@@ -228,3 +228,263 @@ impl CoachState {
 }
 
 pub type SharedState = Arc<RwLock<CoachState>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{ModelConfig, Settings};
+    use std::collections::HashMap;
+
+    /// Build a CoachState with empty env_tokens so tests don't depend
+    /// on the machine's actual environment variables.
+    fn test_state() -> CoachState {
+        CoachState {
+            sessions: HashMap::new(),
+            priorities: vec!["Simplicity".into()],
+            activity_log: Vec::new(),
+            port: 7700,
+            theme: Theme::System,
+            default_mode: CoachMode::Present,
+            model: ModelConfig {
+                provider: "google".into(),
+                model: "gemini-2.5-flash".into(),
+            },
+            api_tokens: HashMap::new(),
+            env_tokens: HashMap::new(),
+        }
+    }
+
+    // ── effective_token resolution chain ─────────────────────────────────
+
+    /// User-provided token should take precedence over an env token
+    /// for the same provider.
+    #[test]
+    fn effective_token_user_overrides_env() {
+        let mut state = test_state();
+        state.api_tokens.insert("google".into(), "user-key".into());
+        state.env_tokens.insert("google".into(), "env-key".into());
+
+        assert_eq!(state.effective_token("google"), Some("user-key"));
+    }
+
+    /// When the user token is empty, it should fall back to the env token.
+    #[test]
+    fn effective_token_empty_user_falls_back_to_env() {
+        let mut state = test_state();
+        state.api_tokens.insert("google".into(), "".into());
+        state.env_tokens.insert("google".into(), "env-key".into());
+
+        assert_eq!(state.effective_token("google"), Some("env-key"));
+    }
+
+    /// When neither user nor env token exists, effective_token returns None.
+    #[test]
+    fn effective_token_returns_none_when_absent() {
+        let state = test_state();
+        assert_eq!(state.effective_token("google"), None);
+    }
+
+    /// Token resolution is per-provider — setting a token for "google"
+    /// should not affect "anthropic".
+    #[test]
+    fn effective_token_providers_are_independent() {
+        let mut state = test_state();
+        state.api_tokens.insert("google".into(), "gk".into());
+
+        assert_eq!(state.effective_token("google"), Some("gk"));
+        assert_eq!(state.effective_token("anthropic"), None);
+    }
+
+    // ── Session lifecycle ───────────────────────────────────────────────
+
+    /// Calling session() for a new ID should create a session with
+    /// event_count=1 and the state's default mode.
+    #[test]
+    fn session_creates_with_correct_defaults() {
+        let mut state = test_state();
+        state.default_mode = CoachMode::Away;
+
+        let sess = state.session("s1", Some("/tmp"));
+        assert_eq!(sess.event_count, 1);
+        assert_eq!(sess.mode, CoachMode::Away);
+        assert_eq!(sess.cwd, Some("/tmp".into()));
+    }
+
+    /// Calling session() again on the same ID should increment
+    /// event_count and update cwd, but not reset mode.
+    #[test]
+    fn session_increments_event_count_and_updates_cwd() {
+        let mut state = test_state();
+        state.session("s1", Some("/a"));
+
+        // Change mode to Away to verify it's preserved.
+        state.sessions.get_mut("s1").unwrap().mode = CoachMode::Away;
+
+        let sess = state.session("s1", Some("/b"));
+        assert_eq!(sess.event_count, 2);
+        assert_eq!(sess.cwd, Some("/b".into()));
+        assert_eq!(sess.mode, CoachMode::Away, "mode should be preserved across events");
+    }
+
+    /// When cwd is None on a subsequent call, the existing cwd should
+    /// be preserved (not overwritten to None).
+    #[test]
+    fn session_preserves_cwd_when_none() {
+        let mut state = test_state();
+        state.session("s1", Some("/original"));
+        let sess = state.session("s1", None);
+        assert_eq!(sess.cwd, Some("/original".into()));
+    }
+
+    // ── Activity log ────────────────────────────────────────────────────
+
+    /// log() should append entries to the activity log.
+    #[test]
+    fn log_adds_entries() {
+        let mut state = test_state();
+        state.log("s1", "PostToolUse", "observed", None);
+        state.log("s1", "Stop", "blocked", Some("priorities".into()));
+
+        assert_eq!(state.activity_log.len(), 2);
+        assert_eq!(state.activity_log[0].action, "observed");
+        assert_eq!(state.activity_log[1].detail, Some("priorities".into()));
+    }
+
+    /// The activity log should be capped at MAX_LOG_ENTRIES (200).
+    /// Adding more entries should drop the oldest ones.
+    #[test]
+    fn log_is_capped_at_200_entries() {
+        let mut state = test_state();
+        for i in 0..210 {
+            state.log("s1", "PostToolUse", &format!("entry-{i}"), None);
+        }
+        assert_eq!(state.activity_log.len(), MAX_LOG_ENTRIES);
+        // The oldest entries (0..9) should have been pruned.
+        assert_eq!(state.activity_log[0].action, "entry-10");
+        assert_eq!(state.activity_log[199].action, "entry-209");
+    }
+
+    // ── Snapshot properties ─────────────────────────────────────────────
+
+    /// Snapshot sessions should be sorted by last_event descending
+    /// (most recent first). We set timestamps manually to avoid
+    /// depending on wall-clock timing between calls.
+    #[test]
+    fn snapshot_sessions_sorted_by_last_event_descending() {
+        use chrono::Duration;
+
+        let mut state = test_state();
+        state.session("s1", None);
+        state.session("s2", None);
+        state.session("s3", None);
+
+        // Manually assign distinct timestamps: s2 oldest, s3 middle, s1 newest.
+        let now = Utc::now();
+        state.sessions.get_mut("s2").unwrap().last_event_time = now - Duration::seconds(20);
+        state.sessions.get_mut("s3").unwrap().last_event_time = now - Duration::seconds(10);
+        state.sessions.get_mut("s1").unwrap().last_event_time = now;
+
+        let snap = state.snapshot();
+        let ids: Vec<&str> = snap.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["s1", "s3", "s2"], "should be sorted newest-first");
+    }
+
+    /// token_status should reflect "user" source when a user token is set.
+    #[test]
+    fn snapshot_token_status_reflects_user_token() {
+        let mut state = test_state();
+        state.api_tokens.insert("google".into(), "gk-user".into());
+
+        let snap = state.snapshot();
+        let google_status = snap.token_status.get("google").unwrap();
+        assert_eq!(google_status.source, "user");
+        assert!(google_status.env_var.is_none());
+    }
+
+    /// Snapshot should roundtrip model config without loss.
+    #[test]
+    fn snapshot_contains_model_config() {
+        let mut state = test_state();
+        state.model = ModelConfig {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+        };
+
+        let snap = state.snapshot();
+        assert_eq!(snap.model.provider, "anthropic");
+        assert_eq!(snap.model.model, "claude-sonnet-4-20250514");
+    }
+
+    // ── from_settings / to_settings roundtrip ───────────────────────────
+
+    /// Converting Settings -> CoachState -> Settings should preserve
+    /// all persisted fields. This is the core save/load invariant.
+    #[test]
+    fn from_settings_to_settings_roundtrip() {
+        let original = Settings {
+            api_tokens: HashMap::from([("openai".into(), "sk-test".into())]),
+            model: ModelConfig {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+            },
+            priorities: vec!["Speed".into(), "Correctness".into()],
+            theme: Theme::Dark,
+            port: 8080,
+        };
+
+        // Note: from_settings calls env_tokens() which reads real env.
+        // We construct the state manually to avoid that dependency.
+        let state = CoachState {
+            sessions: HashMap::new(),
+            priorities: original.priorities.clone(),
+            activity_log: Vec::new(),
+            port: original.port,
+            theme: original.theme.clone(),
+            default_mode: CoachMode::Present,
+            model: original.model.clone(),
+            api_tokens: original.api_tokens.clone(),
+            env_tokens: HashMap::new(),
+        };
+
+        let restored = state.to_settings();
+
+        assert_eq!(restored.api_tokens, original.api_tokens);
+        assert_eq!(restored.model.provider, original.model.provider);
+        assert_eq!(restored.model.model, original.model.model);
+        assert_eq!(restored.priorities, original.priorities);
+        assert_eq!(restored.theme, original.theme);
+        assert_eq!(restored.port, original.port);
+    }
+
+    /// to_settings should not include transient state like sessions or
+    /// activity log — those are runtime-only.
+    #[test]
+    fn to_settings_excludes_transient_state() {
+        let mut state = test_state();
+        state.session("s1", Some("/tmp"));
+        state.log("s1", "PostToolUse", "observed", None);
+
+        let settings = state.to_settings();
+        let json = serde_json::to_value(&settings).unwrap();
+
+        // Settings JSON should not contain sessions or activity_log keys.
+        assert!(json.get("sessions").is_none());
+        assert!(json.get("activity_log").is_none());
+    }
+
+    // ── prune_stale ─────────────────────────────────────────────────────
+
+    /// Fresh sessions (just created) should survive pruning.
+    #[test]
+    fn prune_stale_keeps_fresh_sessions() {
+        let mut state = test_state();
+        state.session("s1", None);
+        state.session("s2", None);
+
+        // prune_stale is called internally by session(), but let's call it
+        // explicitly via a new session() to trigger it.
+        state.session("s3", None);
+
+        assert_eq!(state.sessions.len(), 3);
+    }
+}

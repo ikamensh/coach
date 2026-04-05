@@ -51,10 +51,13 @@ fn has_http_hook(entries: &[serde_json::Value], url: &str) -> bool {
 }
 
 pub fn check_hook_status(port: u16) -> HookStatus {
-    let path = claude_settings_path();
+    check_hook_status_at(port, &claude_settings_path())
+}
+
+pub fn check_hook_status_at(port: u16, path: &std::path::Path) -> HookStatus {
     let expected = expected_hook_urls(port);
 
-    let settings: serde_json::Value = std::fs::read_to_string(&path)
+    let settings: serde_json::Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null);
@@ -88,10 +91,13 @@ pub fn check_hook_status(port: u16) -> HookStatus {
 
 /// Merge coach hooks into ~/.claude/settings.json, preserving existing hooks.
 pub fn install_hooks(port: u16) -> Result<(), String> {
-    let path = claude_settings_path();
+    install_hooks_at(port, &claude_settings_path())
+}
+
+pub fn install_hooks_at(port: u16, path: &std::path::Path) -> Result<(), String> {
     let expected = expected_hook_urls(port);
 
-    let mut settings: serde_json::Value = std::fs::read_to_string(&path)
+    let mut settings: serde_json::Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::json!({}));
@@ -130,7 +136,7 @@ pub fn install_hooks(port: u16) -> Result<(), String> {
     }
 
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -243,5 +249,203 @@ impl Settings {
             }
             Err(e) => eprintln!("Warning: failed to serialize settings: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Default values ──────────────────────────────────────────────────
+
+    /// Default model should be google/gemini-2.5-flash — the cheapest
+    /// capable model that works out of the box.
+    #[test]
+    fn default_model_is_gemini_flash() {
+        let s = Settings::default();
+        assert_eq!(s.model.provider, "google");
+        assert_eq!(s.model.model, "gemini-2.5-flash");
+    }
+
+    /// Priorities should ship with sensible non-empty defaults so the
+    /// coach has something to say on first launch.
+    #[test]
+    fn default_priorities_are_non_empty() {
+        let s = Settings::default();
+        assert!(!s.priorities.is_empty());
+    }
+
+    /// Default port should be 7700, matching the hardcoded hook URLs
+    /// and frontend expectations.
+    #[test]
+    fn default_port_is_7700() {
+        let s = Settings::default();
+        assert_eq!(s.port, 7700);
+    }
+
+    /// Default theme should be System so the app matches OS appearance.
+    #[test]
+    fn default_theme_is_system() {
+        let s = Settings::default();
+        assert_eq!(s.theme, Theme::System);
+    }
+
+    // ── Serde roundtrip ─────────────────────────────────────────────────
+
+    /// Serializing Settings to JSON and deserializing back should
+    /// preserve all fields exactly. This guards against accidentally
+    /// breaking persistence when adding new fields.
+    #[test]
+    fn settings_serde_roundtrip_preserves_all_fields() {
+        let original = Settings {
+            api_tokens: HashMap::from([
+                ("google".into(), "gk-123".into()),
+                ("openai".into(), "sk-abc".into()),
+            ]),
+            model: ModelConfig {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-20250514".into(),
+            },
+            priorities: vec!["Speed".into(), "Safety".into()],
+            theme: Theme::Dark,
+            port: 9999,
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.api_tokens, original.api_tokens);
+        assert_eq!(restored.model.provider, original.model.provider);
+        assert_eq!(restored.model.model, original.model.model);
+        assert_eq!(restored.priorities, original.priorities);
+        assert_eq!(restored.theme, original.theme);
+        assert_eq!(restored.port, original.port);
+    }
+
+    /// Deserializing an empty JSON object `{}` should produce the same
+    /// defaults as `Settings::default()`. This ensures serde(default)
+    /// attributes are correctly set on every field.
+    #[test]
+    fn empty_json_deserializes_to_defaults() {
+        let from_json: Settings = serde_json::from_str("{}").unwrap();
+        let defaults = Settings::default();
+
+        assert_eq!(from_json.model.provider, defaults.model.provider);
+        assert_eq!(from_json.model.model, defaults.model.model);
+        assert_eq!(from_json.priorities, defaults.priorities);
+        assert_eq!(from_json.theme, defaults.theme);
+        assert_eq!(from_json.port, defaults.port);
+        assert!(from_json.api_tokens.is_empty());
+    }
+
+    // ── has_http_hook helper ────────────────────────────────────────────
+
+    /// has_http_hook should find a matching entry when the URL and type
+    /// are present in the nested hooks array.
+    #[test]
+    fn has_http_hook_finds_matching_entry() {
+        let entries: Vec<serde_json::Value> = vec![serde_json::json!({
+            "hooks": [{"type": "http", "url": "http://localhost:7700/hook/stop"}]
+        })];
+        assert!(has_http_hook(&entries, "http://localhost:7700/hook/stop"));
+    }
+
+    /// has_http_hook should return false when the URL doesn't match,
+    /// even if the structure is correct.
+    #[test]
+    fn has_http_hook_rejects_non_matching_url() {
+        let entries: Vec<serde_json::Value> = vec![serde_json::json!({
+            "hooks": [{"type": "http", "url": "http://localhost:7700/hook/stop"}]
+        })];
+        assert!(!has_http_hook(&entries, "http://localhost:9999/hook/stop"));
+    }
+
+    /// has_http_hook on an empty array should return false.
+    #[test]
+    fn has_http_hook_returns_false_for_empty_array() {
+        let entries: Vec<serde_json::Value> = vec![];
+        assert!(!has_http_hook(&entries, "http://localhost:7700/hook/stop"));
+    }
+
+    /// has_http_hook should ignore entries with a non-http type.
+    #[test]
+    fn has_http_hook_ignores_non_http_types() {
+        let entries: Vec<serde_json::Value> = vec![serde_json::json!({
+            "hooks": [{"type": "command", "url": "http://localhost:7700/hook/stop"}]
+        })];
+        assert!(!has_http_hook(&entries, "http://localhost:7700/hook/stop"));
+    }
+
+    // ── check_hook_status with path ─────────────────────────────────────
+
+    /// When the settings file doesn't exist, all hooks should report
+    /// as not installed.
+    #[test]
+    fn check_hook_status_reports_not_installed_for_missing_file() {
+        let status = check_hook_status_at(7700, std::path::Path::new("/nonexistent/path.json"));
+        assert!(!status.installed);
+        assert!(status.hooks.iter().all(|h| !h.installed));
+        assert_eq!(status.hooks.len(), 3); // PermissionRequest, Stop, PostToolUse
+    }
+
+    /// After install_hooks_at writes hooks to a temp file, check_hook_status_at
+    /// should report all hooks as installed. This tests the install/check roundtrip.
+    #[test]
+    fn install_then_check_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        install_hooks_at(7700, &path).unwrap();
+        let status = check_hook_status_at(7700, &path);
+
+        assert!(status.installed);
+        assert!(status.hooks.iter().all(|h| h.installed));
+    }
+
+    /// Installing hooks twice should be idempotent — the second call
+    /// should not duplicate hook entries.
+    #[test]
+    fn install_hooks_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        install_hooks_at(7700, &path).unwrap();
+        install_hooks_at(7700, &path).unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Each event should have exactly one entry.
+        for event in ["PermissionRequest", "Stop", "PostToolUse"] {
+            let arr = content["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "event {event} should have exactly 1 entry after double install");
+        }
+    }
+
+    /// Installing hooks should preserve existing content in the settings file.
+    #[test]
+    fn install_hooks_preserves_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Write a settings file with some existing config.
+        let existing = serde_json::json!({
+            "permissions": {"allow": ["Bash"]},
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "echo stopped"}]}]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        install_hooks_at(7700, &path).unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Existing permissions should still be there.
+        assert_eq!(content["permissions"]["allow"][0], "Bash");
+        // Existing command hook should still be there alongside the new http hook.
+        let stop_entries = content["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_entries.len(), 2, "existing command hook + new http hook");
     }
 }

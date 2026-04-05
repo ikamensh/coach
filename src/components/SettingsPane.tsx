@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useCoachStore } from "../store/useCoachStore";
 import type { TokenSource } from "../store/useCoachStore";
 
-const PROVIDERS = [
+export const PROVIDERS = [
   {
     id: "google",
     label: "Google AI",

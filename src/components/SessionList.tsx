@@ -1,12 +1,12 @@
 import { useCoachStore } from "../store/useCoachStore";
 
-function projectName(cwd: string | null): string {
+export function projectName(cwd: string | null): string {
   if (!cwd) return "unknown";
   const parts = cwd.split("/");
   return parts[parts.length - 1] || cwd;
 }
 
-function timeAgo(iso: string): string {
+export function timeAgo(iso: string): string {
   const seconds = Math.floor(
     (Date.now() - new Date(iso).getTime()) / 1000,
   );
