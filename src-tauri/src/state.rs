@@ -1,11 +1,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
 use crate::settings::{ModelConfig, Settings};
+
+pub const EVENT_STATE_UPDATED: &str = "coach-state-updated";
+pub const EVENT_THEME_CHANGED: &str = "coach-theme-changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -38,14 +41,26 @@ pub struct SessionSnapshot {
     pub cwd: Option<String>,
     pub last_event: DateTime<Utc>,
     pub event_count: usize,
+    pub started_at: DateTime<Utc>,
+    pub duration_secs: u64,
+    pub display_name: String,
+    pub tool_counts: HashMap<String, usize>,
+    pub stop_count: usize,
+    pub stop_blocked_count: usize,
+    pub cwd_history: Vec<String>,
 }
 
-/// Per-provider token status sent to the frontend.
-/// "source" is "user", "env", or "none".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenSource {
+    User,
+    Env,
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenStatus {
-    pub source: String,
-    /// Which env var was matched (only set when source == "env").
+    pub source: TokenSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_var: Option<String>,
 }
@@ -68,20 +83,25 @@ pub struct SessionState {
     pub last_event_time: DateTime<Utc>,
     pub event_count: usize,
     pub last_stop_blocked: Option<Instant>,
+    pub started_at: DateTime<Utc>,
+    pub display_name: String,
+    pub tool_counts: HashMap<String, usize>,
+    pub stop_count: usize,
+    pub stop_blocked_count: usize,
+    pub cwd_history: Vec<String>,
 }
 
 pub struct CoachState {
     pub sessions: HashMap<String, SessionState>,
     pub priorities: Vec<String>,
-    pub activity_log: Vec<ActivityEntry>,
+    pub activity_log: VecDeque<ActivityEntry>,
     pub port: u16,
     pub theme: Theme,
     pub default_mode: CoachMode,
     pub model: ModelConfig,
-    /// User-configured tokens (from settings file).
     pub api_tokens: HashMap<String, String>,
-    /// Tokens detected from environment at startup (read-only).
     pub env_tokens: HashMap<String, String>,
+    pub http_client: reqwest::Client,
 }
 
 impl CoachState {
@@ -95,6 +115,41 @@ impl CoachState {
     }
 }
 
+const GENERIC_DIR_NAMES: &[&str] = &[
+    "src", "lib", "app", "test", "tests", "dist", "build",
+    "node_modules", "packages", ".git", "target",
+];
+
+/// Derive a human-readable display name from session working directories.
+///
+/// Picks the deepest non-home path from `cwd_history`, extracts its last segment,
+/// and includes the parent if that segment is a generic name like "src" or "lib".
+/// Falls back to the first 8 characters of `session_id` if no cwd is available.
+fn derive_display_name(cwd_history: &[String], session_id: &str) -> String {
+    let best = cwd_history
+        .iter()
+        .filter(|p| !p.is_empty())
+        .max_by_key(|p| p.matches('/').count());
+
+    let path = match best {
+        Some(p) => p.as_str(),
+        None => return session_id.chars().take(8).collect(),
+    };
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return session_id.chars().take(8).collect();
+    }
+
+    let last = segments[segments.len() - 1];
+    if GENERIC_DIR_NAMES.contains(&last) && segments.len() >= 2 {
+        let parent = segments[segments.len() - 2];
+        format!("{}/{}", parent, last)
+    } else {
+        last.to_string()
+    }
+}
+
 const MAX_LOG_ENTRIES: usize = 200;
 const SESSION_TTL_SECS: u64 = 3600;
 
@@ -103,13 +158,21 @@ impl CoachState {
         Self {
             sessions: HashMap::new(),
             priorities: settings.priorities,
-            activity_log: Vec::new(),
+            activity_log: VecDeque::new(),
             port: settings.port,
             theme: settings.theme,
             default_mode: CoachMode::Present,
             model: settings.model,
             api_tokens: settings.api_tokens,
             env_tokens: crate::settings::env_tokens(),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn set_all_modes(&mut self, mode: CoachMode) {
+        self.default_mode = mode.clone();
+        for session in self.sessions.values_mut() {
+            session.mode = mode.clone();
         }
     }
 
@@ -131,28 +194,44 @@ impl CoachState {
     pub fn session(&mut self, session_id: &str, cwd: Option<&str>) -> &mut SessionState {
         self.prune_stale();
         let default_mode = self.default_mode.clone();
+        let sid = session_id.to_string();
         self.sessions
-            .entry(session_id.to_string())
+            .entry(sid.clone())
             .and_modify(|s| {
                 s.last_event = Instant::now();
                 s.last_event_time = Utc::now();
                 s.event_count += 1;
                 if let Some(cwd) = cwd {
                     s.cwd = Some(cwd.to_string());
+                    if !s.cwd_history.iter().any(|c| c == cwd) {
+                        s.cwd_history.push(cwd.to_string());
+                        s.display_name = derive_display_name(&s.cwd_history, &sid);
+                    }
                 }
             })
-            .or_insert_with(|| SessionState {
-                mode: default_mode,
-                cwd: cwd.map(String::from),
-                last_event: Instant::now(),
-                last_event_time: Utc::now(),
-                event_count: 1,
-                last_stop_blocked: None,
+            .or_insert_with(|| {
+                let cwd_history: Vec<String> = cwd.iter().map(|c| c.to_string()).collect();
+                let display_name = derive_display_name(&cwd_history, &sid);
+                SessionState {
+                    mode: default_mode,
+                    cwd: cwd.map(String::from),
+                    last_event: Instant::now(),
+                    last_event_time: Utc::now(),
+                    event_count: 1,
+                    last_stop_blocked: None,
+                    started_at: Utc::now(),
+                    display_name,
+                    tool_counts: HashMap::new(),
+                    stop_count: 0,
+                    stop_blocked_count: 0,
+                    cwd_history,
+                }
             })
     }
 
     /// Snapshot for the frontend. Tokens are masked (true = set, false = empty).
     pub fn snapshot(&self) -> CoachSnapshot {
+        let now = Utc::now();
         let mut sessions: Vec<SessionSnapshot> = self
             .sessions
             .iter()
@@ -162,6 +241,13 @@ impl CoachState {
                 cwd: s.cwd.clone(),
                 last_event: s.last_event_time,
                 event_count: s.event_count,
+                started_at: s.started_at,
+                duration_secs: (now - s.started_at).num_seconds().max(0) as u64,
+                display_name: s.display_name.clone(),
+                tool_counts: s.tool_counts.clone(),
+                stop_count: s.stop_count,
+                stop_blocked_count: s.stop_blocked_count,
+                cwd_history: s.cwd_history.clone(),
             })
             .collect();
         sessions.sort_by(|a, b| b.last_event.cmp(&a.last_event));
@@ -169,7 +255,7 @@ impl CoachState {
         CoachSnapshot {
             sessions,
             priorities: self.priorities.clone(),
-            activity_log: self.activity_log.clone(),
+            activity_log: self.activity_log.iter().cloned().collect(),
             port: self.port,
             theme: self.theme.clone(),
             model: self.model.clone(),
@@ -177,24 +263,22 @@ impl CoachState {
                 let mut status = HashMap::new();
                 for (provider, vars) in crate::settings::PROVIDER_ENV_VARS {
                     let has_user = self.api_tokens.get(*provider).is_some_and(|v| !v.is_empty());
-                    let env_var_found = if !has_user {
-                        vars.iter().find(|var| {
-                            std::env::var(var).ok().is_some_and(|v| !v.is_empty())
+                    let has_env = self.env_tokens.contains_key(*provider);
+                    let env_var_name = if !has_user && has_env {
+                        vars.iter().find(|_| {
+                            self.env_tokens.contains_key(*provider)
                         }).map(|v| v.to_string())
                     } else {
                         None
                     };
                     let (source, env_var) = if has_user {
-                        ("user", None)
-                    } else if let Some(var) = env_var_found {
-                        ("env", Some(var))
+                        (TokenSource::User, None)
+                    } else if let Some(var) = env_var_name {
+                        (TokenSource::Env, Some(var))
                     } else {
-                        ("none", None)
+                        (TokenSource::None, None)
                     };
-                    status.insert(provider.to_string(), TokenStatus {
-                        source: source.into(),
-                        env_var,
-                    });
+                    status.insert(provider.to_string(), TokenStatus { source, env_var });
                 }
                 status
             },
@@ -208,16 +292,15 @@ impl CoachState {
         action: &str,
         detail: Option<String>,
     ) {
-        self.activity_log.push(ActivityEntry {
+        self.activity_log.push_back(ActivityEntry {
             timestamp: Utc::now(),
             session_id: session_id.to_string(),
             hook_event: hook_event.to_string(),
             action: action.to_string(),
             detail,
         });
-        if self.activity_log.len() > MAX_LOG_ENTRIES {
-            self.activity_log
-                .drain(..self.activity_log.len() - MAX_LOG_ENTRIES);
+        while self.activity_log.len() > MAX_LOG_ENTRIES {
+            self.activity_log.pop_front();
         }
     }
 
@@ -241,7 +324,7 @@ mod tests {
         CoachState {
             sessions: HashMap::new(),
             priorities: vec!["Simplicity".into()],
-            activity_log: Vec::new(),
+            activity_log: VecDeque::new(),
             port: 7700,
             theme: Theme::System,
             default_mode: CoachMode::Present,
@@ -251,6 +334,7 @@ mod tests {
             },
             api_tokens: HashMap::new(),
             env_tokens: HashMap::new(),
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -397,7 +481,7 @@ mod tests {
 
         let snap = state.snapshot();
         let google_status = snap.token_status.get("google").unwrap();
-        assert_eq!(google_status.source, "user");
+        assert_eq!(google_status.source, TokenSource::User);
         assert!(google_status.env_var.is_none());
     }
 
@@ -437,13 +521,14 @@ mod tests {
         let state = CoachState {
             sessions: HashMap::new(),
             priorities: original.priorities.clone(),
-            activity_log: Vec::new(),
+            activity_log: VecDeque::new(),
             port: original.port,
             theme: original.theme.clone(),
             default_mode: CoachMode::Present,
             model: original.model.clone(),
             api_tokens: original.api_tokens.clone(),
             env_tokens: HashMap::new(),
+            http_client: reqwest::Client::new(),
         };
 
         let restored = state.to_settings();
@@ -486,5 +571,106 @@ mod tests {
         state.session("s3", None);
 
         assert_eq!(state.sessions.len(), 3);
+    }
+
+    // ── derive_display_name ────────────────────────────────────────────
+
+    /// A normal project path should yield just the last segment.
+    #[test]
+    fn display_name_normal_path() {
+        let history = vec!["/Users/foo/projects/coach".into()];
+        assert_eq!(derive_display_name(&history, "abc12345"), "coach");
+    }
+
+    /// When the last segment is generic (e.g. "src"), include parent/child.
+    #[test]
+    fn display_name_generic_last_segment() {
+        let history = vec!["/Users/foo/projects/coach/src".into()];
+        assert_eq!(derive_display_name(&history, "abc12345"), "coach/src");
+    }
+
+    /// With no cwd history, fall back to first 8 chars of session_id.
+    #[test]
+    fn display_name_fallback_to_session_id() {
+        let history: Vec<String> = vec![];
+        assert_eq!(derive_display_name(&history, "abcdef1234567890"), "abcdef12");
+    }
+
+    /// With multiple cwd entries, pick the deepest (most path segments).
+    #[test]
+    fn display_name_picks_deepest_cwd() {
+        let history = vec![
+            "/Users/foo/projects".into(),
+            "/Users/foo/projects/coach/src".into(),
+            "/Users/foo".into(),
+        ];
+        // Deepest is coach/src — "src" is generic, so "coach/src"
+        assert_eq!(derive_display_name(&history, "abc12345"), "coach/src");
+    }
+
+    // ── New session fields ─────────────────────────────────────────────
+
+    /// New sessions should have started_at set, empty tool_counts, zero counters,
+    /// and cwd_history populated from the initial cwd.
+    #[test]
+    fn session_initializes_new_fields() {
+        let mut state = test_state();
+        let before = Utc::now();
+        let sess = state.session("s1", Some("/Users/foo/projects/coach"));
+
+        assert!(sess.started_at >= before);
+        assert!(sess.tool_counts.is_empty());
+        assert_eq!(sess.stop_count, 0);
+        assert_eq!(sess.stop_blocked_count, 0);
+        assert_eq!(sess.cwd_history, vec!["/Users/foo/projects/coach"]);
+        assert_eq!(sess.display_name, "coach");
+    }
+
+    /// Updating a session with a new cwd should append to cwd_history
+    /// and recompute display_name.
+    #[test]
+    fn session_updates_cwd_history_on_change() {
+        let mut state = test_state();
+        state.session("s1", Some("/Users/foo/projects/coach"));
+        let sess = state.session("s1", Some("/Users/foo/projects/coach/src"));
+
+        assert_eq!(sess.cwd_history, vec![
+            "/Users/foo/projects/coach",
+            "/Users/foo/projects/coach/src",
+        ]);
+        assert_eq!(sess.display_name, "coach/src");
+    }
+
+    /// Re-visiting an already-seen cwd should not duplicate it in history.
+    #[test]
+    fn session_does_not_duplicate_cwd_history() {
+        let mut state = test_state();
+        state.session("s1", Some("/Users/foo/projects/coach"));
+        state.session("s1", Some("/Users/foo/projects/coach/src"));
+        let sess = state.session("s1", Some("/Users/foo/projects/coach"));
+
+        assert_eq!(sess.cwd_history.len(), 2);
+    }
+
+    /// Snapshot should include the new session fields.
+    #[test]
+    fn snapshot_includes_new_session_fields() {
+        let mut state = test_state();
+        state.session("s1", Some("/Users/foo/projects/coach"));
+        {
+            let sess = state.sessions.get_mut("s1").unwrap();
+            sess.tool_counts.insert("Read".into(), 3);
+            sess.stop_count = 2;
+            sess.stop_blocked_count = 1;
+        }
+
+        let snap = state.snapshot();
+        let s = &snap.sessions[0];
+        assert_eq!(s.display_name, "coach");
+        assert_eq!(s.tool_counts.get("Read"), Some(&3));
+        assert_eq!(s.stop_count, 2);
+        assert_eq!(s.stop_blocked_count, 1);
+        assert_eq!(s.cwd_history, vec!["/Users/foo/projects/coach"]);
+        assert!(s.duration_secs < 5, "duration should be near zero for a just-created session");
     }
 }

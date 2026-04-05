@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { timeAgo, projectName } from "./SessionList";
+import { timeAgo, projectName, topTools, formatDuration } from "./SessionList";
 
 describe("projectName", () => {
   /** Extracts the last path segment as the project name. */
@@ -57,5 +57,62 @@ describe("timeAgo", () => {
     const recentNum = parseInt(timeAgo(recent));
     const olderNum = parseInt(timeAgo(older));
     expect(olderNum).toBeGreaterThanOrEqual(recentNum);
+  });
+});
+
+describe("topTools", () => {
+  /** Returns tools sorted by count descending, formatted as "Name: count". */
+  it("returns top N tools sorted by count", () => {
+    const counts = { Write: 14, Bash: 8, Read: 20, Edit: 3 };
+    expect(topTools(counts, 3)).toBe("Read: 20, Write: 14, Bash: 8");
+  });
+
+  it("returns all tools when fewer than N exist", () => {
+    const counts = { Bash: 5 };
+    expect(topTools(counts, 3)).toBe("Bash: 5");
+  });
+
+  it("returns empty string for empty counts", () => {
+    expect(topTools({})).toBe("");
+  });
+
+  /** Property: result never contains more entries than requested. */
+  it("respects the limit parameter", () => {
+    const counts = { A: 1, B: 2, C: 3, D: 4, E: 5 };
+    const result = topTools(counts, 2);
+    expect(result.split(", ").length).toBe(2);
+  });
+});
+
+describe("formatDuration", () => {
+  /** Compact duration formatting: seconds, minutes, hours, and combinations. */
+  it("formats seconds", () => {
+    expect(formatDuration(45)).toBe("45s");
+  });
+
+  it("formats minutes", () => {
+    expect(formatDuration(23 * 60)).toBe("23m");
+  });
+
+  it("formats exact hours", () => {
+    expect(formatDuration(2 * 3600)).toBe("2h");
+  });
+
+  it("formats hours and minutes", () => {
+    expect(formatDuration(3600 + 15 * 60)).toBe("1h 15m");
+  });
+
+  /** Property: output always contains a time unit character. */
+  it("always contains a unit suffix", () => {
+    for (const secs of [0, 1, 59, 60, 3599, 3600, 7200, 5400]) {
+      expect(formatDuration(secs)).toMatch(/[smh]/);
+    }
+  });
+
+  /** Property: longer durations produce longer or equal output strings. */
+  it("longer input never produces shorter output", () => {
+    const short = formatDuration(600);
+    const long = formatDuration(6000);
+    expect(long.length).toBeGreaterThanOrEqual(short.length);
   });
 });

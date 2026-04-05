@@ -45,7 +45,7 @@ fn session_id(payload: &HookPayload) -> String {
 fn emit_update(emitter: &Option<tauri::AppHandle>, coach: &crate::state::CoachState) {
     if let Some(handle) = emitter {
         use tauri::Emitter;
-        let _ = handle.emit("coach-state-updated", coach.snapshot());
+        let _ = handle.emit(crate::state::EVENT_STATE_UPDATED, coach.snapshot());
     }
 }
 
@@ -56,7 +56,9 @@ async fn handle_permission_request(
     let sid = session_id(&payload);
     let tool = payload.tool_name.clone().unwrap_or_default();
     let mut coach = state.coach.write().await;
-    let mode = coach.session(&sid, payload.cwd.as_deref()).mode.clone();
+    let session = coach.session(&sid, payload.cwd.as_deref());
+    *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
+    let mode = session.mode.clone();
 
     if mode == CoachMode::Away {
         coach.log(&sid, "PermissionRequest", "auto-approved", Some(tool));
@@ -81,26 +83,38 @@ async fn handle_stop(
 ) -> Json<HookResponse> {
     let sid = session_id(&payload);
     let mut coach = state.coach.write().await;
-    let session = coach.session(&sid, payload.cwd.as_deref());
 
-    if session.mode != CoachMode::Away {
-        let sid = sid.clone();
+    // Extract session state we need for decisions, then release the borrow.
+    let session = coach.session(&sid, payload.cwd.as_deref());
+    let mode = session.mode.clone();
+    let on_cooldown = session
+        .last_stop_blocked
+        .map_or(false, |last| last.elapsed() < STOP_COOLDOWN);
+
+    if mode != CoachMode::Away {
+        // stop_count tracks all stops, including passthrough
+        coach.sessions.get_mut(&sid).unwrap().stop_count += 1;
         coach.log(&sid, "Stop", "passed through", None);
         emit_update(&state.emitter, &coach);
         return Json(HookResponse::passthrough());
     }
 
-    // Cooldown to prevent infinite stop loops
-    if let Some(last) = session.last_stop_blocked {
-        if last.elapsed() < STOP_COOLDOWN {
-            let sid = sid.clone();
-            coach.log(&sid, "Stop", "allowed (cooldown)", None);
-            emit_update(&state.emitter, &coach);
-            return Json(HookResponse::passthrough());
-        }
+    if on_cooldown {
+        // Cooldown: allow the stop but still count it
+        coach.sessions.get_mut(&sid).unwrap().stop_count += 1;
+        coach.log(&sid, "Stop", "allowed (cooldown)", None);
+        emit_update(&state.emitter, &coach);
+        return Json(HookResponse::passthrough());
     }
 
-    session.last_stop_blocked = Some(std::time::Instant::now());
+    // Block the stop — update session fields
+    {
+        let session = coach.sessions.get_mut(&sid).unwrap();
+        session.last_stop_blocked = Some(std::time::Instant::now());
+        session.stop_count += 1;
+        session.stop_blocked_count += 1;
+    }
+
     let priorities_text = coach
         .priorities
         .iter()
@@ -134,7 +148,8 @@ async fn handle_post_tool_use(
     let sid = session_id(&payload);
     let tool = payload.tool_name.unwrap_or_default();
     let mut coach = state.coach.write().await;
-    coach.session(&sid, payload.cwd.as_deref());
+    let session = coach.session(&sid, payload.cwd.as_deref());
+    *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
     coach.log(&sid, "PostToolUse", "observed", Some(tool));
     emit_update(&state.emitter, &coach);
     Json(HookResponse::passthrough())

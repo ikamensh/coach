@@ -1,16 +1,20 @@
+import { useMemo } from "react";
 import { useCoachStore } from "../store/useCoachStore";
+import { projectName } from "./SessionList";
+import type { SessionSnapshot } from "../store/useCoachStore";
 
-function projectName(sessionId: string, sessions: { session_id: string; cwd: string | null }[]): string {
+function sessionLabel(sessionId: string, sessions: SessionSnapshot[]): string {
   const session = sessions.find((s) => s.session_id === sessionId);
-  if (!session?.cwd) return sessionId.slice(0, 8);
-  const parts = session.cwd.split("/");
-  return parts[parts.length - 1] || sessionId.slice(0, 8);
+  if (!session) return sessionId.slice(0, 8);
+  if (session.display_name) return session.display_name;
+  if (!session.cwd) return sessionId.slice(0, 8);
+  return projectName(session.cwd);
 }
 
 export function ActivityLog() {
   const activityLog = useCoachStore((s) => s.activityLog);
   const sessions = useCoachStore((s) => s.sessions);
-  const entries = [...activityLog].reverse();
+  const entries = useMemo(() => [...activityLog].reverse(), [activityLog]);
 
   return (
     <div className="flex flex-col min-h-0">
@@ -34,7 +38,7 @@ export function ActivityLog() {
                   {new Date(entry.timestamp).toLocaleTimeString()}
                 </span>
                 <span className="text-zinc-500 dark:text-zinc-500">
-                  {projectName(entry.session_id, sessions)}
+                  {sessionLabel(entry.session_id, sessions)}
                 </span>
                 <span className="text-zinc-600 dark:text-zinc-400 font-medium">
                   {entry.hook_event}

@@ -1,7 +1,12 @@
 use crate::settings::{self, HookStatus, ModelConfig};
-use crate::state::{CoachMode, CoachSnapshot, SharedState, Theme};
+use crate::state::{CoachMode, CoachSnapshot, CoachState, SharedState, Theme, EVENT_STATE_UPDATED, EVENT_THEME_CHANGED};
 use serde_json::json;
 use tauri::Emitter;
+
+fn emit_snapshot(app: &tauri::AppHandle, state: &CoachState) -> Result<(), String> {
+    app.emit(EVENT_STATE_UPDATED, &state.snapshot())
+        .map_err(|e| e.to_string())
+}
 
 #[tauri::command]
 pub async fn get_state(state: tauri::State<'_, SharedState>) -> Result<CoachSnapshot, String> {
@@ -20,9 +25,7 @@ pub async fn set_session_mode(
     if let Some(session) = s.sessions.get_mut(&session_id) {
         session.mode = mode;
     }
-    let snapshot = s.snapshot();
-    app.emit("coach-state-updated", &snapshot)
-        .map_err(|e| e.to_string())?;
+    emit_snapshot(&app, &s)?;
     Ok(())
 }
 
@@ -33,24 +36,21 @@ pub async fn set_all_sessions_mode(
     mode: CoachMode,
 ) -> Result<(), String> {
     let mut s = state.write().await;
-    s.default_mode = mode.clone();
-    for session in s.sessions.values_mut() {
-        session.mode = mode.clone();
-    }
-    let snapshot = s.snapshot();
-    app.emit("coach-state-updated", &snapshot)
-        .map_err(|e| e.to_string())?;
+    s.set_all_modes(mode);
+    emit_snapshot(&app, &s)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_priorities(
     state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
     priorities: Vec<String>,
 ) -> Result<(), String> {
     let mut s = state.write().await;
     s.priorities = priorities;
     s.save();
+    emit_snapshot(&app, &s)?;
     Ok(())
 }
 
@@ -63,14 +63,16 @@ pub async fn set_theme(
     let mut s = state.write().await;
     s.theme = theme.clone();
     s.save();
-    app.emit("coach-theme-changed", &theme)
+    app.emit(EVENT_THEME_CHANGED, &theme)
         .map_err(|e| e.to_string())?;
+    emit_snapshot(&app, &s)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_api_token(
     state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
     provider: String,
     token: String,
 ) -> Result<(), String> {
@@ -81,22 +83,50 @@ pub async fn set_api_token(
         s.api_tokens.insert(provider, token);
     }
     s.save();
+    emit_snapshot(&app, &s)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_model(
     state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
     model: ModelConfig,
 ) -> Result<(), String> {
     let mut s = state.write().await;
     s.model = model;
     s.save();
+    emit_snapshot(&app, &s)?;
     Ok(())
 }
 
-/// Ping the provider to verify the model + key combo works.
-/// Returns Ok(()) on success, Err(message) on failure.
+async fn validate_chat_endpoint(
+    client: &reqwest::Client,
+    url: &str,
+    auth_header: (&str, &str),
+    model: &str,
+) -> Result<(), String> {
+    let resp = client
+        .post(url)
+        .header(auth_header.0, auth_header.1)
+        .json(&json!({
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        if body.contains("model") {
+            return Err(format!("Model '{}' not found", model));
+        }
+        return Err("API key invalid or request failed".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn validate_model(
     state: tauri::State<'_, SharedState>,
@@ -108,9 +138,8 @@ pub async fn validate_model(
         .effective_token(&provider)
         .ok_or("No API key configured")?
         .to_string();
+    let client = s.http_client.clone();
     drop(s);
-
-    let client = reqwest::Client::new();
 
     match provider.as_str() {
         "google" => {
@@ -136,45 +165,23 @@ pub async fn validate_model(
             }
         }
         "anthropic" => {
-            let resp = client
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", &token)
-                .header("anthropic-version", "2023-06-01")
-                .json(&json!({
-                    "model": model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "hi"}]
-                }))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                if body.contains("model") {
-                    return Err(format!("Model '{}' not found", model));
-                }
-                return Err("API key invalid or request failed".into());
-            }
+            validate_chat_endpoint(
+                &client,
+                "https://api.anthropic.com/v1/messages",
+                ("x-api-key", &token),
+                &model,
+            )
+            .await?;
         }
         "openrouter" => {
-            let resp = client
-                .post("https://openrouter.ai/api/v1/chat/completions")
-                .header("Authorization", format!("Bearer {}", token))
-                .json(&json!({
-                    "model": model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "hi"}]
-                }))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                if body.contains("model") {
-                    return Err(format!("Model '{}' not found", model));
-                }
-                return Err("API key invalid or request failed".into());
-            }
+            let bearer = format!("Bearer {}", token);
+            validate_chat_endpoint(
+                &client,
+                "https://openrouter.ai/api/v1/chat/completions",
+                ("Authorization", &bearer),
+                &model,
+            )
+            .await?;
         }
         _ => return Err(format!("Unknown provider '{}'", provider)),
     }

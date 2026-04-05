@@ -1,11 +1,13 @@
 import { useEffect } from "react";
 import { useCoachStore } from "./store/useCoachStore";
+import { useZoom } from "./hooks/useZoom";
 import { SessionList } from "./components/SessionList";
 import { PriorityList } from "./components/PriorityList";
 import { ActivityLog } from "./components/ActivityLog";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { SettingsPane } from "./components/SettingsPane";
 import { HooksPane } from "./components/HooksPane";
+import { SessionDetail } from "./components/SessionDetail";
 
 export default function App() {
   const init = useCoachStore((s) => s.init);
@@ -15,6 +17,8 @@ export default function App() {
   const port = useCoachStore((s) => s.port);
   const model = useCoachStore((s) => s.model);
   const hookStatus = useCoachStore((s) => s.hookStatus);
+
+  useZoom();
 
   useEffect(() => {
     init();
@@ -32,6 +36,14 @@ export default function App() {
     return (
       <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
         <SettingsPane />
+      </div>
+    );
+  }
+
+  if (view === "session") {
+    return (
+      <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
+        <SessionDetail />
       </div>
     );
   }
@@ -80,6 +92,8 @@ export default function App() {
       </div>
 
       <div className="text-xs text-zinc-400 dark:text-zinc-600 text-center flex items-center justify-center gap-2">
+        <span>v{__APP_VERSION__}</span>
+        <span>·</span>
         <span>localhost:{port}</span>
         <span>·</span>
         <span>{model.provider}/{model.model}</span>

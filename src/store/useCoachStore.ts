@@ -20,6 +20,13 @@ interface SessionSnapshot {
   cwd: string | null;
   last_event: string;
   event_count: number;
+  display_name: string;
+  started_at: string;
+  duration_secs: number;
+  tool_counts: Record<string, number>;
+  stop_count: number;
+  stop_blocked_count: number;
+  cwd_history: string[];
 }
 
 interface ModelConfig {
@@ -66,7 +73,8 @@ interface CoachState {
   modelError: string | null;
   modelValidating: boolean;
   initialized: boolean;
-  view: "main" | "settings" | "hooks";
+  view: "main" | "settings" | "hooks" | "session";
+  selectedSessionId: string | null;
 }
 
 interface CoachActions {
@@ -80,7 +88,8 @@ interface CoachActions {
   setTheme: (theme: Theme) => Promise<void>;
   setApiToken: (provider: string, token: string) => Promise<void>;
   setModel: (model: ModelConfig) => Promise<void>;
-  setView: (view: "main" | "settings" | "hooks") => void;
+  setView: (view: "main" | "settings" | "hooks" | "session") => void;
+  selectSession: (id: string | null) => void;
   refreshHookStatus: () => Promise<void>;
   installHooks: () => Promise<void>;
 }
@@ -116,8 +125,11 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   modelValidating: false,
   initialized: false,
   view: "main",
+  selectedSessionId: null,
 
   init: async () => {
+    if (get().initialized) return;
+
     const snapshot = await invoke<CoachSnapshot>("get_state");
     applyThemeClass(snapshot.theme);
 
@@ -142,12 +154,6 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         activityLog: s.activity_log,
         model: s.model,
         tokenStatus: s.token_status,
-      });
-    });
-
-    await listen<CoachMode>("coach-mode-changed", () => {
-      invoke<CoachSnapshot>("get_state").then((s) => {
-        set({ sessions: s.sessions });
       });
     });
 
@@ -210,9 +216,6 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
 
   setApiToken: async (provider, token) => {
     await invoke("set_api_token", { provider, token });
-    // Refresh full state to get updated token_status
-    const snapshot = await invoke<CoachSnapshot>("get_state");
-    set({ tokenStatus: snapshot.token_status });
   },
 
   setModel: async (model) => {
@@ -230,6 +233,8 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   },
 
   setView: (view) => set({ view }),
+
+  selectSession: (id) => set({ selectedSessionId: id, view: id ? "session" : "main" }),
 
   refreshHookStatus: async () => {
     const hookStatus = await invoke<HookStatus>("get_hook_status");

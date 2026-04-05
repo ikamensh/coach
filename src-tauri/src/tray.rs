@@ -1,4 +1,4 @@
-use crate::state::{CoachMode, SharedState};
+use crate::state::{CoachMode, SharedState, EVENT_STATE_UPDATED};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -14,11 +14,8 @@ fn toggle_all(state: &SharedState, handle: &tauri::AppHandle) {
             CoachMode::Present => CoachMode::Away,
             CoachMode::Away => CoachMode::Present,
         };
-        s.default_mode = new_mode.clone();
-        for session in s.sessions.values_mut() {
-            session.mode = new_mode.clone();
-        }
-        let _ = handle.emit("coach-state-updated", s.snapshot());
+        s.set_all_modes(new_mode);
+        let _ = handle.emit(EVENT_STATE_UPDATED, s.snapshot());
     });
 }
 

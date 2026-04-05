@@ -17,10 +17,43 @@ export function timeAgo(iso: string): string {
   return `${hours}h ago`;
 }
 
+/** Top N tools by count, formatted like "Write: 14, Bash: 8". */
+export function topTools(toolCounts: Record<string, number>, n = 3): string {
+  return Object.entries(toolCounts)
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, n)
+    .map(([name, count]) => `${name}: ${count}`)
+    .join(", ");
+}
+
+/** Compact duration: "23m", "1h 15m", "2h". */
+export function formatDuration(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const minutes = Math.floor(secs / 60);
+  const hours = Math.floor(minutes / 60);
+  const remainMinutes = minutes % 60;
+  if (hours === 0) return `${minutes}m`;
+  if (remainMinutes === 0) return `${hours}h`;
+  return `${hours}h ${remainMinutes}m`;
+}
+
+function abbreviateCwd(cwd: string | null): string {
+  if (!cwd) return "unknown";
+  const home = "/Users/";
+  if (cwd.startsWith(home)) {
+    const rest = cwd.slice(home.length);
+    const slashIdx = rest.indexOf("/");
+    if (slashIdx >= 0) return "~" + rest.slice(slashIdx);
+    return "~";
+  }
+  return cwd;
+}
+
 export function SessionList() {
   const sessions = useCoachStore((s) => s.sessions);
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
   const setAllMode = useCoachStore((s) => s.setAllMode);
+  const selectSession = useCoachStore((s) => s.selectSession);
 
   const allAway = sessions.length > 0 && sessions.every((s) => s.mode === "away");
   const allPresent = sessions.length > 0 && sessions.every((s) => s.mode === "present");
@@ -67,36 +100,46 @@ export function SessionList() {
           {sessions.map((session) => (
             <li
               key={session.session_id}
-              className="flex items-center gap-3 bg-zinc-100 dark:bg-zinc-800/50 rounded-lg px-3 py-2"
+              onClick={() => selectSession(session.session_id)}
+              className="flex items-start gap-3 bg-zinc-100 dark:bg-zinc-800/50 rounded-lg px-3 py-2 cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors"
             >
               <div
-                className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                className={`w-2 h-2 rounded-full flex-shrink-0 mt-1.5 ${
                   session.mode === "away" ? "bg-amber-500" : "bg-emerald-500"
                 }`}
               />
               <div className="flex-1 min-w-0">
-                <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">
-                  {projectName(session.cwd)}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">
+                    {session.display_name}
+                  </div>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSessionMode(
+                        session.session_id,
+                        session.mode === "present" ? "away" : "present",
+                      );
+                    }}
+                    className={`text-xs px-2.5 py-0.5 rounded-md font-medium transition-colors flex-shrink-0 ${
+                      session.mode === "away"
+                        ? "bg-amber-500/20 text-amber-600 dark:text-amber-400 hover:bg-amber-500/30"
+                        : "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/30"
+                    }`}
+                  >
+                    {session.mode === "away" ? "Away" : "Present"}
+                  </button>
+                </div>
+                <div className="text-xs text-zinc-400 dark:text-zinc-500 font-mono truncate">
+                  {abbreviateCwd(session.cwd)}
                 </div>
                 <div className="text-xs text-zinc-400 dark:text-zinc-500">
-                  {session.event_count} events · {timeAgo(session.last_event)}
+                  {formatDuration(session.duration_secs)} · {session.event_count} events
+                  {Object.keys(session.tool_counts).length > 0 && (
+                    <span> · {topTools(session.tool_counts)}</span>
+                  )}
                 </div>
               </div>
-              <button
-                onClick={() =>
-                  setSessionMode(
-                    session.session_id,
-                    session.mode === "present" ? "away" : "present",
-                  )
-                }
-                className={`text-xs px-2.5 py-1 rounded-md font-medium transition-colors ${
-                  session.mode === "away"
-                    ? "bg-amber-500/20 text-amber-600 dark:text-amber-400 hover:bg-amber-500/30"
-                    : "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/30"
-                }`}
-              >
-                {session.mode === "away" ? "Away" : "Present"}
-              </button>
             </li>
           ))}
         </ul>
