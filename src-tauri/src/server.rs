@@ -1,0 +1,179 @@
+use axum::{extract::State as AxumState, routing::{get, post}, Json, Router};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+use crate::state::{CoachMode, SharedState};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HookPayload {
+    session_id: Option<String>,
+    #[allow(dead_code)]
+    hook_event_name: Option<String>,
+    tool_name: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_specific_output: Option<serde_json::Value>,
+}
+
+impl HookResponse {
+    fn passthrough() -> Self {
+        Self {
+            hook_specific_output: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    coach: SharedState,
+    emitter: Option<tauri::AppHandle>,
+}
+
+fn session_id(payload: &HookPayload) -> String {
+    payload
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn emit_update(emitter: &Option<tauri::AppHandle>, coach: &crate::state::CoachState) {
+    if let Some(handle) = emitter {
+        use tauri::Emitter;
+        let _ = handle.emit("coach-state-updated", coach.snapshot());
+    }
+}
+
+async fn handle_permission_request(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let tool = payload.tool_name.clone().unwrap_or_default();
+    let mut coach = state.coach.write().await;
+    let mode = coach.session(&sid, payload.cwd.as_deref()).mode.clone();
+
+    if mode == CoachMode::Away {
+        coach.log(&sid, "PermissionRequest", "auto-approved", Some(tool));
+        emit_update(&state.emitter, &coach);
+        Json(HookResponse {
+            hook_specific_output: Some(serde_json::json!({
+                "decision": { "behavior": "allow" }
+            })),
+        })
+    } else {
+        coach.log(&sid, "PermissionRequest", "passed through", Some(tool));
+        emit_update(&state.emitter, &coach);
+        Json(HookResponse::passthrough())
+    }
+}
+
+const STOP_COOLDOWN: Duration = Duration::from_secs(15);
+
+async fn handle_stop(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let mut coach = state.coach.write().await;
+    let session = coach.session(&sid, payload.cwd.as_deref());
+
+    if session.mode != CoachMode::Away {
+        let sid = sid.clone();
+        coach.log(&sid, "Stop", "passed through", None);
+        emit_update(&state.emitter, &coach);
+        return Json(HookResponse::passthrough());
+    }
+
+    // Cooldown to prevent infinite stop loops
+    if let Some(last) = session.last_stop_blocked {
+        if last.elapsed() < STOP_COOLDOWN {
+            let sid = sid.clone();
+            coach.log(&sid, "Stop", "allowed (cooldown)", None);
+            emit_update(&state.emitter, &coach);
+            return Json(HookResponse::passthrough());
+        }
+    }
+
+    session.last_stop_blocked = Some(std::time::Instant::now());
+    let priorities_text = coach
+        .priorities
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{}. {}", i + 1, p))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let message = format!(
+        "User is away. Continue working autonomously. \
+         If you need to make a decision, use these priorities (highest first): {}. \
+         If you were asking whether to proceed — yes, proceed.",
+        priorities_text
+    );
+
+    coach.log(&sid, "Stop", "blocked — user away", Some(message.clone()));
+    emit_update(&state.emitter, &coach);
+
+    Json(HookResponse {
+        hook_specific_output: Some(serde_json::json!({
+            "decision": "block",
+            "additionalContext": message
+        })),
+    })
+}
+
+async fn handle_post_tool_use(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let tool = payload.tool_name.unwrap_or_default();
+    let mut coach = state.coach.write().await;
+    coach.session(&sid, payload.cwd.as_deref());
+    coach.log(&sid, "PostToolUse", "observed", Some(tool));
+    emit_update(&state.emitter, &coach);
+    Json(HookResponse::passthrough())
+}
+
+async fn handle_get_state(
+    AxumState(state): AxumState<AppState>,
+) -> Json<crate::state::CoachSnapshot> {
+    let coach = state.coach.read().await;
+    Json(coach.snapshot())
+}
+
+fn build_router(coach: SharedState, emitter: Option<tauri::AppHandle>) -> Router {
+    let state = AppState { coach, emitter };
+    Router::new()
+        .route("/hook/permission-request", post(handle_permission_request))
+        .route("/hook/stop", post(handle_stop))
+        .route("/hook/post-tool-use", post(handle_post_tool_use))
+        .route("/state", get(handle_get_state))
+        .with_state(state)
+}
+
+pub fn create_router(coach: SharedState, app_handle: tauri::AppHandle) -> Router {
+    build_router(coach, Some(app_handle))
+}
+
+/// Router without Tauri emitter — for integration tests.
+pub fn create_router_headless(coach: SharedState) -> Router {
+    build_router(coach, None)
+}
+
+pub async fn start_server(coach: SharedState, app_handle: tauri::AppHandle, port: u16) {
+    let app = create_router(coach, app_handle);
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
+    eprintln!("Coach hook server listening on {}", addr);
+    axum::serve(listener, app)
+        .await
+        .expect("Hook server crashed");
+}
