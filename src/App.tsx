@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { Component, useEffect, type ReactNode } from "react";
 import { useCoachStore } from "./store/useCoachStore";
 import { useZoom } from "./hooks/useZoom";
 import { SessionList } from "./components/SessionList";
@@ -8,10 +8,47 @@ import { ThemeToggle } from "./components/ThemeToggle";
 import { SettingsPane } from "./components/SettingsPane";
 import { HooksPane } from "./components/HooksPane";
 import { SessionDetail } from "./components/SessionDetail";
+import { DevPane } from "./components/DevPane";
 
-export default function App() {
+function ErrorDisplay({ title, error }: { title: string; error: string }) {
+  return (
+    <div className="h-screen flex items-center justify-center bg-white dark:bg-zinc-900 p-6">
+      <div className="max-w-lg w-full">
+        <div className="text-red-600 dark:text-red-400 font-semibold text-sm mb-2">
+          {title}
+        </div>
+        <pre className="text-xs text-red-500 dark:text-red-400 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-md p-3 whitespace-pre-wrap break-words font-mono">
+          {error}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: string | null }
+> {
+  state = { error: null as string | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error: `${error.message}\n\n${error.stack}` };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <ErrorDisplay title="Render error" error={this.state.error} />
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function AppInner() {
   const init = useCoachStore((s) => s.init);
   const initialized = useCoachStore((s) => s.initialized);
+  const initError = useCoachStore((s) => s.initError);
   const view = useCoachStore((s) => s.view);
   const setView = useCoachStore((s) => s.setView);
   const port = useCoachStore((s) => s.port);
@@ -23,6 +60,10 @@ export default function App() {
   useEffect(() => {
     init();
   }, [init]);
+
+  if (initError) {
+    return <ErrorDisplay title="Init failed" error={initError} />;
+  }
 
   if (!initialized) {
     return (
@@ -56,6 +97,14 @@ export default function App() {
     );
   }
 
+  if (view === "dev") {
+    return (
+      <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
+        <DevPane />
+      </div>
+    );
+  }
+
   return (
     <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 gap-4 overflow-hidden">
       <div className="flex items-center justify-between">
@@ -75,6 +124,14 @@ export default function App() {
             />
             Hooks
           </button>
+          {import.meta.env.DEV && (
+            <button
+              onClick={() => setView("dev")}
+              className="text-xs px-2.5 py-1 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
+            >
+              Replay
+            </button>
+          )}
           <button
             onClick={() => setView("settings")}
             className="text-xs px-2.5 py-1 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
@@ -99,5 +156,13 @@ export default function App() {
         <span>{model.provider}/{model.model}</span>
       </div>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
   );
 }

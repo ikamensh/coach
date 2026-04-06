@@ -5,12 +5,12 @@ use std::time::Duration;
 use crate::state::{CoachMode, SharedState};
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct HookPayload {
     session_id: Option<String>,
     #[allow(dead_code)]
     hook_event_name: Option<String>,
     tool_name: Option<String>,
+    tool_input: Option<serde_json::Value>,
     cwd: Option<String>,
 }
 
@@ -80,7 +80,7 @@ const STOP_COOLDOWN: Duration = Duration::from_secs(15);
 async fn handle_stop(
     AxumState(state): AxumState<AppState>,
     Json(payload): Json<HookPayload>,
-) -> Json<HookResponse> {
+) -> Json<serde_json::Value> {
     let sid = session_id(&payload);
     let mut coach = state.coach.write().await;
 
@@ -92,19 +92,17 @@ async fn handle_stop(
         .map_or(false, |last| last.elapsed() < STOP_COOLDOWN);
 
     if mode != CoachMode::Away {
-        // stop_count tracks all stops, including passthrough
         coach.sessions.get_mut(&sid).unwrap().stop_count += 1;
         coach.log(&sid, "Stop", "passed through", None);
         emit_update(&state.emitter, &coach);
-        return Json(HookResponse::passthrough());
+        return Json(serde_json::json!({}));
     }
 
     if on_cooldown {
-        // Cooldown: allow the stop but still count it
         coach.sessions.get_mut(&sid).unwrap().stop_count += 1;
         coach.log(&sid, "Stop", "allowed (cooldown)", None);
         emit_update(&state.emitter, &coach);
-        return Json(HookResponse::passthrough());
+        return Json(serde_json::json!({}));
     }
 
     // Block the stop — update session fields
@@ -115,30 +113,16 @@ async fn handle_stop(
         session.stop_blocked_count += 1;
     }
 
-    let priorities_text = coach
-        .priorities
-        .iter()
-        .enumerate()
-        .map(|(i, p)| format!("{}. {}", i + 1, p))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let message = format!(
-        "User is away. Continue working autonomously. \
-         If you need to make a decision, use these priorities (highest first): {}. \
-         If you were asking whether to proceed — yes, proceed.",
-        priorities_text
-    );
+    let message = crate::state::away_message(&coach.priorities);
 
     coach.log(&sid, "Stop", "blocked — user away", Some(message.clone()));
     emit_update(&state.emitter, &coach);
 
-    Json(HookResponse {
-        hook_specific_output: Some(serde_json::json!({
-            "decision": "block",
-            "additionalContext": message
-        })),
-    })
+    // Stop hooks use top-level fields, NOT hookSpecificOutput.
+    Json(serde_json::json!({
+        "decision": "block",
+        "reason": message
+    }))
 }
 
 async fn handle_post_tool_use(
@@ -147,12 +131,44 @@ async fn handle_post_tool_use(
 ) -> Json<HookResponse> {
     let sid = session_id(&payload);
     let tool = payload.tool_name.unwrap_or_default();
+    let tool_input = payload.tool_input.unwrap_or(serde_json::Value::Null);
     let mut coach = state.coach.write().await;
     let session = coach.session(&sid, payload.cwd.as_deref());
     *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
-    coach.log(&sid, "PostToolUse", "observed", Some(tool));
+
+    // Run enabled rules against tool input
+    let rule_message = check_rules(&coach.rules, &tool, &tool_input);
+
+    if let Some(ref msg) = rule_message {
+        coach.log(&sid, "PostToolUse", "rule triggered", Some(format!("{}: {}", tool, msg)));
+    } else {
+        coach.log(&sid, "PostToolUse", "observed", Some(tool));
+    }
+
     emit_update(&state.emitter, &coach);
-    Json(HookResponse::passthrough())
+
+    match rule_message {
+        Some(msg) => Json(HookResponse {
+            hook_specific_output: Some(serde_json::json!({
+                "additionalContext": msg
+            })),
+        }),
+        None => Json(HookResponse::passthrough()),
+    }
+}
+
+fn check_rules(
+    rules: &[crate::settings::CoachRule],
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Option<String> {
+    let outdated_enabled = rules.iter().any(|r| r.id == "outdated_models" && r.enabled);
+    if !outdated_enabled {
+        return None;
+    }
+
+    let text = crate::rules::extract_checkable_text(tool_name, tool_input)?;
+    crate::rules::check_outdated_models(&text)
 }
 
 async fn handle_get_state(

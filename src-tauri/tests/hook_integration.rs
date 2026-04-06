@@ -45,9 +45,9 @@ async fn post_tool_use_creates_session() {
     let resp = client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
-            "sessionId": "sess-1",
-            "hookEventName": "PostToolUse",
-            "toolName": "Bash",
+            "session_id": "sess-1",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
             "cwd": "/tmp/my-project"
         }))
         .send()
@@ -80,9 +80,9 @@ async fn multiple_sessions_tracked_independently() {
         client
             .post(format!("{base}/hook/post-tool-use"))
             .json(&serde_json::json!({
-                "sessionId": id,
-                "hookEventName": "PostToolUse",
-                "toolName": "Read",
+                "session_id": id,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
                 "cwd": format!("/projects/{id}")
             }))
             .send()
@@ -94,9 +94,9 @@ async fn multiple_sessions_tracked_independently() {
     client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
-            "sessionId": "alpha",
-            "hookEventName": "PostToolUse",
-            "toolName": "Edit"
+            "session_id": "alpha",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit"
         }))
         .send()
         .await
@@ -136,9 +136,9 @@ async fn permission_request_auto_approves_in_away_mode() {
     client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
-            "sessionId": "away-sess",
-            "hookEventName": "PostToolUse",
-            "toolName": "Read"
+            "session_id": "away-sess",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read"
         }))
         .send()
         .await
@@ -156,9 +156,9 @@ async fn permission_request_auto_approves_in_away_mode() {
     let resp: serde_json::Value = client
         .post(format!("{base}/hook/permission-request"))
         .json(&serde_json::json!({
-            "sessionId": "away-sess",
-            "hookEventName": "PermissionRequest",
-            "toolName": "Bash"
+            "session_id": "away-sess",
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash"
         }))
         .send()
         .await
@@ -180,9 +180,9 @@ async fn stop_blocks_then_allows_on_cooldown() {
     client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
-            "sessionId": "stop-sess",
-            "hookEventName": "PostToolUse",
-            "toolName": "Read"
+            "session_id": "stop-sess",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read"
         }))
         .send()
         .await
@@ -199,8 +199,8 @@ async fn stop_blocks_then_allows_on_cooldown() {
     let resp: serde_json::Value = client
         .post(format!("{base}/hook/stop"))
         .json(&serde_json::json!({
-            "sessionId": "stop-sess",
-            "hookEventName": "Stop"
+            "session_id": "stop-sess",
+            "hook_event_name": "Stop"
         }))
         .send()
         .await
@@ -209,18 +209,20 @@ async fn stop_blocks_then_allows_on_cooldown() {
         .await
         .unwrap();
 
-    assert_eq!(resp["hookSpecificOutput"]["decision"], "block");
-    assert!(resp["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap()
-        .contains("priorities"));
+    // Stop hooks use top-level fields, NOT hookSpecificOutput.
+    assert!(
+        resp.get("hookSpecificOutput").is_none(),
+        "stop hook must NOT use hookSpecificOutput — Claude Code rejects it"
+    );
+    assert_eq!(resp["decision"], "block");
+    assert!(resp["reason"].as_str().unwrap().contains("priorities"));
 
-    // Second Stop (within cooldown) → should pass through.
+    // Second Stop (within cooldown) → should pass through (empty object).
     let resp: serde_json::Value = client
         .post(format!("{base}/hook/stop"))
         .json(&serde_json::json!({
-            "sessionId": "stop-sess",
-            "hookEventName": "Stop"
+            "session_id": "stop-sess",
+            "hook_event_name": "Stop"
         }))
         .send()
         .await
@@ -229,7 +231,341 @@ async fn stop_blocks_then_allows_on_cooldown() {
         .await
         .unwrap();
 
-    assert!(resp.get("hookSpecificOutput").is_none());
+    assert!(resp.as_object().unwrap().is_empty(), "cooldown passthrough should be {{}}");
+}
+
+// ── Scanner discovers live sessions from ~/.claude/sessions/ ──────────
+
+/// The scanner should pick up real Claude Code sessions running on this
+/// machine.  We verify this by reading the session files ourselves and
+/// checking that sync_sessions registers them in CoachState.
+#[tokio::test]
+async fn scanner_discovers_real_sessions() {
+    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
+
+    // Run a sync (reads real ~/.claude/sessions/).
+    coach_lib::scanner::sync_sessions(&state, None).await;
+
+    let coach = state.read().await;
+    let live_files = coach_lib::scanner::scan_live_sessions();
+
+    // Every live session file should have a matching entry in state.
+    for file in &live_files {
+        let sess = coach.sessions.get(&file.session_id);
+        assert!(
+            sess.is_some(),
+            "session {} from file should be in state",
+            file.session_id
+        );
+        let sess = sess.unwrap();
+        assert_eq!(sess.pid, Some(file.pid));
+        assert_eq!(sess.event_count, 0, "discovered sessions start with 0 events");
+    }
+}
+
+/// A hook event arriving for a scanner-discovered session should merge
+/// cleanly: increment event_count while preserving the PID.
+#[tokio::test]
+async fn hook_merges_with_scanner_discovered_session() {
+    let (_base, state) = start_test_server().await;
+
+    // Simulate scanner discovering a session.
+    {
+        let mut coach = state.write().await;
+        coach.register_discovered("scan-merge", Some("/tmp/project"), chrono::Utc::now(), 42);
+    }
+
+    // Now a hook event arrives for the same session.
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{_base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "scan-merge",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "cwd": "/tmp/project"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let coach = state.read().await;
+    let sess = coach.sessions.get("scan-merge").unwrap();
+    assert_eq!(sess.event_count, 1, "hook should increment from 0 to 1");
+    assert_eq!(sess.pid, Some(42), "PID should be preserved after hook update");
+}
+
+// ── Outdated models rule ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn post_tool_use_triggers_outdated_models_rule() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Write tool with outdated model in content → should get additionalContext.
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "rule-sess",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "/tmp/app.py",
+                "content": "model = genai.GenerativeModel('gemini-2.0-flash')\nresult = model.generate(prompt)"
+            },
+            "cwd": "/tmp"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let ctx = resp["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("should have additionalContext");
+    assert!(ctx.contains("gemini-2.0-flash"), "should mention the outdated model");
+    assert!(ctx.contains("gemini-2.5-flash"), "should suggest the replacement");
+}
+
+#[tokio::test]
+async fn post_tool_use_passes_through_current_models() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Write tool with current model → no intervention.
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "rule-sess-2",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "/tmp/app.py",
+                "content": "model = genai.GenerativeModel('gemini-2.5-flash')"
+            },
+            "cwd": "/tmp"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        resp.get("hookSpecificOutput").is_none(),
+        "current models should not trigger the rule"
+    );
+}
+
+// ── Hook response schema validation ───────────────────────────────────
+//
+// Claude Code validates hook responses against a strict schema per event type.
+// Each hook type has a different response format:
+//
+//   PermissionRequest: { hookSpecificOutput: { decision: { behavior }, additionalContext? } }
+//   PostToolUse:       { hookSpecificOutput: { additionalContext } }
+//   Stop:              { decision: "block", reason: "..." }   (top-level, NO hookSpecificOutput)
+//
+// Passthrough (no intervention) is always `{}` for all hook types.
+
+/// Validates that a hook response conforms to Claude Code's expected schema.
+fn validate_hook_response(resp: &serde_json::Value, hook_event: &str) {
+    let obj = resp.as_object().unwrap_or_else(|| panic!("{hook_event}: response must be object"));
+
+    // Empty object = passthrough, always valid.
+    if obj.is_empty() {
+        return;
+    }
+
+    match hook_event {
+        "Stop" => {
+            // Stop hooks use top-level fields, never hookSpecificOutput.
+            assert!(
+                resp.get("hookSpecificOutput").is_none(),
+                "Stop: must NOT use hookSpecificOutput"
+            );
+            let allowed: &[&str] = &["decision", "reason"];
+            for key in obj.keys() {
+                assert!(
+                    allowed.contains(&key.as_str()),
+                    "Stop: unexpected top-level key '{key}' (allowed: {allowed:?})"
+                );
+            }
+            if let Some(d) = resp.get("decision") {
+                assert_eq!(d, "block", "Stop: decision must be \"block\"");
+            }
+        }
+        "PermissionRequest" | "PostToolUse" => {
+            // These use hookSpecificOutput.
+            for key in obj.keys() {
+                assert!(
+                    key == "hookSpecificOutput",
+                    "{hook_event}: unexpected top-level key '{key}'"
+                );
+            }
+            let hso = resp["hookSpecificOutput"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{hook_event}: hookSpecificOutput must be an object"));
+
+            let allowed: &[&str] = match hook_event {
+                "PermissionRequest" => &["decision", "additionalContext"],
+                "PostToolUse" => &["additionalContext"],
+                _ => unreachable!(),
+            };
+            for key in hso.keys() {
+                assert!(
+                    allowed.contains(&key.as_str()),
+                    "{hook_event}: unexpected field '{key}' in hookSpecificOutput (allowed: {allowed:?})"
+                );
+            }
+
+            // PermissionRequest decision must be { behavior: "allow"|"deny" }.
+            if hook_event == "PermissionRequest" {
+                if let Some(decision) = hso.get("decision") {
+                    assert!(decision.is_object(), "PermissionRequest: decision must be an object");
+                    let behavior = decision.get("behavior").and_then(|b| b.as_str())
+                        .unwrap_or_else(|| panic!("PermissionRequest: decision needs 'behavior'"));
+                    assert!(
+                        behavior == "allow" || behavior == "deny",
+                        "PermissionRequest: decision.behavior must be 'allow' or 'deny', got '{behavior}'"
+                    );
+                }
+            }
+        }
+        other => panic!("unknown hook event: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn all_hook_responses_conform_to_claude_code_schema() {
+    // Exercises every hook endpoint in every mode and validates the response schema.
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let payload = |sid: &str, event: &str| -> serde_json::Value {
+        serde_json::json!({
+            "session_id": sid,
+            "hook_event_name": event,
+            "tool_name": "Bash",
+            "tool_input": { "command": "echo hello" },
+            "cwd": "/tmp/schema-test"
+        })
+    };
+
+    // ── Present mode (default) ──────────────────────────────────────
+
+    for (endpoint, event) in [
+        ("hook/permission-request", "PermissionRequest"),
+        ("hook/stop", "Stop"),
+        ("hook/post-tool-use", "PostToolUse"),
+    ] {
+        let resp: serde_json::Value = client
+            .post(format!("{base}/{endpoint}"))
+            .json(&payload("schema-present", event))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        validate_hook_response(&resp, event);
+    }
+
+    // ── Away mode ───────────────────────────────────────────────────
+
+    {
+        let mut s = state.write().await;
+        s.default_mode = coach_lib::state::CoachMode::Away;
+        if let Some(sess) = s.sessions.get_mut("schema-present") {
+            sess.mode = coach_lib::state::CoachMode::Away;
+        }
+    }
+
+    // Create fresh session that will inherit away mode.
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/permission-request"))
+        .json(&payload("schema-away", "PermissionRequest"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    validate_hook_response(&resp, "PermissionRequest");
+
+    // Stop in away mode (first call — should block).
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/stop"))
+        .json(&payload("schema-away", "Stop"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    validate_hook_response(&resp, "Stop");
+
+    // Stop in away mode (second call — cooldown passthrough).
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/stop"))
+        .json(&payload("schema-away", "Stop"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    validate_hook_response(&resp, "Stop");
+
+    // PostToolUse in away mode.
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&payload("schema-away", "PostToolUse"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    validate_hook_response(&resp, "PostToolUse");
+}
+
+#[tokio::test]
+async fn post_tool_use_rule_response_schema() {
+    // When a rule fires, the PostToolUse response must still conform to schema.
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Write tool input that triggers the outdated_models rule.
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "rule-schema",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": {
+                "content": "model = 'gpt-3.5-turbo'"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    validate_hook_response(&resp, "PostToolUse");
+    // Rule should have fired — verify additionalContext is present.
+    assert!(
+        resp["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some(),
+        "expected rule to produce additionalContext"
+    );
 }
 
 // ── Real Claude Code integration ───────────────────────────────────────

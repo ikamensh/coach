@@ -1,4 +1,5 @@
-use crate::settings::{self, HookStatus, ModelConfig};
+use crate::replay;
+use crate::settings::{self, CoachRule, EngineMode, HookStatus, ModelConfig};
 use crate::state::{CoachMode, CoachSnapshot, CoachState, SharedState, Theme, EVENT_STATE_UPDATED, EVENT_THEME_CHANGED};
 use serde_json::json;
 use tauri::Emitter;
@@ -200,4 +201,56 @@ pub async fn install_hooks(state: tauri::State<'_, SharedState>) -> Result<HookS
     let port = state.read().await.port;
     settings::install_hooks(port)?;
     Ok(settings::check_hook_status(port))
+}
+
+#[tauri::command]
+pub async fn uninstall_hooks(state: tauri::State<'_, SharedState>) -> Result<HookStatus, String> {
+    let port = state.read().await.port;
+    settings::uninstall_hooks(port)?;
+    Ok(settings::check_hook_status(port))
+}
+
+#[tauri::command]
+pub async fn list_saved_sessions(limit: Option<usize>) -> Result<Vec<replay::SavedSession>, String> {
+    let limit = limit.unwrap_or(50);
+    Ok(replay::list_sessions(limit))
+}
+
+#[tauri::command]
+pub async fn replay_session(
+    state: tauri::State<'_, SharedState>,
+    session_id: String,
+    mode: Option<String>,
+) -> Result<replay::ReplayResult, String> {
+    let coach = state.read().await;
+    let mode = mode.unwrap_or_else(|| "away".to_string());
+    let priorities = coach.priorities.clone();
+    drop(coach);
+    replay::replay_session(&session_id, &mode, &priorities)
+}
+
+#[tauri::command]
+pub async fn set_coach_mode(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+    coach_mode: EngineMode,
+) -> Result<(), String> {
+    let mut s = state.write().await;
+    s.coach_mode = coach_mode;
+    s.save();
+    emit_snapshot(&app, &s)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_rules(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+    rules: Vec<CoachRule>,
+) -> Result<(), String> {
+    let mut s = state.write().await;
+    s.rules = rules;
+    s.save();
+    emit_snapshot(&app, &s)?;
+    Ok(())
 }

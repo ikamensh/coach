@@ -1,11 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-use crate::settings::{ModelConfig, Settings};
+use crate::settings::{CoachRule, EngineMode, ModelConfig, Settings};
 
 pub const EVENT_STATE_UPDATED: &str = "coach-state-updated";
 pub const EVENT_THEME_CHANGED: &str = "coach-theme-changed";
@@ -74,6 +74,8 @@ pub struct CoachSnapshot {
     pub theme: Theme,
     pub model: ModelConfig,
     pub token_status: HashMap<String, TokenStatus>,
+    pub coach_mode: EngineMode,
+    pub rules: Vec<CoachRule>,
 }
 
 pub struct SessionState {
@@ -89,6 +91,8 @@ pub struct SessionState {
     pub stop_count: usize,
     pub stop_blocked_count: usize,
     pub cwd_history: Vec<String>,
+    /// PID of the Claude Code process, set by the session scanner.
+    pub pid: Option<u32>,
 }
 
 pub struct CoachState {
@@ -102,6 +106,8 @@ pub struct CoachState {
     pub api_tokens: HashMap<String, String>,
     pub env_tokens: HashMap<String, String>,
     pub http_client: reqwest::Client,
+    pub coach_mode: EngineMode,
+    pub rules: Vec<CoachRule>,
 }
 
 impl CoachState {
@@ -166,6 +172,8 @@ impl CoachState {
             api_tokens: settings.api_tokens,
             env_tokens: crate::settings::env_tokens(),
             http_client: reqwest::Client::new(),
+            coach_mode: settings.coach_mode,
+            rules: settings.rules,
         }
     }
 
@@ -183,6 +191,8 @@ impl CoachState {
             priorities: self.priorities.clone(),
             theme: self.theme.clone(),
             port: self.port,
+            coach_mode: self.coach_mode.clone(),
+            rules: self.rules.clone(),
         }
     }
 
@@ -225,6 +235,7 @@ impl CoachState {
                     stop_count: 0,
                     stop_blocked_count: 0,
                     cwd_history,
+                    pid: None,
                 }
             })
     }
@@ -282,6 +293,8 @@ impl CoachState {
                 }
                 status
             },
+            coach_mode: self.coach_mode.clone(),
+            rules: self.rules.clone(),
         }
     }
 
@@ -308,6 +321,76 @@ impl CoachState {
         self.sessions
             .retain(|_, s| s.last_event.elapsed().as_secs() < SESSION_TTL_SECS);
     }
+
+    /// Register a session discovered by the file scanner.
+    /// If the session already exists (created by a hook), just assigns the PID.
+    pub fn register_discovered(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        started_at: DateTime<Utc>,
+        pid: u32,
+    ) {
+        if let Some(sess) = self.sessions.get_mut(session_id) {
+            if sess.pid.is_none() {
+                sess.pid = Some(pid);
+            }
+            return;
+        }
+
+        let cwd_history: Vec<String> = cwd.iter().map(|c| c.to_string()).collect();
+        let display_name = derive_display_name(&cwd_history, session_id);
+        self.sessions.insert(
+            session_id.to_string(),
+            SessionState {
+                mode: self.default_mode.clone(),
+                cwd: cwd.map(String::from),
+                last_event: Instant::now(),
+                last_event_time: Utc::now(),
+                event_count: 0,
+                last_stop_blocked: None,
+                started_at,
+                display_name,
+                tool_counts: HashMap::new(),
+                stop_count: 0,
+                stop_blocked_count: 0,
+                cwd_history,
+                pid: Some(pid),
+            },
+        );
+    }
+
+    /// Remove sessions whose PID was set by the scanner but is no longer
+    /// in the live set. Returns the IDs of removed sessions.
+    pub fn remove_dead_sessions(&mut self, live_session_ids: &HashSet<String>) -> Vec<String> {
+        let dead: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(id, s)| s.pid.is_some() && !live_session_ids.contains(id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &dead {
+            self.sessions.remove(id);
+        }
+        dead
+    }
+}
+
+/// Build the "away mode" intervention message from the current priorities.
+pub fn away_message(priorities: &[String]) -> String {
+    let ptext = priorities
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{}. {}", i + 1, p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "User is away. Continue working autonomously. \
+         If you need to make a decision, use these priorities (highest first): {}. \
+         If you were asking whether to proceed — yes, proceed.",
+        ptext
+    )
 }
 
 pub type SharedState = Arc<RwLock<CoachState>>;
@@ -315,7 +398,7 @@ pub type SharedState = Arc<RwLock<CoachState>>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{ModelConfig, Settings};
+    use crate::settings::{EngineMode, ModelConfig, Settings};
     use std::collections::HashMap;
 
     /// Build a CoachState with empty env_tokens so tests don't depend
@@ -335,6 +418,8 @@ mod tests {
             api_tokens: HashMap::new(),
             env_tokens: HashMap::new(),
             http_client: reqwest::Client::new(),
+            coach_mode: EngineMode::Rules,
+            rules: vec![],
         }
     }
 
@@ -514,6 +599,8 @@ mod tests {
             priorities: vec!["Speed".into(), "Correctness".into()],
             theme: Theme::Dark,
             port: 8080,
+            coach_mode: EngineMode::Rules,
+            rules: vec![],
         };
 
         // Note: from_settings calls env_tokens() which reads real env.
@@ -529,6 +616,8 @@ mod tests {
             api_tokens: original.api_tokens.clone(),
             env_tokens: HashMap::new(),
             http_client: reqwest::Client::new(),
+            coach_mode: original.coach_mode.clone(),
+            rules: original.rules.clone(),
         };
 
         let restored = state.to_settings();
@@ -539,6 +628,8 @@ mod tests {
         assert_eq!(restored.priorities, original.priorities);
         assert_eq!(restored.theme, original.theme);
         assert_eq!(restored.port, original.port);
+        assert_eq!(restored.coach_mode, original.coach_mode);
+        assert_eq!(restored.rules, original.rules);
     }
 
     /// to_settings should not include transient state like sessions or
@@ -650,6 +741,73 @@ mod tests {
         let sess = state.session("s1", Some("/Users/foo/projects/coach"));
 
         assert_eq!(sess.cwd_history.len(), 2);
+    }
+
+    // ── register_discovered / remove_dead_sessions ──────────────────────
+
+    /// register_discovered should create a session with event_count=0
+    /// and the provided started_at timestamp (not Utc::now()).
+    #[test]
+    fn register_discovered_creates_session() {
+        use chrono::Duration;
+        let mut state = test_state();
+        let started = Utc::now() - Duration::hours(1);
+        state.register_discovered("scan-1", Some("/projects/foo"), started, 12345);
+
+        let sess = state.sessions.get("scan-1").unwrap();
+        assert_eq!(sess.event_count, 0);
+        assert_eq!(sess.pid, Some(12345));
+        assert_eq!(sess.started_at, started);
+        assert_eq!(sess.cwd, Some("/projects/foo".into()));
+    }
+
+    /// When a hook already created the session, register_discovered
+    /// should only assign the PID without resetting other fields.
+    #[test]
+    fn register_discovered_assigns_pid_to_existing() {
+        let mut state = test_state();
+        // Hook creates session first
+        state.session("s1", Some("/a"));
+        assert_eq!(state.sessions.get("s1").unwrap().event_count, 1);
+        assert!(state.sessions.get("s1").unwrap().pid.is_none());
+
+        // Scanner discovers it
+        state.register_discovered("s1", Some("/a"), Utc::now(), 999);
+
+        let sess = state.sessions.get("s1").unwrap();
+        assert_eq!(sess.pid, Some(999));
+        assert_eq!(sess.event_count, 1, "event_count should be preserved");
+    }
+
+    /// remove_dead_sessions should remove sessions with a PID that is
+    /// not in the live set, and leave sessions without a PID untouched.
+    #[test]
+    fn remove_dead_sessions_only_removes_pid_sessions() {
+        let mut state = test_state();
+        // hook-only session (no pid)
+        state.session("hook-only", None);
+        // scanner-discovered session
+        state.register_discovered("scanned", Some("/a"), Utc::now(), 111);
+
+        let live = HashSet::new(); // nothing is live
+        let dead = state.remove_dead_sessions(&live);
+
+        assert_eq!(dead, vec!["scanned"]);
+        assert!(state.sessions.contains_key("hook-only"), "hook session should survive");
+        assert!(!state.sessions.contains_key("scanned"));
+    }
+
+    /// remove_dead_sessions should keep sessions whose ID is in the live set.
+    #[test]
+    fn remove_dead_sessions_keeps_live() {
+        let mut state = test_state();
+        state.register_discovered("alive", Some("/a"), Utc::now(), 222);
+
+        let live: HashSet<String> = ["alive".to_string()].into();
+        let dead = state.remove_dead_sessions(&live);
+
+        assert!(dead.is_empty());
+        assert!(state.sessions.contains_key("alive"));
     }
 
     /// Snapshot should include the new session fields.

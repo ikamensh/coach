@@ -5,6 +5,12 @@ import { listen } from "@tauri-apps/api/event";
 type CoachMode = "present" | "away";
 type Theme = "light" | "dark" | "system";
 type TokenSource = "user" | "env" | "none";
+type EngineMode = "rules" | "llm";
+
+interface CoachRule {
+  id: string;
+  enabled: boolean;
+}
 
 interface ActivityEntry {
   timestamp: string;
@@ -47,6 +53,8 @@ interface CoachSnapshot {
   theme: Theme;
   model: ModelConfig;
   token_status: Record<string, TokenStatus>;
+  coach_mode: EngineMode;
+  rules: CoachRule[];
 }
 
 interface HookEntryStatus {
@@ -69,11 +77,14 @@ interface CoachState {
   theme: Theme;
   model: ModelConfig;
   tokenStatus: Record<string, TokenStatus>;
+  engineMode: EngineMode;
+  rules: CoachRule[];
   hookStatus: HookStatus | null;
   modelError: string | null;
   modelValidating: boolean;
   initialized: boolean;
-  view: "main" | "settings" | "hooks" | "session";
+  initError: string | null;
+  view: "main" | "settings" | "hooks" | "session" | "dev";
   selectedSessionId: string | null;
 }
 
@@ -88,10 +99,14 @@ interface CoachActions {
   setTheme: (theme: Theme) => Promise<void>;
   setApiToken: (provider: string, token: string) => Promise<void>;
   setModel: (model: ModelConfig) => Promise<void>;
-  setView: (view: "main" | "settings" | "hooks" | "session") => void;
+  setView: (view: "main" | "settings" | "hooks" | "session" | "dev") => void;
   selectSession: (id: string | null) => void;
+  setEngineMode: (mode: EngineMode) => Promise<void>;
+  setRules: (rules: CoachRule[]) => Promise<void>;
+  toggleRule: (id: string) => Promise<void>;
   refreshHookStatus: () => Promise<void>;
   installHooks: () => Promise<void>;
+  uninstallHooks: () => Promise<void>;
 }
 
 type CoachStore = CoachState & CoachActions;
@@ -110,7 +125,7 @@ function applyThemeClass(theme: Theme) {
   }
 }
 
-export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, HookStatus };
+export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, HookStatus, EngineMode, CoachRule };
 
 export const useCoachStore = create<CoachStore>((set, get) => ({
   sessions: [],
@@ -120,29 +135,39 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   theme: "system",
   model: { provider: "google", model: "gemini-2.5-flash" },
   tokenStatus: {},
+  engineMode: "rules",
+  rules: [{ id: "outdated_models", enabled: true }],
   hookStatus: null,
   modelError: null,
   modelValidating: false,
   initialized: false,
+  initError: null,
   view: "main",
   selectedSessionId: null,
 
   init: async () => {
     if (get().initialized) return;
 
-    const snapshot = await invoke<CoachSnapshot>("get_state");
-    applyThemeClass(snapshot.theme);
+    try {
+      const snapshot = await invoke<CoachSnapshot>("get_state");
+      applyThemeClass(snapshot.theme);
 
-    set({
-      sessions: snapshot.sessions,
-      priorities: snapshot.priorities,
-      activityLog: snapshot.activity_log,
-      port: snapshot.port,
-      theme: snapshot.theme,
-      model: snapshot.model,
-      tokenStatus: snapshot.token_status,
-      initialized: true,
-    });
+      set({
+        sessions: snapshot.sessions,
+        priorities: snapshot.priorities,
+        activityLog: snapshot.activity_log,
+        port: snapshot.port,
+        theme: snapshot.theme,
+        model: snapshot.model,
+        tokenStatus: snapshot.token_status,
+        engineMode: snapshot.coach_mode,
+        rules: snapshot.rules,
+        initialized: true,
+      });
+    } catch (e) {
+      set({ initError: String(e) });
+      return;
+    }
 
     get().refreshHookStatus();
 
@@ -154,6 +179,8 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         activityLog: s.activity_log,
         model: s.model,
         tokenStatus: s.token_status,
+        engineMode: s.coach_mode,
+        rules: s.rules,
       });
     });
 
@@ -236,6 +263,23 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
 
   selectSession: (id) => set({ selectedSessionId: id, view: id ? "session" : "main" }),
 
+  setEngineMode: async (coachMode) => {
+    await invoke("set_coach_mode", { coachMode });
+    set({ engineMode: coachMode });
+  },
+
+  setRules: async (rules) => {
+    await invoke("set_rules", { rules });
+    set({ rules });
+  },
+
+  toggleRule: async (id) => {
+    const rules = get().rules.map((r) =>
+      r.id === id ? { ...r, enabled: !r.enabled } : r,
+    );
+    await get().setRules(rules);
+  },
+
   refreshHookStatus: async () => {
     const hookStatus = await invoke<HookStatus>("get_hook_status");
     set({ hookStatus });
@@ -243,6 +287,11 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
 
   installHooks: async () => {
     const hookStatus = await invoke<HookStatus>("install_hooks");
+    set({ hookStatus });
+  },
+
+  uninstallHooks: async () => {
+    const hookStatus = await invoke<HookStatus>("uninstall_hooks");
     set({ hookStatus });
   },
 }));

@@ -37,17 +37,20 @@ fn expected_hook_urls(port: u16) -> Vec<(&'static str, String)> {
 }
 
 fn has_http_hook(entries: &[serde_json::Value], url: &str) -> bool {
-    entries.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("type").and_then(|t| t.as_str()) == Some("http")
-                        && hook.get("url").and_then(|u| u.as_str()) == Some(url)
-                })
+    entries.iter().any(|entry| is_coach_hook_entry(entry, url))
+}
+
+/// Returns true if this hook entry contains an HTTP hook matching the given URL.
+fn is_coach_hook_entry(entry: &serde_json::Value, url: &str) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("type").and_then(|t| t.as_str()) == Some("http")
+                    && hook.get("url").and_then(|u| u.as_str()) == Some(url)
             })
-    })
+        })
 }
 
 pub fn check_hook_status(port: u16) -> HookStatus {
@@ -141,10 +144,64 @@ pub fn install_hooks_at(port: u16, path: &std::path::Path) -> Result<(), String>
     Ok(())
 }
 
+/// Remove coach hooks from ~/.claude/settings.json, preserving everything else.
+pub fn uninstall_hooks(port: u16) -> Result<(), String> {
+    uninstall_hooks_at(port, &claude_settings_path())
+}
+
+pub fn uninstall_hooks_at(port: u16, path: &std::path::Path) -> Result<(), String> {
+    let expected = expected_hook_urls(port);
+
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| e.to_string())?;
+
+    let hooks_obj = settings
+        .get_mut("hooks")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("No hooks object in settings")?;
+
+    for (event, url) in &expected {
+        if let Some(arr) = hooks_obj.get_mut(*event).and_then(|v| v.as_array_mut()) {
+            arr.retain(|entry| !is_coach_hook_entry(entry, url));
+        }
+    }
+
+    // Clean up empty event arrays
+    let empty_events: Vec<String> = hooks_obj
+        .iter()
+        .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in empty_events {
+        hooks_obj.remove(&key);
+    }
+
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub provider: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineMode {
+    /// Rule-based: pattern-matching only, no LLM calls.
+    Rules,
+    /// LLM-powered: sends context to the configured model for evaluation.
+    Llm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CoachRule {
+    pub id: String,
+    pub enabled: bool,
 }
 
 /// Env var name for each provider.
@@ -180,6 +237,10 @@ pub struct Settings {
     pub theme: Theme,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_coach_mode")]
+    pub coach_mode: EngineMode,
+    #[serde(default = "default_rules")]
+    pub rules: Vec<CoachRule>,
 }
 
 fn default_model() -> ModelConfig {
@@ -205,6 +266,17 @@ fn default_port() -> u16 {
     7700
 }
 
+fn default_coach_mode() -> EngineMode {
+    EngineMode::Rules
+}
+
+fn default_rules() -> Vec<CoachRule> {
+    vec![CoachRule {
+        id: "outdated_models".into(),
+        enabled: true,
+    }]
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -213,6 +285,8 @@ impl Default for Settings {
             priorities: default_priorities(),
             theme: default_theme(),
             port: default_port(),
+            coach_mode: default_coach_mode(),
+            rules: default_rules(),
         }
     }
 }
@@ -309,6 +383,10 @@ mod tests {
             priorities: vec!["Speed".into(), "Safety".into()],
             theme: Theme::Dark,
             port: 9999,
+            coach_mode: EngineMode::Llm,
+            rules: vec![
+                CoachRule { id: "outdated_models".into(), enabled: false },
+            ],
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -320,6 +398,8 @@ mod tests {
         assert_eq!(restored.priorities, original.priorities);
         assert_eq!(restored.theme, original.theme);
         assert_eq!(restored.port, original.port);
+        assert_eq!(restored.coach_mode, original.coach_mode);
+        assert_eq!(restored.rules, original.rules);
     }
 
     /// Deserializing an empty JSON object `{}` should produce the same
@@ -447,5 +527,66 @@ mod tests {
         // Existing command hook should still be there alongside the new http hook.
         let stop_entries = content["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop_entries.len(), 2, "existing command hook + new http hook");
+    }
+
+    // ── uninstall_hooks ────────────────────────────────────────────────
+
+    /// install then uninstall should leave no coach hooks, and
+    /// check_hook_status should report not installed.
+    #[test]
+    fn uninstall_reverses_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        install_hooks_at(7700, &path).unwrap();
+        uninstall_hooks_at(7700, &path).unwrap();
+
+        let status = check_hook_status_at(7700, &path);
+        assert!(!status.installed);
+        assert!(status.hooks.iter().all(|h| !h.installed));
+    }
+
+    /// Uninstall should preserve other hooks and settings.
+    #[test]
+    fn uninstall_preserves_other_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let existing = serde_json::json!({
+            "permissions": {"allow": ["Bash"]},
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "echo stopped"}]}]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        install_hooks_at(7700, &path).unwrap();
+        uninstall_hooks_at(7700, &path).unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Permissions untouched.
+        assert_eq!(content["permissions"]["allow"][0], "Bash");
+        // The user's command hook on Stop should survive.
+        let stop_entries = content["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_entries.len(), 1);
+        assert_eq!(stop_entries[0]["hooks"][0]["type"], "command");
+    }
+
+    /// Uninstall cleans up empty event arrays (coach-only events get removed).
+    #[test]
+    fn uninstall_removes_empty_event_arrays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        install_hooks_at(7700, &path).unwrap();
+        uninstall_hooks_at(7700, &path).unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        let hooks = content["hooks"].as_object().unwrap();
+        assert!(hooks.is_empty(), "all coach-only events should be cleaned up");
     }
 }

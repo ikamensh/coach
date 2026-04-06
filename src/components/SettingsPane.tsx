@@ -141,6 +141,14 @@ function TokenInput({
   );
 }
 
+const RULE_LABELS: Record<string, { label: string; description: string }> = {
+  outdated_models: {
+    label: "Outdated LLM models",
+    description:
+      "Detect when code uses outdated model identifiers (gemini-2.0-flash, gpt-4o, claude-3-*) and suggest current versions",
+  },
+};
+
 export function SettingsPane() {
   const model = useCoachStore((s) => s.model);
   const tokenStatus = useCoachStore((s) => s.tokenStatus);
@@ -148,6 +156,10 @@ export function SettingsPane() {
   const modelValidating = useCoachStore((s) => s.modelValidating);
   const setModel = useCoachStore((s) => s.setModel);
   const setView = useCoachStore((s) => s.setView);
+  const engineMode = useCoachStore((s) => s.engineMode);
+  const rules = useCoachStore((s) => s.rules);
+  const setEngineMode = useCoachStore((s) => s.setEngineMode);
+  const toggleRule = useCoachStore((s) => s.toggleRule);
 
   const selectedProvider = PROVIDERS.find((p) => p.id === model.provider);
   const models = selectedProvider?.models ?? [];
@@ -222,6 +234,80 @@ export function SettingsPane() {
             {modelError}
           </p>
         )}
+      </section>
+
+      {/* Coach Engine */}
+      <section>
+        <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
+          Coach Engine
+        </h2>
+        <div className="flex gap-1">
+          <button
+            onClick={() => setEngineMode("rules")}
+            className={`flex-1 text-xs px-3 py-1.5 rounded-lg font-medium transition-colors ${
+              engineMode === "rules"
+                ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
+            }`}
+          >
+            Rules
+          </button>
+          <button
+            onClick={() => setEngineMode("llm")}
+            className={`flex-1 text-xs px-3 py-1.5 rounded-lg font-medium transition-colors ${
+              engineMode === "llm"
+                ? "bg-violet-500/20 text-violet-600 dark:text-violet-400"
+                : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
+            }`}
+          >
+            LLM
+          </button>
+        </div>
+        <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-1.5">
+          {engineMode === "rules"
+            ? "Pattern-matching only. No LLM calls, zero latency."
+            : "Uses the coach model to evaluate context. Requires API token."}
+        </p>
+      </section>
+
+      {/* Rules */}
+      <section>
+        <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
+          Rules
+        </h2>
+        <div className="space-y-2">
+          {rules.map((rule) => {
+            const meta = RULE_LABELS[rule.id];
+            return (
+              <label
+                key={rule.id}
+                className="flex items-start gap-2.5 cursor-pointer group"
+              >
+                <input
+                  type="checkbox"
+                  checked={rule.enabled}
+                  onChange={() => toggleRule(rule.id)}
+                  className="mt-0.5 accent-emerald-500"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-zinc-700 dark:text-zinc-300 font-medium group-hover:text-zinc-900 dark:group-hover:text-zinc-100 transition-colors">
+                    {meta?.label ?? rule.id}
+                  </div>
+                  {meta?.description && (
+                    <div className="text-xs text-zinc-400 dark:text-zinc-500 mt-0.5">
+                      {meta.description}
+                    </div>
+                  )}
+                </div>
+              </label>
+            );
+          })}
+          {rules.length === 0 && (
+            <p className="text-xs text-zinc-400 dark:text-zinc-500 italic">
+              No rules configured.
+            </p>
+          )}
+        </div>
       </section>
 
       {/* API Tokens */}

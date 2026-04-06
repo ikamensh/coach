@@ -10,6 +10,7 @@ export function HooksPane() {
   const hookStatus = useCoachStore((s) => s.hookStatus);
   const setView = useCoachStore((s) => s.setView);
   const installHooks = useCoachStore((s) => s.installHooks);
+  const uninstallHooks = useCoachStore((s) => s.uninstallHooks);
 
   return (
     <div className="flex flex-col gap-4 h-full">
@@ -82,10 +83,17 @@ export function HooksPane() {
           )}
 
           {hookStatus.installed && (
-            <p className="text-sm text-emerald-600 dark:text-emerald-400">
-              All hooks installed. Claude Code sessions will be tracked
-              automatically.
-            </p>
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-emerald-600 dark:text-emerald-400">
+                All hooks installed.
+              </p>
+              <button
+                onClick={uninstallHooks}
+                className="px-3 py-1.5 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg hover:bg-red-500/10 transition-colors"
+              >
+                Uninstall
+              </button>
+            </div>
           )}
         </>
       )}
