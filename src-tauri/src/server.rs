@@ -178,6 +178,10 @@ async fn handle_get_state(
     Json(coach.snapshot())
 }
 
+async fn handle_version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
 fn build_router(coach: SharedState, emitter: Option<tauri::AppHandle>) -> Router {
     let state = AppState { coach, emitter };
     Router::new()
@@ -185,6 +189,7 @@ fn build_router(coach: SharedState, emitter: Option<tauri::AppHandle>) -> Router
         .route("/hook/stop", post(handle_stop))
         .route("/hook/post-tool-use", post(handle_post_tool_use))
         .route("/state", get(handle_get_state))
+        .route("/version", get(handle_version))
         .with_state(state)
 }
 

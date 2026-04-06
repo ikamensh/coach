@@ -17,6 +17,21 @@ use tokio::sync::RwLock;
 pub fn run() {
     eprintln!("[coach] starting up");
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Another instance tried to launch — show our existing window.
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
+        .on_window_event(|window, event| {
+            // Close-to-tray: hide window instead of quitting.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             eprintln!("[coach] setup: loading settings");
             let settings = Settings::load();

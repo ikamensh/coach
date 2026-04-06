@@ -10,7 +10,7 @@ use crate::settings::{CoachRule, EngineMode, ModelConfig, Settings};
 pub const EVENT_STATE_UPDATED: &str = "coach-state-updated";
 pub const EVENT_THEME_CHANGED: &str = "coach-theme-changed";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum CoachMode {
     Present,

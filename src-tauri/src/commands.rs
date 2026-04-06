@@ -38,6 +38,7 @@ pub async fn set_all_sessions_mode(
 ) -> Result<(), String> {
     let mut s = state.write().await;
     s.set_all_modes(mode);
+    crate::tray::update_icon(&app, &mode);
     emit_snapshot(&app, &s)?;
     Ok(())
 }

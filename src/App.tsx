@@ -45,6 +45,14 @@ class ErrorBoundary extends Component<
   }
 }
 
+function VersionFooter() {
+  return (
+    <div className="text-[10px] text-zinc-400 dark:text-zinc-600 text-center pt-2">
+      v{__APP_VERSION__}
+    </div>
+  );
+}
+
 function AppInner() {
   const init = useCoachStore((s) => s.init);
   const initialized = useCoachStore((s) => s.initialized);
@@ -77,6 +85,7 @@ function AppInner() {
     return (
       <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
         <SettingsPane />
+        <VersionFooter />
       </div>
     );
   }
@@ -85,6 +94,7 @@ function AppInner() {
     return (
       <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
         <SessionDetail />
+        <VersionFooter />
       </div>
     );
   }
@@ -93,6 +103,7 @@ function AppInner() {
     return (
       <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
         <HooksPane />
+        <VersionFooter />
       </div>
     );
   }
@@ -101,6 +112,7 @@ function AppInner() {
     return (
       <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
         <DevPane />
+        <VersionFooter />
       </div>
     );
   }

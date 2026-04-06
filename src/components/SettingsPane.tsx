@@ -203,20 +203,19 @@ export function SettingsPane() {
               </option>
             ))}
           </select>
-          <input
-            list={`models-${model.provider}`}
+          <select
             value={model.model}
             onChange={(e) =>
               setModel({ provider: model.provider, model: e.target.value })
             }
-            placeholder="Model ID"
             className="flex-1 bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-1.5 text-sm text-zinc-800 dark:text-zinc-200 focus:outline-none font-mono"
-          />
-          <datalist id={`models-${model.provider}`}>
+          >
             {models.map((m) => (
-              <option key={m} value={m} />
+              <option key={m} value={m}>
+                {m}
+              </option>
             ))}
-          </datalist>
+          </select>
         </div>
         {activeSource === "none" && (
           <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
