@@ -568,6 +568,208 @@ async fn post_tool_use_rule_response_schema() {
     );
 }
 
+// ── LLM mode fallback + observer wiring ────────────────────────────────
+//
+// These tests cover the new code paths (chained evaluator, fire-and-forget
+// observer) without needing a real LLM key. `chain_openai` fails fast at the
+// "no token for primary provider" check before making any HTTP call, so the
+// failure paths run in milliseconds.
+
+/// Helper: switch a CoachState into LLM engine mode with the OpenAI provider
+/// but without any API token. This is the "user enabled the observer but
+/// hasn't put a key in" scenario — every LLM call will fail at snapshot_config.
+async fn put_in_llm_mode_no_key(state: &Arc<RwLock<CoachState>>) {
+    let mut s = state.write().await;
+    s.coach_mode = coach_lib::settings::EngineMode::Llm;
+    s.model = coach_lib::settings::ModelConfig {
+        provider: "openai".into(),
+        model: "gpt-5.4-mini".into(),
+    };
+    s.api_tokens.clear();
+    // Also wipe any env-resolved token so the test is hermetic regardless
+    // of the developer's shell environment.
+    s.env_tokens.clear();
+}
+
+/// In LLM mode + Away, when the LLM call fails (no key) the Stop hook must
+/// still return a valid block response — falling back to the fixed
+/// away_message instead of bubbling the LLM error to Claude Code.
+#[tokio::test]
+async fn stop_in_llm_mode_falls_back_to_fixed_when_no_key() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Create the session via PostToolUse first.
+    client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "llm-fallback",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    put_in_llm_mode_no_key(&state).await;
+    {
+        let mut s = state.write().await;
+        if let Some(sess) = s.sessions.get_mut("llm-fallback") {
+            sess.mode = coach_lib::state::CoachMode::Away;
+        }
+    }
+
+    let resp: serde_json::Value = client
+        .post(format!("{base}/hook/stop"))
+        .json(&serde_json::json!({
+            "session_id": "llm-fallback",
+            "hook_event_name": "Stop"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Schema must still be valid (the whole point of the fallback).
+    validate_hook_response(&resp, "Stop");
+    assert_eq!(resp["decision"], "block");
+    let reason = resp["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("priorities") || reason.contains("away"),
+        "fallback should look like the fixed away_message; got: {reason}"
+    );
+}
+
+/// In LLM mode + observer-capable provider, every PostToolUse should spawn
+/// the observer task. With no API key, the task fails fast and records an
+/// "Observer/error" entry in the session activity. This proves the wiring
+/// without needing a working LLM.
+#[tokio::test]
+async fn observer_fires_in_llm_mode_and_records_failure() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    put_in_llm_mode_no_key(&state).await;
+
+    let resp = client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "obs-fires",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/x.py", "new_string": "ok"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "hook must respond immediately");
+
+    // Observer is fire-and-forget. Wait briefly for the spawned task to
+    // run, fail at no-token, and record the error.
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let s = state.read().await;
+        if let Some(sess) = s.sessions.get("obs-fires") {
+            if sess.activity.iter().any(|a| a.hook_event == "Observer") {
+                // Found it.
+                let observer_entry = sess
+                    .activity
+                    .iter()
+                    .find(|a| a.hook_event == "Observer")
+                    .unwrap();
+                assert_eq!(
+                    observer_entry.action, "error",
+                    "no-token failure should be logged as Observer/error"
+                );
+                return;
+            }
+        }
+    }
+    panic!("observer task never recorded an Observer entry within 500ms");
+}
+
+/// In Rules mode, PostToolUse must NOT spawn an observer task — the LLM is
+/// supposed to be off. Verify the session has zero Observer entries even
+/// after waiting (regression test for "always firing the observer").
+#[tokio::test]
+async fn observer_does_not_fire_in_rules_mode() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Default is Rules mode. Don't change it.
+    client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "rules-only",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/x.py", "new_string": "ok"}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Even with a generous wait, no observer entry should appear.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let s = state.read().await;
+    let sess = s.sessions.get("rules-only").expect("session should exist");
+    let observer_entries: Vec<_> = sess
+        .activity
+        .iter()
+        .filter(|a| a.hook_event == "Observer")
+        .collect();
+    assert!(
+        observer_entries.is_empty(),
+        "Rules mode must not spawn observer; found {} Observer entries",
+        observer_entries.len()
+    );
+}
+
+/// In LLM mode with a provider that ISN'T observer-capable (e.g. google),
+/// PostToolUse must skip the observer task entirely — there's no chained
+/// path for non-OpenAI providers in rig 0.34. Same regression check as
+/// above but exercising the OBSERVER_CAPABLE_PROVIDERS gate.
+#[tokio::test]
+async fn observer_does_not_fire_for_non_capable_provider() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    {
+        let mut s = state.write().await;
+        s.coach_mode = coach_lib::settings::EngineMode::Llm;
+        s.model = coach_lib::settings::ModelConfig {
+            provider: "google".into(),
+            model: "gemini-2.5-flash".into(),
+        };
+        s.api_tokens.clear();
+        s.env_tokens.clear();
+    }
+
+    client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "google-llm",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/x.py", "new_string": "ok"}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let s = state.read().await;
+    let sess = s.sessions.get("google-llm").expect("session should exist");
+    assert!(
+        sess.activity.iter().all(|a| a.hook_event != "Observer"),
+        "non-capable provider must not spawn observer"
+    );
+}
+
 // ── Real Claude Code integration ───────────────────────────────────────
 
 #[tokio::test]
