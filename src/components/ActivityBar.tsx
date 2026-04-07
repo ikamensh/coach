@@ -21,11 +21,14 @@ export function activityOpacity(
 }
 
 /**
- * Pick a chip color from an activity entry. Coach interventions
- * (blocks, auto-approvals) get vivid alert colors; tool calls are
- * categorized by tool family; everything else falls back to neutral.
+ * Pick a chip color from an activity entry. User prompts are the major
+ * lifecycle event and get a vivid yellow that pops against tool noise.
+ * Coach interventions (blocks, auto-approvals) get alert colors; tool
+ * calls are categorized by tool family; everything else falls back to
+ * neutral.
  */
 export function activityColor(entry: ActivityEntry): string {
+  if (entry.hook_event === "UserPromptSubmit") return "rgb(250 204 21)"; // yellow-400
   if (entry.action.includes("blocked")) return "rgb(239 68 68)"; // red-500
   if (entry.action.includes("auto-approved")) return "rgb(245 158 11)"; // amber-500
 
@@ -52,6 +55,12 @@ export function activityColor(entry: ActivityEntry): string {
   return "rgb(113 113 122)"; // zinc-500
 }
 
+/** UserPromptSubmit is a major lifecycle event — render it as a wider,
+ * full-height "spike" so it stands out above the tool-call chip stream. */
+function isMajor(entry: ActivityEntry): boolean {
+  return entry.hook_event === "UserPromptSubmit";
+}
+
 function chipLabel(entry: ActivityEntry): string {
   const tool = entry.detail ? ` ${entry.detail}` : "";
   return `${entry.hook_event}${tool} — ${entry.action}`;
@@ -74,24 +83,29 @@ export function ActivityBar({ entries }: { entries: ActivityEntry[] }) {
 
   if (chips.length === 0) {
     return (
-      <div className="h-2 mt-1.5 rounded bg-zinc-200/40 dark:bg-zinc-700/30" />
+      <div className="h-4 mt-1.5 rounded bg-zinc-200/40 dark:bg-zinc-700/30" />
     );
   }
 
   return (
     <div
-      className="flex items-end gap-[2px] mt-1.5 h-3 overflow-hidden"
+      className="flex items-end gap-[2px] mt-1.5 h-4 overflow-hidden"
       aria-label="recent activity"
     >
       {chips.map((entry, i) => {
         const age = (now - new Date(entry.timestamp).getTime()) / 1000;
         const opacity = activityOpacity(age);
         if (opacity <= 0) return null;
+        const major = isMajor(entry);
         return (
           <span
             key={`${entry.timestamp}-${i}`}
             title={chipLabel(entry)}
-            className="block w-[5px] h-3 rounded-[1px]"
+            className={
+              major
+                ? "block w-[7px] h-4 rounded-[1px] ring-1 ring-yellow-300/60 dark:ring-yellow-200/40"
+                : "block w-[5px] h-2.5 rounded-[1px]"
+            }
             style={{ backgroundColor: activityColor(entry), opacity }}
           />
         );

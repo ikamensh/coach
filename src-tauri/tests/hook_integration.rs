@@ -852,3 +852,93 @@ async fn test_with_real_claude_code() {
         sessions[0]["session_id"]
     );
 }
+
+/// UserPromptSubmit must create the session if it doesn't exist, record a
+/// "user spoke" entry in the session's activity log with the (truncated)
+/// prompt text, and pass through with no decision payload.
+#[tokio::test]
+async fn user_prompt_submit_records_activity() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/hook/user-prompt-submit"))
+        .json(&serde_json::json!({
+            "session_id": "talk-1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "make the sessions stop jumping around",
+            "cwd": "/projects/coach"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Response is a passthrough — no decision body.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("hookSpecificOutput").is_none()
+            || body["hookSpecificOutput"].is_null(),
+        "user prompt submit should pass through, got: {body}",
+    );
+
+    // The activity entry should be on the session snapshot.
+    let snap: serde_json::Value = client
+        .get(format!("{base}/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session = snap["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == "talk-1")
+        .expect("session should exist after user prompt");
+    let activity = session["activity"].as_array().unwrap();
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0]["hook_event"], "UserPromptSubmit");
+    assert_eq!(activity[0]["action"], "user spoke");
+    assert_eq!(activity[0]["detail"], "make the sessions stop jumping around");
+}
+
+/// Long prompts must be truncated so a paste-bomb doesn't bloat the
+/// activity queue. The truncation marker is "…".
+#[tokio::test]
+async fn user_prompt_submit_truncates_long_prompts() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let long_prompt = "x".repeat(1000);
+    client
+        .post(format!("{base}/hook/user-prompt-submit"))
+        .json(&serde_json::json!({
+            "session_id": "longwinded",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": long_prompt,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let snap: serde_json::Value = client
+        .get(format!("{base}/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session = snap["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == "longwinded")
+        .unwrap();
+    let detail = session["activity"][0]["detail"].as_str().unwrap();
+    assert!(detail.ends_with("…"), "truncated prompts should end with ellipsis");
+    // 200 x's plus the ellipsis character.
+    assert_eq!(detail.chars().count(), 201);
+}

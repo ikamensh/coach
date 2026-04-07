@@ -33,6 +33,7 @@ fn expected_hook_urls(port: u16) -> Vec<(&'static str, String)> {
         ("PermissionRequest", format!("{}/hook/permission-request", base)),
         ("Stop", format!("{}/hook/stop", base)),
         ("PostToolUse", format!("{}/hook/post-tool-use", base)),
+        ("UserPromptSubmit", format!("{}/hook/user-prompt-submit", base)),
     ]
 }
 
@@ -478,7 +479,7 @@ mod tests {
         let status = check_hook_status_at(7700, std::path::Path::new("/nonexistent/path.json"));
         assert!(!status.installed);
         assert!(status.hooks.iter().all(|h| !h.installed));
-        assert_eq!(status.hooks.len(), 3); // PermissionRequest, Stop, PostToolUse
+        assert_eq!(status.hooks.len(), 4); // PermissionRequest, Stop, PostToolUse, UserPromptSubmit
     }
 
     /// After install_hooks_at writes hooks to a temp file, check_hook_status_at
@@ -509,7 +510,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
         // Each event should have exactly one entry.
-        for event in ["PermissionRequest", "Stop", "PostToolUse"] {
+        for event in ["PermissionRequest", "Stop", "PostToolUse", "UserPromptSubmit"] {
             let arr = content["hooks"][event].as_array().unwrap();
             assert_eq!(arr.len(), 1, "event {event} should have exactly 1 entry after double install");
         }

@@ -14,6 +14,9 @@ struct HookPayload {
     tool_input: Option<serde_json::Value>,
     /// Set by Claude Code on Stop hooks when available.
     stop_reason: Option<String>,
+    /// Set by Claude Code on UserPromptSubmit hooks — the literal text
+    /// the user typed.
+    prompt: Option<String>,
     cwd: Option<String>,
 }
 
@@ -76,6 +79,34 @@ async fn handle_permission_request(
         emit_update(&state.emitter, &coach);
         Json(HookResponse::passthrough())
     }
+}
+
+/// UserPromptSubmit fires whenever the user sends a turn to Claude Code.
+/// Cheap, always passes through — we just record it as a major event in
+/// the session timeline so the activity bar shows when the user spoke.
+async fn handle_user_prompt_submit(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let mut coach = state.coach.write().await;
+    coach.session(&sid, payload.cwd.as_deref());
+
+    // Truncate the prompt for the activity log — full text is overkill for
+    // a chip tooltip, and very long pastes would bloat the queue.
+    let detail = payload.prompt.as_ref().map(|p| {
+        const MAX: usize = 200;
+        if p.chars().count() > MAX {
+            let truncated: String = p.chars().take(MAX).collect();
+            format!("{truncated}…")
+        } else {
+            p.clone()
+        }
+    });
+    coach.log(&sid, "UserPromptSubmit", "user spoke", detail);
+    emit_update(&state.emitter, &coach);
+
+    Json(HookResponse::passthrough())
 }
 
 const STOP_COOLDOWN: Duration = Duration::from_secs(15);
@@ -348,6 +379,7 @@ fn build_router(coach: SharedState, emitter: Option<tauri::AppHandle>) -> Router
         .route("/hook/permission-request", post(handle_permission_request))
         .route("/hook/stop", post(handle_stop))
         .route("/hook/post-tool-use", post(handle_post_tool_use))
+        .route("/hook/user-prompt-submit", post(handle_user_prompt_submit))
         .route("/state", get(handle_get_state))
         .route("/version", get(handle_version))
         .with_state(state)

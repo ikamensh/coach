@@ -109,4 +109,18 @@ describe("activityColor", () => {
       }),
     ).toBe("rgb(113 113 122)");
   });
+
+  /** UserPromptSubmit is the major lifecycle event — it must dominate
+   * any other classification (color is yellow even if e.g. "blocked"
+   * appears in the action by some future fluke). */
+  it("uses yellow for UserPromptSubmit regardless of action text", () => {
+    expect(
+      activityColor({
+        timestamp: "",
+        hook_event: "UserPromptSubmit",
+        action: "user spoke",
+        detail: "anything",
+      }),
+    ).toBe("rgb(250 204 21)");
+  });
 });
