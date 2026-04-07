@@ -97,14 +97,17 @@ pub fn scan_live_sessions_in(dir: &Path) -> Vec<ClaudeSessionFile> {
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-pub async fn run_session_scanner(state: SharedState, app_handle: tauri::AppHandle) {
-    sync_sessions(&state, Some(&app_handle)).await;
+/// Periodically refresh the session list from `~/.claude/sessions/*.json`.
+/// Pass `Some(app_handle)` from the Tauri GUI path so changes emit
+/// `EVENT_STATE_UPDATED` to the frontend; pass `None` for headless mode.
+pub async fn run_session_scanner(state: SharedState, app_handle: Option<tauri::AppHandle>) {
+    sync_sessions(&state, app_handle.as_ref()).await;
 
     let mut interval = tokio::time::interval(SCAN_INTERVAL);
     interval.tick().await; // first tick is immediate, skip it
     loop {
         interval.tick().await;
-        sync_sessions(&state, Some(&app_handle)).await;
+        sync_sessions(&state, app_handle.as_ref()).await;
     }
 }
 

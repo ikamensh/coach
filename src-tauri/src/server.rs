@@ -683,10 +683,6 @@ pub fn fake_resolver_from_sid() -> PidResolver {
     Arc::new(|_peer_port, sid| Some(fake_pid_for_sid(sid)))
 }
 
-pub fn create_router(coach: SharedState, app_handle: tauri::AppHandle, port: u16) -> Router {
-    build_router(coach, Some(app_handle), lsof_resolver(port))
-}
-
 /// Router without Tauri emitter — for integration tests.
 /// Tests inject a fake resolver via `fake_resolver_from_sid()` so the
 /// in-process client gets distinct fake PIDs per session_id.
@@ -694,8 +690,15 @@ pub fn create_router_headless(coach: SharedState, resolver: PidResolver) -> Rout
     build_router(coach, None, resolver)
 }
 
-pub async fn start_server(coach: SharedState, app_handle: tauri::AppHandle, port: u16) {
-    let app = create_router(coach, app_handle, port);
+/// Bind the production hook server. Pass `Some(app_handle)` from the
+/// Tauri GUI path to get state-update events emitted to the frontend;
+/// pass `None` for headless `coach serve` mode (CLI / VM tests / CI).
+pub async fn start_server(
+    coach: SharedState,
+    app_handle: Option<tauri::AppHandle>,
+    port: u16,
+) {
+    let app = build_router(coach, app_handle, lsof_resolver(port));
     let addr = format!("127.0.0.1:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

@@ -75,13 +75,13 @@ pub fn run() {
             let server_state = state.clone();
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                server::start_server(server_state, app_handle, port).await;
+                server::start_server(server_state, Some(app_handle), port).await;
             });
 
             let scanner_state = state.clone();
             let scanner_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                scanner::run_session_scanner(scanner_state, scanner_handle).await;
+                scanner::run_session_scanner(scanner_state, Some(scanner_handle)).await;
             });
 
             tray::setup(app, state)?;
@@ -120,4 +120,60 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Coach");
+}
+
+/// Headless daemon mode: start the HTTP hook server and the session
+/// scanner without going through `tauri::Builder`. Reachable via the
+/// `coach serve` CLI subcommand. Skipping the Tauri runtime is the
+/// whole point — `tauri-plugin-single-instance` uses a global Unix
+/// socket on macOS, so two GUI coach processes cannot coexist on the
+/// same user account, which makes integration testing impossible.
+/// Headless mode bypasses this and is what VM tests / CI / users who
+/// just want the daemon should run.
+///
+/// Blocks until either the server task exits, the scanner task exits,
+/// or the process receives Ctrl-C.
+pub async fn serve(port_override: Option<u16>) {
+    let mut settings = Settings::load();
+    if let Some(p) = port_override {
+        settings.port = p;
+    }
+    let port = settings.port;
+    eprintln!("[coach serve] starting on 127.0.0.1:{port}, priorities={:?}", settings.priorities);
+
+    let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(settings)));
+
+    // Top up managed hooks the same way the GUI path does, so headless
+    // and GUI behave identically. No-op on a fresh tempdir HOME.
+    if let Ok(added) = settings::topup_managed_hooks(port) {
+        if !added.is_empty() {
+            eprintln!("[coach serve] topped up managed hooks: {added:?}");
+        }
+    }
+    if let Ok(added) = settings::topup_managed_cursor_hooks(port) {
+        if !added.is_empty() {
+            eprintln!("[coach serve] topped up Cursor managed hooks: {added:?}");
+        }
+    }
+
+    let server_task = tokio::spawn({
+        let s = state.clone();
+        async move { server::start_server(s, None, port).await }
+    });
+    let scanner_task = tokio::spawn({
+        let s = state.clone();
+        async move { scanner::run_session_scanner(s, None).await }
+    });
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("[coach serve] received Ctrl-C, shutting down");
+        }
+        r = server_task => {
+            eprintln!("[coach serve] hook server task exited: {r:?}");
+        }
+        r = scanner_task => {
+            eprintln!("[coach serve] scanner task exited: {r:?}");
+        }
+    }
 }

@@ -26,6 +26,7 @@ USAGE:
     coach <command> [args]                 run a CLI subcommand
 
 COMMANDS:
+    serve [--port N]                       run the daemon headless (no GUI / no tray)
     status [--json]                        show live state (requires running Coach)
     mode <away|present> [--pid N]          set away/present mode (requires running Coach)
 
@@ -82,6 +83,7 @@ pub fn dispatch_with_args(args: Vec<String>) -> Option<i32> {
             println!("coach {}", env!("CARGO_PKG_VERSION"));
             Some(0)
         }
+        "serve" => Some(run(cmd_serve(&args[1..]))),
         "status" => Some(run(cmd_status(&args[1..]))),
         "mode" => Some(run(cmd_mode(&args[1..]))),
         "hooks" => Some(run(cmd_hooks(&args[1..]))),
@@ -107,6 +109,22 @@ fn run(result: Result<(), String>) -> i32 {
             1
         }
     }
+}
+
+// ── serve (headless daemon) ─────────────────────────────────────────────
+
+/// Run the daemon without Tauri. Each invocation owns its own
+/// multi-thread tokio runtime — server + scanner need to make progress
+/// concurrently. Blocks until Ctrl-C or one of the long-running tasks
+/// exits.
+fn cmd_serve(args: &[String]) -> Result<(), String> {
+    let port_override = parse_named_u32(args, "--port")?.map(|p| p as u16);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    runtime.block_on(crate::serve(port_override));
+    Ok(())
 }
 
 // ── status / mode (HTTP-only) ───────────────────────────────────────────

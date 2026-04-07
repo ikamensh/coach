@@ -367,3 +367,201 @@ fn cli_replay_unknown_session_errors_cleanly() {
     assert_eq!(code, 1);
     assert!(stderr.contains("Session not found") || stderr.contains("not found"));
 }
+
+// ── headless `coach serve` ─────────────────────────────────────────────
+
+/// Pick a free TCP port by binding to 0 and reading what the kernel
+/// assigned. The listener is dropped immediately, so there is a small
+/// race window before the spawned daemon claims the same port. Fine for
+/// tests on a developer machine; if it ever flakes, retry.
+fn pick_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Wait until `127.0.0.1:port` accepts a TCP connection, or panic
+/// after `timeout`. Polls every 50ms.
+fn wait_for_port(port: u16, timeout: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("port {port} did not open within {timeout:?}");
+}
+
+/// Kill the child and wait for it to exit. Used in test cleanup so we
+/// don't leave headless coach daemons running between test runs.
+fn kill_and_wait(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Block on a future from a sync test. Cheap throwaway runtime — same
+/// pattern the CLI uses for `coach status`.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fut)
+}
+
+/// Fetch a URL and decode as JSON. Panics on any failure — tests want
+/// the panic message, not graceful degradation.
+fn http_get_json(url: &str) -> serde_json::Value {
+    block_on(async move {
+        reqwest::get(url)
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    })
+}
+
+/// End-to-end smoke test for `coach serve`: spawn the binary as a
+/// background process under a tempdir HOME, verify it binds the
+/// requested port, hit the HTTP API, mutate state via the CLI (which
+/// the running daemon should serve via HTTP, not the file fallback),
+/// and confirm the change is visible through both `coach status` and
+/// the on-disk settings file.
+///
+/// This is the test that was missing — and the absence of it is why
+/// the single-instance plugin breakage went unnoticed until VM-style
+/// integration testing tried to spawn a second daemon.
+#[test]
+fn cli_serve_starts_headless_daemon_and_round_trips_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+
+    // Pre-seed settings.json so both the daemon and subsequent CLI
+    // invocations agree on the port. The CLI's `server_running` probe
+    // also reads `port` from this file, so a CLI `config set` will
+    // route to HTTP not the file fallback.
+    let port = pick_free_port();
+    std::fs::create_dir_all(home.join(".coach")).unwrap();
+    std::fs::write(
+        home.join(".coach").join("settings.json"),
+        format!(r#"{{"port":{port}}}"#),
+    )
+    .unwrap();
+
+    // Spawn `coach serve` as a child process. We pass --port too so
+    // the test does not depend on the settings.json round-trip working
+    // (smaller failure surface if something is broken).
+    let mut child = Command::new(coach_bin())
+        .args(["serve", "--port", &port.to_string()])
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        // Capture daemon stderr so we can include it in panic messages
+        // if something goes wrong; ignore stdout (none expected).
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn `coach serve`");
+
+    // Make sure we always reap the child even on assertion failure.
+    // (Wrapping in a guard struct would be cleaner, but tests panic
+    // and we just need to avoid leaving daemons around.)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_port(port, std::time::Duration::from_secs(10));
+
+        // /version is a cheap liveness probe.
+        let version = http_get_json(&format!("http://127.0.0.1:{port}/version"));
+        assert!(
+            version.get("version").is_some(),
+            "version response missing 'version' field: {version}"
+        );
+
+        // /api/state should reflect the configured port and a sane
+        // default snapshot (no real claude sessions in a tempdir HOME).
+        let state = http_get_json(&format!("http://127.0.0.1:{port}/api/state"));
+        assert_eq!(state["port"].as_u64().unwrap(), port as u64);
+        assert!(
+            state["sessions"].as_array().unwrap().is_empty(),
+            "fresh tempdir HOME should have no sessions, got {state:#}"
+        );
+
+        // CLI `config set` against a running daemon should route via
+        // HTTP. Verify by reading the snapshot back through HTTP — if
+        // it had hit the file fallback, the running daemon's
+        // in-memory state would not have moved.
+        let (code, _stdout, stderr) = run_coach(
+            &["config", "set", "priorities", "served-A,served-B"],
+            home,
+        );
+        assert_eq!(code, 0, "config set failed; stderr: {stderr}");
+
+        let state = http_get_json(&format!("http://127.0.0.1:{port}/api/state"));
+        let priorities: Vec<String> = state["priorities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            priorities,
+            vec!["served-A".to_string(), "served-B".to_string()],
+            "HTTP-routed config set must update the daemon's in-memory state"
+        );
+
+        // The same write must also be persisted to disk so a daemon
+        // restart picks it up. Read the file directly.
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".coach").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk["priorities"][0], "served-A",
+            "config set via HTTP must also persist to settings.json"
+        );
+    }));
+
+    kill_and_wait(&mut child);
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// Property: `coach serve` exits cleanly when its process is killed
+/// (no orphaned listener on the port). Catches a regression where the
+/// HTTP server kept the port held after the parent CLI process died.
+#[test]
+fn cli_serve_releases_port_on_kill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let port = pick_free_port();
+    std::fs::create_dir_all(home.join(".coach")).unwrap();
+    std::fs::write(
+        home.join(".coach").join("settings.json"),
+        format!(r#"{{"port":{port}}}"#),
+    )
+    .unwrap();
+
+    let mut child = Command::new(coach_bin())
+        .args(["serve", "--port", &port.to_string()])
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn `coach serve`");
+
+    wait_for_port(port, std::time::Duration::from_secs(10));
+    kill_and_wait(&mut child);
+
+    // Give the kernel a moment to release the port. SIGKILL on the
+    // child is immediate, but the close happens through the process
+    // teardown path.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let probe = std::net::TcpStream::connect(("127.0.0.1", port));
+    assert!(
+        probe.is_err(),
+        "port {port} still listening after `coach serve` was killed"
+    );
+}
