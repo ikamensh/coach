@@ -26,9 +26,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// How many timestamped log files to keep in the directory. Older
-/// files are deleted on each startup. 20 covers a couple of weeks of
-/// normal restart cadence and a long crash-loop debugging session.
-const KEEP_LAUNCHES: usize = 20;
+/// files are deleted on each startup. 500 covers months of normal
+/// restart cadence even for users who relaunch many times a day.
+const KEEP_LAUNCHES: usize = 500;
 
 /// Stable name pointed at the most recent launch's file via symlink.
 const SYMLINK_NAME: &str = "coach.log";
