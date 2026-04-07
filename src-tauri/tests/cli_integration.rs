@@ -131,20 +131,58 @@ fn cli_hooks_cursor_install_matches_install_cursor_hooks_at() {
     let (code, _stdout, stderr) = run_coach(&["hooks", "cursor", "install"], home);
     assert_eq!(code, 0, "stderr: {stderr}");
 
-    let cli_path = home.join(".cursor").join("hooks.json");
+    let cli_hooks = home.join(".cursor").join("hooks.json");
+    let cli_shim = home.join(".cursor").join("coach-cursor-hook.sh");
     let cli_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&cli_path).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(&cli_hooks).unwrap()).unwrap();
 
     let other = tempfile::tempdir().unwrap();
-    let helper_path = other.path().join("hooks.json");
-    coach_lib::settings::install_cursor_hooks_at(7700, &helper_path).unwrap();
+    let helper_hooks = other.path().join(".cursor").join("hooks.json");
+    let helper_shim = other.path().join(".cursor").join("coach-cursor-hook.sh");
+    coach_lib::settings::install_cursor_hooks_at(7700, &helper_hooks, &helper_shim).unwrap();
     let helper_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&helper_path).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(&helper_hooks).unwrap()).unwrap();
 
+    // Each `command` entry embeds the absolute shim path, which differs
+    // by tempdir. Normalize both to a placeholder before comparing so the
+    // assertion still proves "CLI and helper produce structurally
+    // identical hooks.json content".
+    let normalize = |val: serde_json::Value, shim: &Path| {
+        let raw = serde_json::to_string(&val).unwrap();
+        let placeholder = "<SHIM>";
+        let cleaned = raw.replace(&shim.display().to_string(), placeholder);
+        serde_json::from_str::<serde_json::Value>(&cleaned).unwrap()
+    };
     assert_eq!(
-        cli_json, helper_json,
-        "CLI cursor install must match install_cursor_hooks_at"
+        normalize(cli_json, &cli_shim),
+        normalize(helper_json, &helper_shim),
+        "CLI cursor install must match install_cursor_hooks_at (modulo absolute shim path)"
     );
+
+    // Both shims must be on disk and executable, since cursor's hook
+    // runner spawns them directly.
+    for (label, path) in [("cli", &cli_shim), ("helper", &helper_shim)] {
+        let meta = std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{label} shim missing at {}: {e}", path.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                meta.permissions().mode() & 0o111 != 0,
+                "{label} shim at {} must be executable",
+                path.display()
+            );
+        }
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(
+            body.starts_with("#!/bin/sh"),
+            "{label} shim must start with shebang, got: {body}"
+        );
+        assert!(
+            body.contains("curl"),
+            "{label} shim must call curl internally"
+        );
+    }
 }
 
 #[test]

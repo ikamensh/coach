@@ -65,9 +65,11 @@ export function HooksPane() {
         <span className="font-medium text-zinc-700 dark:text-zinc-300">
           Cursor Agent
         </span>{" "}
-        (<code className="font-mono text-xs">curl</code> forwarders in{" "}
-        <code className="font-mono text-xs">~/.cursor/hooks.json</code>). Existing entries are
-        preserved.
+        (a small shim script{" "}
+        <code className="font-mono text-xs">~/.cursor/coach-cursor-hook.sh</code>{" "}
+        referenced from <code className="font-mono text-xs">~/.cursor/hooks.json</code> —
+        Cursor's hook runner blocks raw <code className="font-mono text-xs">curl</code>{" "}
+        commands). Existing entries are preserved.
       </p>
 
       {hookStatus && (

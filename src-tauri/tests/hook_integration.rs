@@ -945,6 +945,166 @@ async fn test_with_real_claude_code() {
     );
 }
 
+/// Live integration check against the real `cursor-agent` CLI (the same
+/// binary `kodo`'s cursor orchestrator drives). Empirically, headless
+/// `cursor-agent -p` fires four of Coach's eight Cursor hooks:
+/// `sessionStart`, `beforeShellExecution`, `afterShellExecution`, and
+/// `afterFileEdit`. The other four (`beforeSubmitPrompt`, `afterMCPExecution`,
+/// `afterAgentResponse`, `stop`) only fire from the IDE / from agent flows
+/// the CLI doesn't exercise — that's a Cursor-side limitation, not ours.
+///
+/// This test exists because of a real bug we hit: Cursor's hook runner
+/// silently rejects any hook command that mentions `curl` directly, so
+/// the previous "curl in hooks.json" install path was inert. The fix is
+/// the shim script approach in `install_cursor_hooks_at`. This test would
+/// have caught the original bug — and will catch any future regression
+/// to a curl-in-hooks-json shape.
+///
+/// The test writes a project-level `<tmp>/.cursor/hooks.json` plus shim
+/// script (Cursor reads project + user + /etc, all merged) using the same
+/// `install_cursor_hooks_at` helper production uses, then runs `cursor-
+/// agent -p` against a prompt that forces a shell call and a file edit,
+/// and asserts the session is registered with activity from both the
+/// shell and edit hooks.
+#[tokio::test]
+#[ignore] // Requires `cursor-agent` CLI logged in — run with: cargo test -p coach -- --ignored
+async fn test_with_real_cursor_agent() {
+    let which = tokio::process::Command::new("which")
+        .arg("cursor-agent")
+        .output()
+        .await
+        .unwrap();
+    if !which.status.success() {
+        eprintln!("cursor-agent CLI not found, skipping");
+        return;
+    }
+
+    let (base, _state) = start_test_server().await;
+    let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let hooks_path = tmp.path().join(".cursor").join("hooks.json");
+    let shim_path = tmp.path().join(".cursor").join("coach-cursor-hook.sh");
+    coach_lib::settings::install_cursor_hooks_at(port, &hooks_path, &shim_path)
+        .expect("install cursor hooks");
+
+    // git-init so cursor-agent treats the tempdir as a real workspace.
+    tokio::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(tmp.path())
+        .output()
+        .await
+        .unwrap();
+
+    // A prompt that forces (a) a shell call and (b) a file edit, so we
+    // exercise beforeShellExecution / afterShellExecution / afterFileEdit
+    // in addition to sessionStart.
+    let prompt = "Run the shell command 'echo hello-from-coach-test' and then \
+                  create a file note.txt containing the word 'hi'. Then say done.";
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(180),
+        tokio::process::Command::new("cursor-agent")
+            .args([
+                "-p",
+                "-f",
+                "--trust",
+                "--output-format",
+                "text",
+                "--workspace",
+                tmp.path().to_str().unwrap(),
+                prompt,
+            ])
+            .current_dir(tmp.path())
+            .output(),
+    )
+    .await
+    .expect("cursor-agent timed out")
+    .expect("failed to spawn cursor-agent");
+
+    eprintln!(
+        "cursor-agent stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    eprintln!(
+        "cursor-agent stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "cursor-agent exited with {:?}",
+        output.status
+    );
+
+    let client = reqwest::Client::new();
+    let snap: serde_json::Value = client
+        .get(format!("{base}/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sessions = snap["sessions"].as_array().unwrap();
+    assert!(
+        !sessions.is_empty(),
+        "expected cursor-agent to register a session via hooks, got none"
+    );
+    eprintln!(
+        "tracked {} cursor session(s), first id: {}",
+        sessions.len(),
+        sessions[0]["session_id"]
+    );
+
+    // Find the session whose activity matches what cursor-agent should have
+    // generated (a shell call + a file edit). With multiple cursor-agent
+    // runs in a row this could legitimately be split across sessions, so we
+    // look across all of them.
+    let saw_session_start = sessions.iter().any(|s| {
+        s["activity"]
+            .as_array()
+            .map(|acts| acts.iter().any(|a| a["hook_event"] == "SessionStart"))
+            .unwrap_or(false)
+    });
+    let saw_shell = sessions.iter().any(|s| {
+        s["activity"]
+            .as_array()
+            .map(|acts| {
+                acts.iter().any(|a| {
+                    a["hook_event"] == "PermissionRequest"
+                        || a["hook_event"] == "PostToolUse"
+                })
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        saw_session_start,
+        "expected at least one SessionStart activity entry from cursor-agent's sessionStart hook"
+    );
+    assert!(
+        saw_shell,
+        "expected at least one tool-use activity (PermissionRequest from beforeShellExecution \
+         or PostToolUse from after-shell/after-edit) — none of the cursor tool hooks fired"
+    );
+
+    // Cursor sends `workspace_roots: [...]` (not `cwd`) — this asserts
+    // `cursor::cursor_cwd` actually picks it up. macOS resolves /tmp via
+    // /private/tmp, so accept either form.
+    let tmp_str = tmp.path().display().to_string();
+    let private_tmp = format!("/private{tmp_str}");
+    let saw_cwd = sessions.iter().any(|s| {
+        s["cwd"]
+            .as_str()
+            .map(|c| c == tmp_str || c == private_tmp)
+            .unwrap_or(false)
+    });
+    assert!(
+        saw_cwd,
+        "expected at least one session whose cwd matches the workspace ({tmp_str} or \
+         {private_tmp}) — workspace_roots payload field not being read by cursor::cursor_cwd"
+    );
+}
+
 /// UserPromptSubmit must create the session if it doesn't exist, record a
 /// "user spoke" entry in the session's activity log with the (truncated)
 /// prompt text, and pass through with no decision payload.

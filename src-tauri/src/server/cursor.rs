@@ -39,6 +39,13 @@ fn cursor_cwd(v: &Value) -> Option<String> {
             return Some(s.to_string());
         }
     }
+    // `cursor-agent` (and the IDE) actually send `workspace_roots: [path,
+    // ...]` — first entry is the active workspace root.
+    if let Some(arr) = v.get("workspace_roots").and_then(|x| x.as_array()) {
+        if let Some(s) = arr.first().and_then(|x| x.as_str()) {
+            return Some(s.to_string());
+        }
+    }
     None
 }
 
