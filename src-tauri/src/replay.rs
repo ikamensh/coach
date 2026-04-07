@@ -193,11 +193,20 @@ fn extract_topic_from_entry(entry: &serde_json::Value) -> String {
     String::new()
 }
 
+/// Truncate `s` to at most `max` *bytes*, appending `...` if shortened.
+/// Walks back to the nearest UTF-8 char boundary at or below `max` so we
+/// never panic by slicing inside a multi-byte codepoint — a real bug
+/// found by `cargo test` on a VPS whose `~/.claude/projects/` contained
+/// a transcript with `’` (U+2019, 3 bytes) straddling byte 100.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
@@ -386,6 +395,43 @@ mod tests {
     fn truncate_works() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    /// Property: `truncate(s, max)` never panics, regardless of where
+    /// `max` lands in `s`'s UTF-8 byte sequence. Regression for the
+    /// char-boundary slice bug — running `cargo test` on a VPS with a
+    /// real claude transcript containing `’` (U+2019, 3 bytes) across
+    /// byte 100 panicked at `&s[..max]`. We exhaustively try every
+    /// `max` from 0 through `s.len() + 2` against strings packed with
+    /// multi-byte codepoints (2-, 3-, and 4-byte sequences) so any
+    /// future regression that re-introduces a raw byte slice gets
+    /// caught at unit-test time, not in production.
+    #[test]
+    fn truncate_never_panics_inside_a_multibyte_char() {
+        let inputs = [
+            "ascii only",
+            "café",                      // 2-byte: é
+            "naïveté",                   // 2-byte: ï, é
+            "what’s up",                 // 3-byte: ’ (U+2019)
+            "日本語テスト",              // 3-byte each
+            "🚀 rockets ⛵ boats 🦀 crabs", // 4-byte emoji + 3-byte
+            // Long string built so the panic-prone byte 100 would land
+            // exactly inside a multi-byte codepoint, mirroring the
+            // real bug we hit.
+            &("a".repeat(98) + "’ trailing text"),
+        ];
+        for s in inputs {
+            for max in 0..=s.len() + 2 {
+                let out = truncate(s, max);
+                // Output must always be valid UTF-8 (the type system
+                // enforces this — `String` can't be otherwise — so
+                // reaching this line is what we're really proving).
+                assert!(
+                    out.len() <= s.len() + 3,
+                    "truncate({s:?}, {max}) returned longer than input + '...'"
+                );
+            }
+        }
     }
 
     #[test]

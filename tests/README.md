@@ -24,10 +24,10 @@ the LLM with a real key.
 
 ## 1. Unit tests — `cargo test --lib`
 
-119 tests. `#[cfg(test)] mod` blocks scattered across the lib (`state`,
-`settings`, `replay`, `pid_resolver`, `rules`, `scanner`, `llm`,
-`commands`, `path_install`, ...). Pure logic — no filesystem outside
-`tempfile`, no sockets, no subprocesses.
+~120 tests. `#[cfg(test)] mod` blocks scattered across the lib
+(`state`, `settings`, `replay`, `pid_resolver`, `rules`, `scanner`,
+`llm`, `commands`, `path_install`, ...). Pure logic — no filesystem
+outside `tempfile`, no sockets, no subprocesses.
 
 ```sh
 cargo test --manifest-path src-tauri/Cargo.toml --lib
@@ -170,10 +170,11 @@ uv run --with Pillow python tests/test_ui_smoke.py --launch
 ## Running the whole stack
 
 ```sh
-# Layers 1-3 (~10 s total, ~163 tests)
+# Layers 1-3 (~10 s total)
 cargo test --manifest-path src-tauri/Cargo.toml
 
-# Layers 1-3 including the 2 real-CLI ignored tests
+# Layers 1-3 including the ignored tests that need real CLI tools
+# (claude / cursor-agent on PATH; live LLM tests need API keys)
 cargo test --manifest-path src-tauri/Cargo.toml -- --include-ignored
 
 # Layer 5 (macOS GUI only)
@@ -185,9 +186,11 @@ uv run --with Pillow python tests/test_ui_smoke.py --launch
 # real OS, not pretending we have CI.
 ```
 
-Expected baseline at the time of writing: **119 unit + 17 CLI + 27 hook
-= 163 passing, 2 ignored**. If `cargo test` ever drops below 163 with
-no story explanation, something regressed.
+Expected baseline at the time of writing: **~120 unit + 17 CLI + 27 hook
+= ~165 passing, plus ~16 ignored**. The exact numbers drift as the
+codebase grows; treat this as a floor, not an equality. If `cargo
+test` ever drops below ~160 with no story explanation, something
+regressed.
 
 ## Where to add a new test
 
