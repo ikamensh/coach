@@ -169,7 +169,7 @@ fn cmd_hooks(args: &[String]) -> Result<(), String> {
         let verb = args.get(1).map(String::as_str).unwrap_or("status");
         return match verb {
             "status" => {
-                let s = settings::check_cursor_hook_status(port);
+                let s = settings::check_cursor_hook_status();
                 println!("settings file: {}", s.path);
                 println!("all installed: {}", s.installed);
                 for h in &s.hooks {
@@ -180,7 +180,7 @@ fn cmd_hooks(args: &[String]) -> Result<(), String> {
             }
             "install" => {
                 settings::install_cursor_hooks(port)?;
-                let s = settings::check_cursor_hook_status(port);
+                let s = settings::check_cursor_hook_status();
                 println!(
                     "installed {} Cursor hook(s) into {}",
                     s.hooks.iter().filter(|h| h.installed).count(),
@@ -189,7 +189,7 @@ fn cmd_hooks(args: &[String]) -> Result<(), String> {
                 Ok(())
             }
             "uninstall" => {
-                settings::uninstall_cursor_hooks(port)?;
+                settings::uninstall_cursor_hooks()?;
                 println!("removed coach Cursor hooks from ~/.cursor/hooks.json");
                 Ok(())
             }

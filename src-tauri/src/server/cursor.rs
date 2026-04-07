@@ -8,37 +8,46 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use super::{
-    fake_pid_for_sid, run_permission_request, run_post_tool_use, run_session_start, run_stop,
-    run_user_prompt_submit, AppState, HookPayload, HookResponse,
+    emit_update, fake_pid_for_sid, run_permission_request, run_post_tool_use, run_session_start,
+    run_stop, run_user_prompt_submit, AppState, HookPayload, HookResponse,
 };
 use crate::state::SessionClient;
 
-/// Tag the session as belonging to Cursor right after the shared `run_*`
-/// path created/updated it. Idempotent — safe to call after every cursor
-/// hook even though only the first one transitions the client field.
+/// Tag the session as belonging to Cursor and re-emit so the frontend
+/// gets the updated `client` field. The shared `run_*` path the cursor
+/// handler just called already emitted a snapshot with `client=Claude`
+/// (the default on creation), so without this re-emit the icon would
+/// flicker on the first event of every fresh cursor session.
 async fn mark_cursor(state: &AppState, pid: u32) {
-    state
-        .coach
-        .write()
-        .await
-        .mark_client(pid, SessionClient::Cursor);
+    let mut coach = state.coach.write().await;
+    coach.mark_client(pid, SessionClient::Cursor);
+    emit_update(&state.emitter, &coach);
+}
+
+/// First non-empty string under any of `keys`. Used to probe Cursor's
+/// JSON payloads, which have shifted between snake_case and camelCase
+/// across versions.
+fn first_string_field(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn cursor_session_key(v: &Value) -> String {
-    for key in [
-        "sessionId",
-        "session_id",
-        "conversationId",
-        "conversation_id",
-        "id",
-    ] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                return s.to_string();
-            }
-        }
-    }
-    "unknown".to_string()
+    first_string_field(
+        v,
+        &[
+            "sessionId",
+            "session_id",
+            "conversationId",
+            "conversation_id",
+            "id",
+        ],
+    )
+    .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn cursor_pid(v: &Value) -> u32 {
@@ -46,19 +55,18 @@ fn cursor_pid(v: &Value) -> u32 {
 }
 
 fn cursor_cwd(v: &Value) -> Option<String> {
-    for key in ["cwd", "workspaceRoot", "workspace_root", "rootPath", "root"] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            return Some(s.to_string());
-        }
-    }
-    // `cursor-agent` (and the IDE) actually send `workspace_roots: [path,
-    // ...]` — first entry is the active workspace root.
-    if let Some(arr) = v.get("workspace_roots").and_then(|x| x.as_array()) {
-        if let Some(s) = arr.first().and_then(|x| x.as_str()) {
-            return Some(s.to_string());
-        }
-    }
-    None
+    first_string_field(
+        v,
+        &["cwd", "workspaceRoot", "workspace_root", "rootPath", "root"],
+    )
+    .or_else(|| {
+        // `cursor-agent` and the IDE actually send `workspace_roots: [path, ...]`.
+        v.get("workspace_roots")
+            .and_then(|x| x.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    })
 }
 
 fn payload_session_start(v: &Value) -> HookPayload {
@@ -208,82 +216,30 @@ fn payload_stop(v: &Value) -> HookPayload {
     }
 }
 
-pub async fn session_start(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<HookResponse> {
-    let pid = cursor_pid(&v);
-    let resp = run_session_start(&state, pid, payload_session_start(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
+/// Each cursor handler is identical: extract the synthetic PID from the
+/// payload, run the shared `run_*` for the matching Claude lifecycle
+/// event, then re-tag the session as Cursor (and re-emit). The macro
+/// keeps the function names stable so the axum routes in `server.rs`
+/// don't need to change when handlers are added or removed.
+macro_rules! cursor_handler {
+    ($name:ident, $run:ident, $payload:ident, $ret:ty) => {
+        pub async fn $name(
+            AxumState(state): AxumState<AppState>,
+            Json(v): Json<Value>,
+        ) -> Json<$ret> {
+            let pid = cursor_pid(&v);
+            let resp = $run(&state, pid, $payload(&v)).await;
+            mark_cursor(&state, pid).await;
+            resp
+        }
+    };
 }
 
-pub async fn before_submit_prompt(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<HookResponse> {
-    let pid = cursor_pid(&v);
-    let resp = run_user_prompt_submit(&state, pid, payload_before_submit(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
-}
-
-pub async fn before_shell(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<HookResponse> {
-    let pid = cursor_pid(&v);
-    let resp = run_permission_request(&state, pid, payload_before_shell(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
-}
-
-pub async fn before_mcp(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<HookResponse> {
-    let pid = cursor_pid(&v);
-    let resp = run_permission_request(&state, pid, payload_before_mcp(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
-}
-
-pub async fn after_shell(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<HookResponse> {
-    let pid = cursor_pid(&v);
-    let resp = run_post_tool_use(&state, pid, payload_after_shell(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
-}
-
-pub async fn after_mcp(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<HookResponse> {
-    let pid = cursor_pid(&v);
-    let resp = run_post_tool_use(&state, pid, payload_after_mcp(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
-}
-
-pub async fn after_file_edit(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<HookResponse> {
-    let pid = cursor_pid(&v);
-    let resp = run_post_tool_use(&state, pid, payload_after_file_edit(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
-}
-
-pub async fn stop(
-    AxumState(state): AxumState<AppState>,
-    Json(v): Json<Value>,
-) -> Json<serde_json::Value> {
-    let pid = cursor_pid(&v);
-    let resp = run_stop(&state, pid, payload_stop(&v)).await;
-    mark_cursor(&state, pid).await;
-    resp
-}
+cursor_handler!(session_start, run_session_start, payload_session_start, HookResponse);
+cursor_handler!(before_submit_prompt, run_user_prompt_submit, payload_before_submit, HookResponse);
+cursor_handler!(before_shell, run_permission_request, payload_before_shell, HookResponse);
+cursor_handler!(before_mcp, run_permission_request, payload_before_mcp, HookResponse);
+cursor_handler!(after_shell, run_post_tool_use, payload_after_shell, HookResponse);
+cursor_handler!(after_mcp, run_post_tool_use, payload_after_mcp, HookResponse);
+cursor_handler!(after_file_edit, run_post_tool_use, payload_after_file_edit, HookResponse);
+cursor_handler!(stop, run_stop, payload_stop, serde_json::Value);

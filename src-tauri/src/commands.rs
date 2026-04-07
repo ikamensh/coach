@@ -214,10 +214,9 @@ pub async fn uninstall_hooks(state: tauri::State<'_, SharedState>) -> Result<Hoo
 
 #[tauri::command]
 pub async fn get_cursor_hook_status(
-    state: tauri::State<'_, SharedState>,
+    _state: tauri::State<'_, SharedState>,
 ) -> Result<HookStatus, String> {
-    let s = state.read().await;
-    Ok(settings::check_cursor_hook_status(s.port))
+    Ok(settings::check_cursor_hook_status())
 }
 
 #[tauri::command]
@@ -226,16 +225,15 @@ pub async fn install_cursor_hooks(
 ) -> Result<HookStatus, String> {
     let port = state.read().await.port;
     settings::install_cursor_hooks(port)?;
-    Ok(settings::check_cursor_hook_status(port))
+    Ok(settings::check_cursor_hook_status())
 }
 
 #[tauri::command]
 pub async fn uninstall_cursor_hooks(
-    state: tauri::State<'_, SharedState>,
+    _state: tauri::State<'_, SharedState>,
 ) -> Result<HookStatus, String> {
-    let port = state.read().await.port;
-    settings::uninstall_cursor_hooks(port)?;
-    Ok(settings::check_cursor_hook_status(port))
+    settings::uninstall_cursor_hooks()?;
+    Ok(settings::check_cursor_hook_status())
 }
 
 #[tauri::command]

@@ -166,6 +166,24 @@ pub fn status_at(dir: &Path, current_exe: &Path) -> PathStatus {
     }
 }
 
+/// Mark a file executable on Unix (mode 0o755). No-op on Windows where
+/// the executable bit is determined by extension.
+#[cfg(unix)]
+pub fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| format!("chmod +x {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub fn make_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 /// True iff `dir` is one of the entries in the current `$PATH`. Compared
 /// after canonicalization so symlink and trailing-slash differences don't
 /// produce false negatives.
@@ -188,13 +206,7 @@ mod tests {
     fn fake_exe(dir: &Path) -> PathBuf {
         let path = dir.join("fake-coach");
         std::fs::write(&path, b"#!/bin/sh\necho fake\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
+        make_executable(&path).unwrap();
         path
     }
 
