@@ -69,6 +69,18 @@ pub struct ActivityEntry {
     pub detail: Option<String>,
 }
 
+/// Which agent CLI / IDE the session belongs to. Set once at session
+/// creation and only switched by `mark_client`. The frontend uses this
+/// to render a distinct icon per source so users can tell Claude Code
+/// and Cursor sessions apart at a glance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionClient {
+    #[default]
+    Claude,
+    Cursor,
+}
+
 /// Snapshot of one Claude Code window — keyed by PID, surfacing the
 /// **current** conversation in that window. See docs/SESSION_TRACKING.md.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +105,10 @@ pub struct SessionSnapshot {
     pub coach_last_assessment: Option<String>,
     /// Recent activity for the current conversation, oldest-first.
     pub activity: Vec<ActivityEntry>,
+    /// Which agent CLI / IDE this session belongs to. Drives the icon
+    /// rendered in the frontend session list.
+    #[serde(default)]
+    pub client: SessionClient,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,6 +168,11 @@ pub struct SessionState {
     pub coach_chain: CoachChain,
     pub coach_last_assessment: Option<String>,
     pub activity: VecDeque<ActivityEntry>,
+    /// Which agent CLI / IDE this session belongs to. Set once on
+    /// creation (Claude by default) and only updated by `mark_client`,
+    /// which the cursor handlers call after the shared `run_*` path
+    /// creates the session.
+    pub client: SessionClient,
 }
 
 pub struct CoachState {
@@ -379,6 +400,7 @@ impl CoachState {
                         coach_chain: CoachChain::Empty,
                         coach_last_assessment: None,
                         activity: VecDeque::new(),
+                        client: SessionClient::default(),
                     },
                 );
             }
@@ -408,6 +430,7 @@ impl CoachState {
                 cwd_history: s.cwd_history.clone(),
                 coach_last_assessment: s.coach_last_assessment.clone(),
                 activity: s.activity.iter().cloned().collect(),
+                client: s.client,
             })
             .collect();
         // Stable two-bucket sort: active sessions on top, idle below.
@@ -522,9 +545,22 @@ impl CoachState {
                 coach_chain: CoachChain::Empty,
                 coach_last_assessment: None,
                 activity: VecDeque::new(),
+                // The file scanner only walks `~/.claude/projects` so any
+                // session it discovers is necessarily Claude Code.
+                client: SessionClient::Claude,
             },
         );
         true
+    }
+
+    /// Tag the session for `pid` with the given client. Used by the
+    /// cursor hook handlers right after the shared `run_*` path creates
+    /// the session, since those functions don't know which agent the
+    /// hook came from.
+    pub fn mark_client(&mut self, pid: u32, client: SessionClient) {
+        if let Some(s) = self.sessions.get_mut(&pid) {
+            s.client = client;
+        }
     }
 
     /// Remove sessions whose PID is not in the live set. Returns the

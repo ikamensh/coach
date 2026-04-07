@@ -19,6 +19,8 @@ interface ActivityEntry {
   detail: string | null;
 }
 
+type SessionClient = "claude" | "cursor";
+
 interface SessionSnapshot {
   /// OS PID — stable across /clear, the canonical identity for a window.
   pid: number;
@@ -36,6 +38,7 @@ interface SessionSnapshot {
   stop_blocked_count: number;
   cwd_history: string[];
   activity: ActivityEntry[];
+  client: SessionClient;
 }
 
 interface ModelConfig {
@@ -142,7 +145,7 @@ function applyThemeClass(theme: Theme) {
   }
 }
 
-export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule };
+export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, SessionClient, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule };
 
 export const useCoachStore = create<CoachStore>((set, get) => ({
   sessions: [],

@@ -11,6 +11,18 @@ use super::{
     fake_pid_for_sid, run_permission_request, run_post_tool_use, run_session_start, run_stop,
     run_user_prompt_submit, AppState, HookPayload, HookResponse,
 };
+use crate::state::SessionClient;
+
+/// Tag the session as belonging to Cursor right after the shared `run_*`
+/// path created/updated it. Idempotent — safe to call after every cursor
+/// hook even though only the first one transitions the client field.
+async fn mark_cursor(state: &AppState, pid: u32) {
+    state
+        .coach
+        .write()
+        .await
+        .mark_client(pid, SessionClient::Cursor);
+}
 
 fn cursor_session_key(v: &Value) -> String {
     for key in [
@@ -201,7 +213,9 @@ pub async fn session_start(
     Json(v): Json<Value>,
 ) -> Json<HookResponse> {
     let pid = cursor_pid(&v);
-    run_session_start(&state, pid, payload_session_start(&v)).await
+    let resp = run_session_start(&state, pid, payload_session_start(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }
 
 pub async fn before_submit_prompt(
@@ -209,7 +223,9 @@ pub async fn before_submit_prompt(
     Json(v): Json<Value>,
 ) -> Json<HookResponse> {
     let pid = cursor_pid(&v);
-    run_user_prompt_submit(&state, pid, payload_before_submit(&v)).await
+    let resp = run_user_prompt_submit(&state, pid, payload_before_submit(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }
 
 pub async fn before_shell(
@@ -217,7 +233,9 @@ pub async fn before_shell(
     Json(v): Json<Value>,
 ) -> Json<HookResponse> {
     let pid = cursor_pid(&v);
-    run_permission_request(&state, pid, payload_before_shell(&v)).await
+    let resp = run_permission_request(&state, pid, payload_before_shell(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }
 
 pub async fn before_mcp(
@@ -225,7 +243,9 @@ pub async fn before_mcp(
     Json(v): Json<Value>,
 ) -> Json<HookResponse> {
     let pid = cursor_pid(&v);
-    run_permission_request(&state, pid, payload_before_mcp(&v)).await
+    let resp = run_permission_request(&state, pid, payload_before_mcp(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }
 
 pub async fn after_shell(
@@ -233,7 +253,9 @@ pub async fn after_shell(
     Json(v): Json<Value>,
 ) -> Json<HookResponse> {
     let pid = cursor_pid(&v);
-    run_post_tool_use(&state, pid, payload_after_shell(&v)).await
+    let resp = run_post_tool_use(&state, pid, payload_after_shell(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }
 
 pub async fn after_mcp(
@@ -241,7 +263,9 @@ pub async fn after_mcp(
     Json(v): Json<Value>,
 ) -> Json<HookResponse> {
     let pid = cursor_pid(&v);
-    run_post_tool_use(&state, pid, payload_after_mcp(&v)).await
+    let resp = run_post_tool_use(&state, pid, payload_after_mcp(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }
 
 pub async fn after_file_edit(
@@ -249,7 +273,9 @@ pub async fn after_file_edit(
     Json(v): Json<Value>,
 ) -> Json<HookResponse> {
     let pid = cursor_pid(&v);
-    run_post_tool_use(&state, pid, payload_after_file_edit(&v)).await
+    let resp = run_post_tool_use(&state, pid, payload_after_file_edit(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }
 
 pub async fn stop(
@@ -257,5 +283,7 @@ pub async fn stop(
     Json(v): Json<Value>,
 ) -> Json<serde_json::Value> {
     let pid = cursor_pid(&v);
-    run_stop(&state, pid, payload_stop(&v)).await
+    let resp = run_stop(&state, pid, payload_stop(&v)).await;
+    mark_cursor(&state, pid).await;
+    resp
 }

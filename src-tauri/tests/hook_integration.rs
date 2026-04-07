@@ -119,6 +119,44 @@ async fn cursor_after_shell_tracks_session() {
     assert_eq!(sessions[0]["session_id"], "cursor-sess-1");
     assert_eq!(sessions[0]["pid"], fake_pid_for_sid("cursor-sess-1"));
     assert_eq!(sessions[0]["cwd"], "/tmp/cursor-proj");
+    // Property: a session created by ANY cursor hook is tagged as
+    // belonging to Cursor, so the frontend renders the cursor icon.
+    assert_eq!(sessions[0]["client"], "cursor");
+}
+
+/// Property: sessions created via the Claude Code hook routes are
+/// tagged as Claude (the default), regardless of whether the cursor
+/// `mark_client` path also runs.
+#[tokio::test]
+async fn claude_post_tool_use_marks_session_as_claude() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "claude-1",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let snap: serde_json::Value = client
+        .get(format!("{base}/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sessions = snap["sessions"].as_array().unwrap();
+    let session = sessions
+        .iter()
+        .find(|s| s["session_id"] == "claude-1")
+        .expect("session should exist");
+    assert_eq!(session["client"], "claude");
 }
 
 #[tokio::test]
@@ -1102,6 +1140,13 @@ async fn test_with_real_cursor_agent() {
         saw_cwd,
         "expected at least one session whose cwd matches the workspace ({tmp_str} or \
          {private_tmp}) — workspace_roots payload field not being read by cursor::cursor_cwd"
+    );
+
+    // Every session created via a cursor route must be tagged as Cursor
+    // so the frontend renders the cursor icon, not the owl.
+    assert!(
+        sessions.iter().all(|s| s["client"] == "cursor"),
+        "all live cursor-agent sessions should have client=\"cursor\", got: {sessions:?}"
     );
 }
 
