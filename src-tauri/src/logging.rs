@@ -1,20 +1,22 @@
 //! File-based logging for the GUI app.
 //!
-//! Strategy: at every app startup, rotate a ring of previous logs and
-//! open a fresh `~/Library/Logs/Coach/coach.log` (or platform equivalent),
-//! then `dup2` its fd onto STDERR/STDOUT. From that point on, every
-//! existing `eprintln!` / `println!` and any panic message lands in the
-//! log file with zero call-site churn.
+//! Strategy: at every app startup, open a fresh log file with a
+//! timestamped name (`coach-YYYY-MM-DD_HH-MM-SS-mmm.log`) under
+//! `~/Library/Logs/Coach/` (or platform equivalent), point a stable
+//! `coach.log` symlink at it, prune older files past `KEEP_LAUNCHES`,
+//! then `dup2` the file's fd onto STDERR/STDOUT. From that point on,
+//! every existing `eprintln!` / `println!` and any panic message lands
+//! in the log file with zero call-site churn.
 //!
-//! Ring layout after N launches:
-//!   coach.log     — current launch
-//!   coach.log.1   — previous launch
-//!   coach.log.2   — two launches ago
+//! Layout in the log directory:
+//!   coach.log                              -> symlink to the most recent
+//!   coach-2026-04-07_13-07-22-450.log      most recent launch
+//!   coach-2026-04-07_13-05-10-119.log      previous launch
 //!   …
-//!   coach.log.<HISTORY>  — oldest retained
 //!
-//! Each launch gets its own file so investigating "what happened the
-//! time it crashed" is just `tail coach.log.1`.
+//! Each launch lives in its own file so investigating "what happened
+//! the time it crashed" is just `tail coach-<that-time>.log`. The
+//! symlink lets `tail -F coach.log` follow across restarts.
 //!
 //! CLI mode is untouched — `init_for_app()` is only called from the GUI
 //! `run()` path, after `cli::dispatch()` has returned.
@@ -23,28 +25,31 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// How many previous launches to keep alongside the current one.
-/// 10 covers typical "I crashed on startup, let me try again" loops
-/// without burying the original failure.
-const HISTORY: usize = 10;
+/// How many timestamped log files to keep in the directory. Older
+/// files are deleted on each startup. 20 covers a couple of weeks of
+/// normal restart cadence and a long crash-loop debugging session.
+const KEEP_LAUNCHES: usize = 20;
 
-/// Resolve where Coach's log file lives.
+/// Stable name pointed at the most recent launch's file via symlink.
+const SYMLINK_NAME: &str = "coach.log";
+
+/// Resolve where Coach's log directory lives.
 ///
-/// macOS:   `~/Library/Logs/Coach/coach.log` (Apple's standard place)
-/// Linux:   `$XDG_STATE_HOME/coach/coach.log` or `~/.local/state/coach/coach.log`
-/// Other:   `<data_local>/coach/coach.log`
-pub fn log_path() -> PathBuf {
+/// macOS:   `~/Library/Logs/Coach/` (Apple's standard place)
+/// Linux:   `$XDG_STATE_HOME/coach/` or `~/.local/state/coach/`
+/// Other:   `<data_local>/coach/`
+pub fn log_dir() -> PathBuf {
     if let Some(home) = dirs::home_dir() {
         #[cfg(target_os = "macos")]
         {
-            return home.join("Library/Logs/Coach/coach.log");
+            return home.join("Library/Logs/Coach");
         }
         #[cfg(target_os = "linux")]
         {
             let state = std::env::var_os("XDG_STATE_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".local/state"));
-            return state.join("coach/coach.log");
+            return state.join("coach");
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -55,88 +60,121 @@ pub fn log_path() -> PathBuf {
         .or_else(dirs::cache_dir)
         .unwrap_or_else(std::env::temp_dir)
         .join("coach")
-        .join("coach.log")
 }
 
-/// Sibling file `<path>.<n>` — `.1` is the most recent previous launch.
-fn numbered_path(path: &Path, n: usize) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(format!(".{n}"));
-    PathBuf::from(s)
+/// Build the filename for a launch starting at `now`.
+/// Millisecond resolution → no in-process collisions.
+fn launch_filename(now: chrono::DateTime<chrono::Local>) -> String {
+    format!(
+        "coach-{}-{:03}.log",
+        now.format("%Y-%m-%d_%H-%M-%S"),
+        now.timestamp_subsec_millis(),
+    )
 }
 
-/// Shift the ring by one position. The oldest log (`.<history>`) is
-/// dropped, each `.i` becomes `.(i+1)`, and the current log becomes
-/// `.1`. After this returns, `path` does not exist and the caller can
-/// open a fresh file.
-///
-/// `history == 0` discards the current log without keeping any history.
-/// Missing intermediate files are silently skipped.
-fn rotate_ring(path: &Path, history: usize) -> std::io::Result<()> {
-    if history > 0 {
-        // Drop the oldest if it exists.
-        let oldest = numbered_path(path, history);
-        if oldest.exists() {
-            fs::remove_file(&oldest)?;
-        }
-        // Shift .i -> .(i+1) from the top down so we never overwrite.
-        for i in (1..history).rev() {
-            let from = numbered_path(path, i);
-            if from.exists() {
-                let to = numbered_path(path, i + 1);
-                fs::rename(&from, &to)?;
+/// Return the timestamped log filenames currently in `dir`, sorted
+/// chronologically (oldest first). Filename matching is loose: any
+/// `coach-…log` that isn't the symlink counts.
+fn list_launch_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            if s == SYMLINK_NAME {
+                return None;
             }
-        }
+            if s.starts_with("coach-") && s.ends_with(".log") {
+                Some(e.path())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Filename format is lexicographically sortable by time.
+    files.sort();
+    Ok(files)
+}
+
+/// Delete the oldest launch files in `dir` until at most `keep`
+/// remain. No-op if there are fewer than `keep` already.
+fn prune_old_logs(dir: &Path, keep: usize) -> std::io::Result<()> {
+    let files = list_launch_files(dir)?;
+    if files.len() <= keep {
+        return Ok(());
     }
-    // Current -> .1 (or just delete if no history is kept).
-    if path.exists() {
-        if history > 0 {
-            fs::rename(path, numbered_path(path, 1))?;
-        } else {
-            fs::remove_file(path)?;
-        }
+    for f in files.iter().take(files.len() - keep) {
+        let _ = fs::remove_file(f);
     }
     Ok(())
 }
 
-/// Create the parent directory, rotate the ring of previous logs, and
-/// open a fresh empty file at `path` for the new launch. Pure I/O, no
-/// fd surgery — safe to unit test.
-pub fn prepare_log_file(path: &Path, history: usize) -> std::io::Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    rotate_ring(path, history)?;
-    OpenOptions::new()
+/// Repoint `<dir>/coach.log` at `target_filename` (a name relative to
+/// `dir`, not an absolute path — keeps the symlink portable if the
+/// directory is moved). Best-effort: failures are not fatal.
+#[cfg(unix)]
+fn update_symlink(dir: &Path, target_filename: &str) {
+    let symlink = dir.join(SYMLINK_NAME);
+    // remove + recreate. Race-free in practice since Coach is the
+    // only writer in this directory.
+    let _ = fs::remove_file(&symlink);
+    let _ = std::os::unix::fs::symlink(target_filename, &symlink);
+}
+
+#[cfg(not(unix))]
+fn update_symlink(_dir: &Path, _target_filename: &str) {
+    // Windows: a junction or hardlink would be needed; skip for now.
+}
+
+/// Create the directory if needed, open a fresh timestamped log file
+/// for this launch, update the `coach.log` symlink, and prune old
+/// files. Pure I/O — safe to unit test.
+///
+/// Returns `(file, full_path)` where `full_path` is the timestamped
+/// path the caller can announce.
+pub fn prepare_log_file(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Local>,
+    keep: usize,
+) -> std::io::Result<(File, PathBuf)> {
+    fs::create_dir_all(dir)?;
+
+    let name = launch_filename(now);
+    let path = dir.join(&name);
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(path)
+        .open(&path)?;
+
+    update_symlink(dir, &name);
+    prune_old_logs(dir, keep)?;
+
+    Ok((file, path))
 }
 
-/// Open a fresh log file for this launch (rotating the ring of
-/// previous launches) and redirect the process's stderr + stdout to
-/// it. Returns the path so the caller can announce it. On any I/O
-/// error, leaves the original stderr/stdout untouched and returns
-/// `None`.
+/// Open a fresh timestamped log file for this launch and redirect the
+/// process's stderr + stdout to it. Returns the path so the caller can
+/// announce it. On any I/O error, leaves the original stderr/stdout
+/// untouched and returns `None`.
 pub fn init_for_app() -> Option<PathBuf> {
-    let path = log_path();
-    let file = match prepare_log_file(&path, HISTORY) {
-        Ok(f) => f,
+    let dir = log_dir();
+    let now = chrono::Local::now();
+    let (file, path) = match prepare_log_file(&dir, now, KEEP_LAUNCHES) {
+        Ok(pair) => pair,
         Err(e) => {
-            eprintln!("[coach] could not open log file {path:?}: {e}");
+            eprintln!("[coach] could not open log file under {dir:?}: {e}");
             return None;
         }
     };
 
-    // Banner so we can tell startups apart in a single tail.
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    // Banner so the file's first line tells you what version started it.
     let mut banner = &file;
     let _ = writeln!(
         banner,
-        "\n=== Coach v{} starting at {} ===",
+        "=== Coach v{} starting at {} ===",
         env!("CARGO_PKG_VERSION"),
-        now,
+        now.format("%Y-%m-%d %H:%M:%S%.3f"),
     );
 
     redirect_std_to(&file);
@@ -169,129 +207,150 @@ mod tests {
     use std::io::{Read, Write};
     use tempfile::tempdir;
 
+    fn ts(s: &str) -> chrono::DateTime<chrono::Local> {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.3f")
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .unwrap()
+    }
+
     fn read_to_string(p: &Path) -> String {
         let mut s = String::new();
         File::open(p).unwrap().read_to_string(&mut s).unwrap();
         s
     }
 
-    /// `log_path()` returns a path under a directory whose name
+    /// `log_dir()` returns a path under a directory whose name
     /// contains "coach". Sanity check that survives refactors.
     #[test]
-    fn log_path_is_under_a_coach_directory() {
-        let p = log_path();
+    fn log_dir_contains_coach() {
+        let p = log_dir();
         let s = p.to_string_lossy().to_lowercase();
         assert!(s.contains("coach"), "expected 'coach' in {p:?}");
-        assert!(p.file_name().is_some(), "expected a filename in {p:?}");
     }
 
-    /// `prepare_log_file` creates parent directories that don't exist
-    /// yet, so first-run on a fresh machine doesn't need any setup.
+    /// Property: launch filenames embed the timestamp at millisecond
+    /// resolution and lexicographic sort = chronological sort.
     #[test]
-    fn prepare_creates_missing_parent_dirs() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("a/b/c/coach.log");
-        let f = prepare_log_file(&path, 5).unwrap();
+    fn launch_filename_is_lexicographically_sortable_by_time() {
+        let a = launch_filename(ts("2026-04-07 13:00:00.000"));
+        let b = launch_filename(ts("2026-04-07 13:00:00.001"));
+        let c = launch_filename(ts("2026-04-07 13:00:01.000"));
+        let d = launch_filename(ts("2026-04-08 09:00:00.000"));
+        let mut shuffled = vec![&d, &b, &a, &c];
+        shuffled.sort();
+        assert_eq!(shuffled, vec![&a, &b, &c, &d]);
+    }
+
+    /// `prepare_log_file` creates the directory if it doesn't exist —
+    /// first-run on a fresh machine must not need any setup.
+    #[test]
+    fn prepare_creates_missing_directory() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("a/b/c");
+        let (f, path) = prepare_log_file(&dir, ts("2026-04-07 13:00:00.000"), 5).unwrap();
         drop(f);
         assert!(path.exists());
+        assert!(path.starts_with(&dir));
     }
 
-    /// Property: every call to `prepare_log_file` returns a fresh,
-    /// empty file at `path` regardless of what was there before.
-    /// This is the "each launch gets its own log" guarantee.
+    /// Property: each call returns a path that wasn't there before.
+    /// Different timestamps → different filenames → no collision.
     #[test]
-    fn each_call_starts_with_an_empty_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("coach.log");
-        {
-            let mut f = prepare_log_file(&path, 5).unwrap();
-            writeln!(f, "first launch noise").unwrap();
-        }
-        // Second call must hand back an empty file.
-        let f = prepare_log_file(&path, 5).unwrap();
-        drop(f);
-        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    fn each_launch_gets_a_unique_path() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let (f1, p1) =
+            prepare_log_file(dir, ts("2026-04-07 13:00:00.000"), 50).unwrap();
+        drop(f1);
+        let (f2, p2) =
+            prepare_log_file(dir, ts("2026-04-07 13:00:00.001"), 50).unwrap();
+        drop(f2);
+        assert_ne!(p1, p2);
+        assert!(p1.exists());
+        assert!(p2.exists());
     }
 
-    /// Property: the previous launch's content is preserved at
-    /// `<path>.1` after the next `prepare_log_file` call. The N-th
-    /// most recent launch lives at `<path>.<N>`.
+    /// Previous launches are preserved (the whole point of having a
+    /// directory of launch files).
     #[test]
-    fn previous_launch_moves_to_dot_one() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("coach.log");
-        {
-            let mut f = prepare_log_file(&path, 5).unwrap();
-            writeln!(f, "launch A").unwrap();
-        }
-        let _ = prepare_log_file(&path, 5).unwrap();
-        let one = numbered_path(&path, 1);
-        assert!(one.exists(), "expected previous launch at {one:?}");
-        assert!(read_to_string(&one).contains("launch A"));
+    fn previous_launch_files_are_preserved() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let (mut f1, p1) =
+            prepare_log_file(dir, ts("2026-04-07 13:00:00.000"), 50).unwrap();
+        writeln!(f1, "launch A").unwrap();
+        drop(f1);
+
+        let _ = prepare_log_file(dir, ts("2026-04-07 13:00:01.000"), 50).unwrap();
+
+        assert!(p1.exists());
+        assert!(read_to_string(&p1).contains("launch A"));
     }
 
-    /// Property: after K consecutive launches, the i-th most recent
-    /// launch (1-indexed) lives at `<path>.<i>` for i = 1..min(K, history).
-    /// Uses small history to keep the test fast and clear.
+    /// Property: after K consecutive launches, only the most recent
+    /// `keep` files survive — the oldest are deleted, in order.
     #[test]
-    fn ring_preserves_order_across_many_launches() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("coach.log");
-        let history = 3;
+    fn pruning_keeps_most_recent_n_files() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let keep = 3;
 
-        // 5 launches; history holds at most 3 previous + 1 current = 4 files.
-        for i in 1..=5 {
-            let mut f = prepare_log_file(&path, history).unwrap();
-            writeln!(f, "launch {i}").unwrap();
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let now = ts(&format!("2026-04-07 13:00:0{i}.000"));
+            let (f, p) = prepare_log_file(dir, now, keep).unwrap();
+            drop(f);
+            paths.push(p);
         }
 
-        // After launch 5: current="launch 5" was the latest write, but
-        // we want a *fresh* file for the next launch, so simulate it.
-        let _ = prepare_log_file(&path, history).unwrap();
-
-        // Now: .1 should be "launch 5", .2 = "launch 4", .3 = "launch 3".
-        // Earlier launches (1, 2) have aged out.
-        for (n, expected) in [(1, "launch 5"), (2, "launch 4"), (3, "launch 3")] {
-            let p = numbered_path(&path, n);
-            assert!(p.exists(), "expected {p:?} to exist");
-            assert!(
-                read_to_string(&p).contains(expected),
-                ".{n} should contain {expected:?}, got {:?}",
-                read_to_string(&p),
-            );
+        let surviving = list_launch_files(dir).unwrap();
+        assert_eq!(surviving.len(), keep);
+        // The 3 most-recent paths (last in `paths`) must all still exist.
+        for p in paths.iter().rev().take(keep) {
+            assert!(p.exists(), "expected {p:?} to survive");
         }
-        // .4 must NOT exist — we capped at history=3.
-        assert!(
-            !numbered_path(&path, 4).exists(),
-            "ring exceeded its capacity"
-        );
+        // The 3 oldest must be gone.
+        for p in paths.iter().take(paths.len() - keep) {
+            assert!(!p.exists(), "expected {p:?} to be pruned");
+        }
     }
 
-    /// `rotate_ring` on a non-existent file is a no-op rather than an
-    /// error — first-ever startup must not fail.
+    /// On Unix, `coach.log` is a symlink to the most recent launch's
+    /// filename. Updating to a new launch repoints it.
+    #[cfg(unix)]
     #[test]
-    fn rotate_missing_file_is_noop() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("nope.log");
-        rotate_ring(&path, 5).unwrap();
-        assert!(!path.exists());
-        assert!(!numbered_path(&path, 1).exists());
+    fn symlink_points_at_latest_launch() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        let (_, p1) =
+            prepare_log_file(dir, ts("2026-04-07 13:00:00.000"), 50).unwrap();
+        let symlink = dir.join(SYMLINK_NAME);
+        assert!(symlink.exists());
+        let target = fs::read_link(&symlink).unwrap();
+        assert_eq!(target, PathBuf::from(p1.file_name().unwrap()));
+
+        let (_, p2) =
+            prepare_log_file(dir, ts("2026-04-07 13:00:01.000"), 50).unwrap();
+        let target2 = fs::read_link(&symlink).unwrap();
+        assert_eq!(target2, PathBuf::from(p2.file_name().unwrap()));
     }
 
-    /// Property: with `history == 0`, no `.N` siblings are ever
-    /// created. Each launch gets a fresh file and the previous one is
-    /// discarded. Useful as a degenerate-but-valid configuration and
-    /// guards the off-by-one in the rotation loop.
+    /// `prune_old_logs` ignores the symlink itself when counting —
+    /// deleting `coach.log` would lose the convenient stable name
+    /// without freeing any space.
+    #[cfg(unix)]
     #[test]
-    fn history_zero_keeps_no_previous_files() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("coach.log");
-        {
-            let mut f = prepare_log_file(&path, 0).unwrap();
-            writeln!(f, "first").unwrap();
-        }
-        let _ = prepare_log_file(&path, 0).unwrap();
-        assert!(!numbered_path(&path, 1).exists());
-        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    fn prune_does_not_count_or_delete_symlink() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Two launches, keep = 1. Should leave 1 timestamped + 1 symlink.
+        prepare_log_file(dir, ts("2026-04-07 13:00:00.000"), 1).unwrap();
+        prepare_log_file(dir, ts("2026-04-07 13:00:01.000"), 1).unwrap();
+
+        let files = list_launch_files(dir).unwrap();
+        assert_eq!(files.len(), 1, "expected 1 surviving launch file");
+        assert!(dir.join(SYMLINK_NAME).exists(), "symlink should still exist");
     }
 }
