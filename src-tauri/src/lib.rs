@@ -1,6 +1,7 @@
 pub mod cli;
 mod commands;
 pub mod llm;
+pub mod logging;
 pub mod path_install;
 pub mod pid_resolver;
 pub mod replay;
@@ -18,7 +19,14 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 pub fn run() {
+    // Redirect stderr+stdout to a log file before any other output. After
+    // this returns, every existing eprintln!/println! and any panic message
+    // lands in `~/Library/Logs/Coach/coach.log` (or platform equivalent).
+    let log_path = logging::init_for_app();
     eprintln!("[coach] starting up");
+    if let Some(p) = &log_path {
+        eprintln!("[coach] logging to {}", p.display());
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Another instance tried to launch — show our existing window.
