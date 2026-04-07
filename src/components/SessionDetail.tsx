@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useCoachStore } from "../store/useCoachStore";
 import { formatDuration, formatTime, timeAgo } from "../utils/time";
+import { abbreviateCwd } from "../utils/path";
 import { TopBar } from "./TopBar";
 
 /// Compact integer formatter — 1234 → "1.2k", 12345 → "12.3k", < 1000 → as-is.
@@ -48,7 +49,6 @@ export function SessionDetail() {
     ([, a], [, b]) => b - a,
   );
   const maxToolCount = toolEntries.length > 0 ? toolEntries[0][1] : 0;
-  const otherCwds = session.cwd_history.filter((p) => p !== session.cwd);
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-y-auto">
@@ -81,7 +81,7 @@ export function SessionDetail() {
         </h2>
         <div className="space-y-1 text-xs">
           <div className="font-mono text-zinc-600 dark:text-zinc-400 truncate">
-            {session.cwd}
+            {abbreviateCwd(session.cwd)}
           </div>
           <div className="font-mono text-zinc-400 dark:text-zinc-600">
             {session.session_id.slice(0, 12)}
@@ -89,17 +89,6 @@ export function SessionDetail() {
           <div className="text-zinc-500 dark:text-zinc-400">
             Started {formatTime(session.started_at)} · {timeAgo(session.started_at)} · {formatDuration(session.duration_secs)}
           </div>
-          {otherCwds.length > 0 && (
-            <div className="text-zinc-400 dark:text-zinc-500">
-              Also worked in:{" "}
-              {otherCwds.map((p, i) => (
-                <span key={i} className="font-mono">
-                  {i > 0 && ", "}
-                  {p}
-                </span>
-              ))}
-            </div>
-          )}
         </div>
       </section>
 

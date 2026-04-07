@@ -146,6 +146,8 @@ function SessionBrowser({
   );
 }
 
+type ReplayMode = "away" | "llm" | "present";
+
 function ReplayView({
   sessionId,
   onBack,
@@ -157,6 +159,7 @@ function ReplayView({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedEvent, setExpandedEvent] = useState<number | null>(null);
+  const [mode, setMode] = useState<ReplayMode>("away");
 
   const run = useCallback(async () => {
     setLoading(true);
@@ -164,6 +167,7 @@ function ReplayView({
     try {
       const r = await invoke<ReplayResult>("replay_session", {
         sessionId,
+        mode,
       });
       setResult(r);
       if (r.first_intervention_index !== null) {
@@ -174,7 +178,7 @@ function ReplayView({
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, mode]);
 
   useEffect(() => {
     run();
@@ -188,7 +192,9 @@ function ReplayView({
           onBack={onBack}
         />
         <p className="text-xs text-zinc-400 dark:text-zinc-500 italic py-8 text-center">
-          Parsing session and evaluating events...
+          {mode === "llm"
+            ? "Calling LLM coach for each Stop event — this can take a while..."
+            : "Parsing session and evaluating events..."}
         </p>
       </div>
     );
@@ -236,6 +242,34 @@ function ReplayView({
             <div className="text-emerald-600 dark:text-emerald-400">
               No intervention would occur
             </div>
+          )}
+        </div>
+
+        {/* Mode toggle: rules vs LLM coach. Re-runs replay on change. */}
+        <div className="flex items-center gap-2 mt-2">
+          <span className="text-[10px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+            Engine
+          </span>
+          <div className="inline-flex rounded border border-zinc-200 dark:border-zinc-700 overflow-hidden text-xs">
+            {(["away", "llm", "present"] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => setMode(m)}
+                disabled={loading || mode === m}
+                className={`px-2 py-0.5 ${
+                  mode === m
+                    ? "bg-zinc-800 text-zinc-100 dark:bg-zinc-200 dark:text-zinc-900"
+                    : "bg-transparent text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                }`}
+              >
+                {m === "away" ? "rules" : m === "llm" ? "llm" : "passthrough"}
+              </button>
+            ))}
+          </div>
+          {mode === "llm" && (
+            <span className="text-[10px] text-zinc-400 dark:text-zinc-500 italic">
+              one LLM call per Stop
+            </span>
           )}
         </div>
       </section>

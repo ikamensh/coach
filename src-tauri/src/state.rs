@@ -129,6 +129,10 @@ pub struct SessionSnapshot {
     /// process before any hook fired.
     pub session_id: String,
     pub mode: CoachMode,
+    /// The directory the window was launched in. Set once on first
+    /// observation (scanner or hook) and never overwritten — Claude Code
+    /// can chdir mid-session, but the launch directory is the only stable
+    /// label for "what is this window for".
     pub cwd: Option<String>,
     pub last_event: DateTime<Utc>,
     pub event_count: usize,
@@ -138,7 +142,6 @@ pub struct SessionSnapshot {
     pub tool_counts: HashMap<String, usize>,
     pub stop_count: usize,
     pub stop_blocked_count: usize,
-    pub cwd_history: Vec<String>,
     pub coach_last_assessment: Option<String>,
     pub coach_last_error: Option<String>,
     /// Periodic 4-words-or-fewer topic produced by the coach LLM.
@@ -205,6 +208,10 @@ pub struct SessionState {
     pub pid: u32,
     pub current_session_id: String,
     pub mode: CoachMode,
+    /// Launch directory for this window — set once on first observation
+    /// (scanner or hook) and frozen. Claude Code may chdir during a
+    /// session, but the launch dir is what users mean when they ask
+    /// "which session is this?".
     pub cwd: Option<String>,
     pub last_event: Instant,
     pub last_event_time: DateTime<Utc>,
@@ -216,9 +223,6 @@ pub struct SessionState {
     pub tool_counts: HashMap<String, usize>,
     pub stop_count: usize,
     pub stop_blocked_count: usize,
-    /// All cwds this **window** has been in. Persists across `/clear`
-    /// because it describes the process, not the conversation.
-    pub cwd_history: Vec<String>,
     /// Coach LLM chain handle (provider-specific). Reset to `Empty` on
     /// `/clear` since the new conversation has no shared context with
     /// the previous one.
@@ -284,20 +288,27 @@ const GENERIC_DIR_NAMES: &[&str] = &[
     "node_modules", "packages", ".git", "target",
 ];
 
-/// Derive a human-readable display name from a window's working directories.
+/// Derive a human-readable display name from the window's launch cwd.
 ///
-/// Picks the deepest non-home path from `cwd_history`, extracts its last segment,
-/// and includes the parent if that segment is a generic name like "src" or "lib".
-/// Falls back to `pid:<n>` if no cwd is available.
-fn derive_display_name(cwd_history: &[String], pid: u32) -> String {
-    let best = cwd_history
-        .iter()
-        .filter(|p| !p.is_empty())
-        .max_by_key(|p| p.matches('/').count());
+/// Returns the last path segment, or `parent/last` if the last segment is a
+/// generic name like "src" or "lib". Falls back to `pid:<n>` if no cwd.
+/// Set the launch cwd on first observation. No-op if already set, so
+/// later hooks (which may report a different cwd after the user `cd`s)
+/// can't drift the window's identity.
+fn adopt_cwd_if_unset(sess: &mut SessionState, cwd: Option<&str>) {
+    if sess.cwd.is_some() {
+        return;
+    }
+    if let Some(c) = cwd {
+        sess.cwd = Some(c.to_string());
+        sess.display_name = derive_display_name(sess.cwd.as_deref(), sess.pid);
+    }
+}
 
-    let path = match best {
-        Some(p) => p.as_str(),
-        None => return format!("pid:{pid}"),
+fn derive_display_name(cwd: Option<&str>, pid: u32) -> String {
+    let path = match cwd {
+        Some(p) if !p.is_empty() => p,
+        _ => return format!("pid:{pid}"),
     };
 
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -380,7 +391,7 @@ impl CoachState {
     /// 3. **PID has a session under a different `session_id`** → this is a
     ///    `/clear` (or `/resume` / `/compact`). Replace the conversation:
     ///    new id, fresh `started_at`, counters reset to 0, activity cleared,
-    ///    coach response chain reset. PID, mode, cwd_history, display_name
+    ///    coach response chain reset. PID, mode, cwd, display_name
     ///    are preserved because they describe the **window**.
     ///
     /// Returns a mutable reference to the session for callers that want to
@@ -404,13 +415,7 @@ impl CoachState {
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
                 sess.event_count += 1;
-                if let Some(cwd) = cwd {
-                    sess.cwd = Some(cwd.to_string());
-                    if !sess.cwd_history.iter().any(|c| c == cwd) {
-                        sess.cwd_history.push(cwd.to_string());
-                        sess.display_name = derive_display_name(&sess.cwd_history, pid);
-                    }
-                }
+                adopt_cwd_if_unset(sess, cwd);
             }
             Some(sess) if sess.current_session_id.is_empty() => {
                 // First hook for a scanner-discovered placeholder. Adopt
@@ -420,13 +425,7 @@ impl CoachState {
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
                 sess.event_count = 1;
-                if let Some(cwd) = cwd {
-                    sess.cwd = Some(cwd.to_string());
-                    if !sess.cwd_history.iter().any(|c| c == cwd) {
-                        sess.cwd_history.push(cwd.to_string());
-                        sess.display_name = derive_display_name(&sess.cwd_history, pid);
-                    }
-                }
+                adopt_cwd_if_unset(sess, cwd);
             }
             Some(sess) => {
                 // /clear: new conversation in the same window. Reset
@@ -451,17 +450,10 @@ impl CoachState {
                 sess.coach_last_usage = None;
                 sess.coach_total_usage = CoachUsage::default();
                 sess.activity.clear();
-                if let Some(cwd) = cwd {
-                    sess.cwd = Some(cwd.to_string());
-                    if !sess.cwd_history.iter().any(|c| c == cwd) {
-                        sess.cwd_history.push(cwd.to_string());
-                        sess.display_name = derive_display_name(&sess.cwd_history, pid);
-                    }
-                }
+                adopt_cwd_if_unset(sess, cwd);
             }
             None => {
-                let cwd_history: Vec<String> = cwd.iter().map(|c| c.to_string()).collect();
-                let display_name = derive_display_name(&cwd_history, pid);
+                let display_name = derive_display_name(cwd, pid);
                 self.sessions.insert(
                     pid,
                     SessionState {
@@ -478,7 +470,6 @@ impl CoachState {
                         tool_counts: HashMap::new(),
                         stop_count: 0,
                         stop_blocked_count: 0,
-                        cwd_history,
                         coach_chain: CoachChain::Empty,
                         coach_last_assessment: None,
                         coach_last_error: None,
@@ -517,7 +508,6 @@ impl CoachState {
                 tool_counts: s.tool_counts.clone(),
                 stop_count: s.stop_count,
                 stop_blocked_count: s.stop_blocked_count,
-                cwd_history: s.cwd_history.clone(),
                 coach_last_assessment: s.coach_last_assessment.clone(),
                 coach_last_error: s.coach_last_error.clone(),
                 coach_session_title: s.coach_session_title.clone(),
@@ -632,8 +622,7 @@ impl CoachState {
         if self.sessions.contains_key(&pid) {
             return false;
         }
-        let cwd_history: Vec<String> = cwd.iter().map(|c| c.to_string()).collect();
-        let display_name = derive_display_name(&cwd_history, pid);
+        let display_name = derive_display_name(cwd, pid);
         self.sessions.insert(
             pid,
             SessionState {
@@ -651,7 +640,6 @@ impl CoachState {
                 tool_counts: HashMap::new(),
                 stop_count: 0,
                 stop_blocked_count: 0,
-                cwd_history,
                 coach_chain: CoachChain::Empty,
                 coach_last_assessment: None,
                 coach_last_error: None,
@@ -718,33 +706,35 @@ pub fn away_message(priorities: &[String]) -> String {
 
 pub type SharedState = Arc<RwLock<CoachState>>;
 
+/// Build a `CoachState` with empty env_tokens so tests don't depend on
+/// the machine's actual environment variables. Lives at module scope so
+/// other modules' test trees (e.g. `replay::tests`) can share it.
+#[cfg(test)]
+pub(crate) fn test_state() -> CoachState {
+    CoachState {
+        sessions: HashMap::new(),
+        session_id_to_pid: HashMap::new(),
+        priorities: vec!["Simplicity".into()],
+        port: 7700,
+        theme: Theme::System,
+        default_mode: CoachMode::Present,
+        model: crate::settings::ModelConfig {
+            provider: "google".into(),
+            model: "gemini-2.5-flash".into(),
+        },
+        api_tokens: HashMap::new(),
+        env_tokens: HashMap::new(),
+        http_client: reqwest::Client::new(),
+        coach_mode: crate::settings::EngineMode::Rules,
+        rules: vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::{EngineMode, ModelConfig, Settings};
     use std::collections::HashMap;
-
-    /// Build a CoachState with empty env_tokens so tests don't depend
-    /// on the machine's actual environment variables.
-    fn test_state() -> CoachState {
-        CoachState {
-            sessions: HashMap::new(),
-            session_id_to_pid: HashMap::new(),
-            priorities: vec!["Simplicity".into()],
-            port: 7700,
-            theme: Theme::System,
-            default_mode: CoachMode::Present,
-            model: ModelConfig {
-                provider: "google".into(),
-                model: "gemini-2.5-flash".into(),
-            },
-            api_tokens: HashMap::new(),
-            env_tokens: HashMap::new(),
-            http_client: reqwest::Client::new(),
-            coach_mode: EngineMode::Rules,
-            rules: vec![],
-        }
-    }
 
     // ── effective_token resolution chain ─────────────────────────────────
 
@@ -800,7 +790,9 @@ mod tests {
     }
 
     /// Same (pid, session_id) on a second hook bumps the counter and
-    /// preserves user-set fields like mode.
+    /// preserves user-set fields like mode. The launch cwd is frozen on
+    /// first observation — a later hook from a different cwd (e.g. after
+    /// a `cd` in a Bash tool) must NOT drift the window's identity.
     #[test]
     fn apply_hook_event_increments_existing_session() {
         let mut state = test_state();
@@ -812,12 +804,12 @@ mod tests {
 
         let sess = state.sessions.get(&42).unwrap();
         assert_eq!(sess.event_count, 2);
-        assert_eq!(sess.cwd, Some("/b".into()));
+        assert_eq!(sess.cwd, Some("/a".into()), "launch cwd is frozen");
         assert_eq!(sess.mode, CoachMode::Away, "mode survives hook updates");
     }
 
     /// /clear: same PID, new session_id. Counters reset, started_at moves
-    /// forward, activity is wiped, but pid/mode/cwd_history persist.
+    /// forward, activity is wiped, but pid/mode/cwd persist.
     /// This is the core regression test for the original bug.
     #[test]
     fn apply_hook_event_resets_on_clear() {
@@ -858,7 +850,7 @@ mod tests {
         // Window-scoped: preserved
         assert_eq!(sess.pid, 42);
         assert_eq!(sess.mode, CoachMode::Away, "mode is window-scoped");
-        assert_eq!(sess.cwd_history.len(), 1, "cwd preserved");
+        assert_eq!(sess.cwd, Some("/projects/coach".into()), "cwd preserved");
         // Cache: BOTH ids point at the same PID (lookup safety)
         assert_eq!(state.session_id_to_pid.get("old"), Some(&42));
         assert_eq!(state.session_id_to_pid.get("new"), Some(&42));
@@ -1226,73 +1218,72 @@ mod tests {
 
     #[test]
     fn display_name_normal_path() {
-        let history = vec!["/Users/foo/projects/coach".into()];
-        assert_eq!(derive_display_name(&history, 12345), "coach");
+        assert_eq!(
+            derive_display_name(Some("/Users/foo/projects/coach"), 12345),
+            "coach",
+        );
     }
 
+    /// "src", "lib", "target" etc. are generic — the parent disambiguates.
+    /// Without this, `~/projects/coach/src` and `~/projects/foo/src` would
+    /// both display as "src".
     #[test]
     fn display_name_generic_last_segment() {
-        let history = vec!["/Users/foo/projects/coach/src".into()];
-        assert_eq!(derive_display_name(&history, 12345), "coach/src");
+        assert_eq!(
+            derive_display_name(Some("/Users/foo/projects/coach/src"), 12345),
+            "coach/src",
+        );
     }
 
     /// With no cwd, fall back to a `pid:N` label so the user can still
     /// distinguish multiple unconfigured windows.
     #[test]
     fn display_name_fallback_to_pid() {
-        let history: Vec<String> = vec![];
-        assert_eq!(derive_display_name(&history, 12345), "pid:12345");
+        assert_eq!(derive_display_name(None, 12345), "pid:12345");
+        assert_eq!(derive_display_name(Some(""), 12345), "pid:12345");
     }
 
-    #[test]
-    fn display_name_picks_deepest_cwd() {
-        let history = vec![
-            "/Users/foo/projects".into(),
-            "/Users/foo/projects/coach/src".into(),
-            "/Users/foo".into(),
-        ];
-        assert_eq!(derive_display_name(&history, 12345), "coach/src");
-    }
+    // ── launch cwd is frozen on first observation ──────────────────────
 
-    // ── cwd_history through apply_hook_event ───────────────────────────
-
+    /// Regression: a window's title used to drift to whatever subdirectory
+    /// the most recent hook reported (e.g. `dynamic-fluttering-sprout` →
+    /// `dynamic-fluttering-sprout/src-tauri` after a `cd` in Bash). The
+    /// launch dir is the only stable label.
     #[test]
-    fn apply_hook_event_appends_cwd_history_on_change() {
+    fn launch_cwd_is_frozen_after_first_observation() {
         let mut state = test_state();
         state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
-        state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach/src"));
+        // Subsequent hooks from a deeper cwd must NOT drift the title.
+        state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach/src-tauri"));
+        state.apply_hook_event(1, "s", Some("/tmp/elsewhere"));
 
         let sess = state.sessions.get(&1).unwrap();
-        assert_eq!(
-            sess.cwd_history,
-            vec![
-                "/Users/foo/projects/coach",
-                "/Users/foo/projects/coach/src",
-            ]
-        );
-        assert_eq!(sess.display_name, "coach/src");
+        assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
+        assert_eq!(sess.display_name, "coach");
     }
 
+    /// If the first hook lacked a cwd (defensive — Claude Code always
+    /// sends one in practice), the next hook with a cwd should adopt it.
     #[test]
-    fn apply_hook_event_does_not_duplicate_cwd_history() {
+    fn launch_cwd_adopted_when_first_hook_had_none() {
         let mut state = test_state();
-        state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
-        state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach/src"));
+        state.apply_hook_event(1, "s", None);
         state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
 
         let sess = state.sessions.get(&1).unwrap();
-        assert_eq!(sess.cwd_history.len(), 2);
+        assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
+        assert_eq!(sess.display_name, "coach");
     }
 
-    /// cwd_history persists across /clear because it describes the
-    /// window, not the conversation.
+    /// `/clear` keeps the launch cwd — it's window-scoped, not
+    /// conversation-scoped.
     #[test]
-    fn cwd_history_persists_across_clear() {
+    fn launch_cwd_persists_across_clear() {
         let mut state = test_state();
         state.apply_hook_event(1, "old", Some("/Users/foo/projects/coach"));
-        state.apply_hook_event(1, "new", Some("/Users/foo/projects/coach"));
+        state.apply_hook_event(1, "new", Some("/Users/foo/projects/coach/src"));
         let sess = state.sessions.get(&1).unwrap();
-        assert_eq!(sess.cwd_history, vec!["/Users/foo/projects/coach"]);
+        assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
     }
 
     // ── register_discovered_pid ─────────────────────────────────────────

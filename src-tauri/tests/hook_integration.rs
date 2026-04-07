@@ -215,6 +215,71 @@ async fn multiple_sessions_tracked_independently() {
     assert_eq!(beta["event_count"], 1);
 }
 
+/// Regression: a window's title used to drift to whichever subdirectory
+/// the latest hook reported (e.g. `coach/src-tauri` after a `cd` in a
+/// Bash tool, even though the user launched Claude in `coach`). The
+/// launch directory must be frozen on first observation. End-to-end via
+/// HTTP so this would catch a regression in the wiring between the
+/// hook handler and the state mutator, not just the state unit test.
+#[tokio::test]
+async fn launch_cwd_frozen_across_subsequent_hooks() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // First hook: claude was launched in /Users/foo/projects/coach.
+    client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "drift-me",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "cwd": "/Users/foo/projects/coach",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Subsequent hooks report a deeper cwd (Claude `cd`'d into
+    // src-tauri at some point).
+    for _ in 0..3 {
+        client
+            .post(format!("{base}/hook/post-tool-use"))
+            .json(&serde_json::json!({
+                "session_id": "drift-me",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "cwd": "/Users/foo/projects/coach/src-tauri",
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let snap: serde_json::Value = client
+        .get(format!("{base}/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sess = snap["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == "drift-me")
+        .expect("session should exist");
+
+    assert_eq!(
+        sess["cwd"], "/Users/foo/projects/coach",
+        "launch cwd must NOT drift to a deeper subdirectory",
+    );
+    assert_eq!(
+        sess["display_name"], "coach",
+        "title must reflect the launch dir, not the deepest cwd",
+    );
+}
+
 #[tokio::test]
 async fn permission_request_auto_approves_in_away_mode() {
     let (base, state) = start_test_server().await;

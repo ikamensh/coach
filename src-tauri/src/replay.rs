@@ -1,10 +1,21 @@
 //! Session discovery and replay for the dev tools UI.
 //!
 //! Scans `~/.claude/projects/` for JSONL session files, extracts metadata,
-//! and replays hook events through Coach's intervention logic.
+//! and replays hook events through Coach's intervention logic. The replay
+//! mode parameter mirrors live coach behavior:
+//!   • `"present"` — passthrough; no intervention
+//!   • `"away"`    — rules-mode: block the first Stop with the static
+//!                   `away_message`, pass subsequent ones (a stand-in for
+//!                   the live 15s cooldown)
+//!   • `"llm"`     — call `llm::evaluate_stop` per Stop event, exactly
+//!                   the stateless one-shot path the live coach falls
+//!                   back to when no provider chain is available
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use crate::state::SharedState;
 
 fn claude_projects_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
@@ -242,7 +253,23 @@ pub fn find_session(session_id: &str) -> Option<PathBuf> {
     None
 }
 
-pub fn replay_session(session_id: &str, mode: &str, priorities: &[String]) -> Result<ReplayResult, String> {
+/// Internal raw event extracted from the JSONL transcript before
+/// per-mode evaluation. `stop_reason` is `Some` only on Stop events;
+/// it's the field passed through to the LLM coach, matching what the
+/// live `run_stop` hook handler builds in `StopContext`.
+struct RawEvent {
+    kind: String,
+    tool_name: String,
+    timestamp: String,
+    summary: String,
+    stop_reason: Option<String>,
+}
+
+pub async fn replay_session(
+    session_id: &str,
+    mode: &str,
+    state: &SharedState,
+) -> Result<ReplayResult, String> {
     let path = find_session(session_id)
         .ok_or_else(|| format!("Session not found: {}", session_id))?;
 
@@ -276,8 +303,13 @@ pub fn replay_session(session_id: &str, mode: &str, priorities: &[String]) -> Re
         .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("assistant"))
         .count();
 
-    // Extract hook events
-    let mut events: Vec<(String, String, String, String)> = Vec::new(); // (kind, tool_name, timestamp, summary)
+    // Snapshot priorities now and drop the read guard before any awaits.
+    // `evaluate_stop` reacquires its own short-lived read lock, so we
+    // must not be holding one when we call it.
+    let priorities: Vec<String> = state.read().await.priorities.clone();
+
+    // Extract hook events from the transcript.
+    let mut events: Vec<RawEvent> = Vec::new();
 
     for msg in &messages {
         if msg.get("type").and_then(|v| v.as_str()) != Some("assistant") {
@@ -295,56 +327,98 @@ pub fn replay_session(session_id: &str, mode: &str, priorities: &[String]) -> Re
                 }
                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let summary = tool_summary(block);
-                events.push((
-                    "PostToolUse".to_string(),
-                    tool.to_string(),
-                    ts.clone(),
-                    format!("{}: {}", tool, summary),
-                ));
+                events.push(RawEvent {
+                    kind: "PostToolUse".to_string(),
+                    tool_name: tool.to_string(),
+                    timestamp: ts.clone(),
+                    summary: format!("{}: {}", tool, summary),
+                    stop_reason: None,
+                });
             }
         }
 
+        // Live coach observes the Stop hook regardless of stop_reason,
+        // but in the JSONL transcript the only assistant frames that
+        // would have triggered Stop are the `end_turn` ones. Filtering
+        // here keeps replay aligned with what the user actually saw.
         if stop_reason == "end_turn" {
-            events.push((
-                "Stop".to_string(),
-                String::new(),
-                ts,
-                "end_turn".to_string(),
-            ));
+            events.push(RawEvent {
+                kind: "Stop".to_string(),
+                tool_name: String::new(),
+                timestamp: ts,
+                summary: "end_turn".to_string(),
+                stop_reason: Some(stop_reason.to_string()),
+            });
         }
     }
 
-    // Evaluate events
+    // Evaluate events. Running counters give the LLM the same
+    // `StopContext` shape the live coach builds — tool_counts,
+    // stop_count, stop_blocked_count — at each point in the timeline.
     let mut replay_events = Vec::new();
     let mut first_intervention: Option<usize> = None;
-    let mut stop_blocked = false; // cooldown tracking
+    let mut tool_counts: HashMap<String, usize> = HashMap::new();
+    let mut stop_count: usize = 0;
+    let mut stop_blocked_count: usize = 0;
+    let mut rules_stop_blocked = false; // rules-mode "block first Stop only"
 
-    for (i, (kind, tool_name, timestamp, summary)) in events.iter().enumerate() {
+    for (i, ev) in events.iter().enumerate() {
+        if ev.kind == "PostToolUse" && !ev.tool_name.is_empty() {
+            *tool_counts.entry(ev.tool_name.clone()).or_insert(0) += 1;
+        }
+        if ev.kind == "Stop" {
+            stop_count += 1;
+        }
+
         let (action, message) = if mode == "present" {
             (None, None)
-        } else if kind == "Stop" {
-            if stop_blocked {
-                // Cooldown — passthrough
-                (None, None)
-            } else {
-                stop_blocked = true;
-                let msg = crate::state::away_message(priorities);
-                (Some("blocked".to_string()), Some(msg))
-            }
-        } else {
+        } else if ev.kind != "Stop" {
             (None, None)
+        } else if mode == "llm" {
+            let ctx = crate::llm::StopContext {
+                priorities: priorities.clone(),
+                cwd: if cwd.is_empty() { None } else { Some(cwd.clone()) },
+                tool_counts: tool_counts.clone(),
+                stop_count,
+                stop_blocked_count,
+                stop_reason: ev.stop_reason.clone(),
+            };
+            match crate::llm::evaluate_stop(state, &ctx).await {
+                Ok(decision) if decision.allow => (None, None),
+                Ok(decision) => {
+                    stop_blocked_count += 1;
+                    let msg = decision
+                        .message
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or_else(|| crate::state::away_message(&priorities));
+                    (Some("blocked".to_string()), Some(msg))
+                }
+                Err(e) => (
+                    Some("error".to_string()),
+                    Some(format!("[LLM error] {e}")),
+                ),
+            }
+        } else if rules_stop_blocked {
+            (None, None)
+        } else {
+            rules_stop_blocked = true;
+            stop_blocked_count += 1;
+            (
+                Some("blocked".to_string()),
+                Some(crate::state::away_message(&priorities)),
+            )
         };
 
         let is_intervention = action.is_some();
 
         replay_events.push(ReplayEvent {
             index: i,
-            kind: kind.clone(),
-            tool_name: tool_name.clone(),
-            timestamp: timestamp.clone(),
-            summary: summary.clone(),
-            action: action.clone(),
-            message: message.clone(),
+            kind: ev.kind.clone(),
+            tool_name: ev.tool_name.clone(),
+            timestamp: ev.timestamp.clone(),
+            summary: ev.summary.clone(),
+            action,
+            message,
         });
 
         if is_intervention && first_intervention.is_none() {
@@ -434,9 +508,94 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replay_nonexistent_session_returns_error() {
-        let result = replay_session("nonexistent-id-12345", "away", &["Simplicity".into()]);
+    #[tokio::test]
+    async fn replay_nonexistent_session_returns_error() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        let state: SharedState = Arc::new(RwLock::new(crate::state::test_state()));
+        let result = replay_session("nonexistent-id-12345", "away", &state).await;
         assert!(result.is_err());
+    }
+
+    /// Live integration test for `mode = "llm"`: pick the smallest real
+    /// session in `~/.claude/projects/`, replay it through Gemini, and
+    /// assert that every Stop event got a real verdict from the model
+    /// (allowed or blocked — never `"error"`, which would mean the LLM
+    /// call itself failed).
+    ///
+    /// Ignored by default because it costs a few API calls. Run with
+    /// `cargo test --lib replay::tests::replay_llm_mode_calls_real_llm -- --ignored --nocapture`
+    /// (requires `GOOGLE_API_KEY` and at least one saved Claude Code
+    /// session containing assistant messages).
+    #[tokio::test]
+    #[ignore = "live LLM call — run with --ignored"]
+    async fn replay_llm_mode_calls_real_llm() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let google_key = std::env::var("GOOGLE_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .expect("GOOGLE_API_KEY must be set for the live LLM replay test");
+
+        // Pick the smallest session with at least one assistant message.
+        // Smaller = fewer Stop events = fewer LLM calls.
+        let mut sessions = list_sessions(50);
+        sessions.sort_by_key(|s| s.message_count);
+        let session = sessions
+            .into_iter()
+            .find(|s| s.assistant_message_count > 0)
+            .expect("no saved sessions with assistant messages in ~/.claude/projects/");
+        eprintln!(
+            "[live] replaying session {} ({} msgs, {} assistant)",
+            session.id, session.message_count, session.assistant_message_count
+        );
+
+        // Use the shared `test_state()` builder so we don't depend on
+        // the user's `~/.coach/settings.json` (which might point at a
+        // model the test environment can't reach). Inject only the
+        // Google token so `pick_verifier` finds no second provider and
+        // we make exactly one LLM call per Stop.
+        let mut coach = crate::state::test_state();
+        coach.env_tokens.insert("google".into(), google_key);
+        let state: SharedState = Arc::new(RwLock::new(coach));
+
+        let result = replay_session(&session.id, "llm", &state)
+            .await
+            .expect("replay_session returned an error");
+
+        let stops: Vec<&ReplayEvent> = result
+            .events
+            .iter()
+            .filter(|e| e.kind == "Stop")
+            .collect();
+        assert!(
+            !stops.is_empty(),
+            "selected session {} has no Stop events; cannot exercise the LLM path",
+            session.id
+        );
+
+        let errors: Vec<&&ReplayEvent> = stops
+            .iter()
+            .filter(|e| e.action.as_deref() == Some("error"))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{}/{} Stop events errored from the LLM call. First error: {:?}",
+            errors.len(),
+            stops.len(),
+            errors.first().and_then(|e| e.message.as_ref())
+        );
+
+        eprintln!("[live] {} Stop events evaluated by Gemini:", stops.len());
+        for ev in &stops {
+            let verdict = ev.action.as_deref().unwrap_or("allowed");
+            let preview = ev
+                .message
+                .as_ref()
+                .and_then(|m| m.lines().next())
+                .unwrap_or("");
+            eprintln!("  event {:>3}: {:<8} {}", ev.index + 1, verdict, preview);
+        }
     }
 }

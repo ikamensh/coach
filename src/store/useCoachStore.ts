@@ -34,6 +34,7 @@ interface SessionSnapshot {
   /** Current conversation id — changes on /clear. */
   session_id: string;
   mode: CoachMode;
+  /** Launch directory of the window. Set once on first observation and frozen. */
   cwd: string | null;
   last_event: string;
   event_count: number;
@@ -43,7 +44,6 @@ interface SessionSnapshot {
   tool_counts: Record<string, number>;
   stop_count: number;
   stop_blocked_count: number;
-  cwd_history: string[];
   coach_last_assessment: string | null;
   coach_last_error: string | null;
   /** Periodic LLM-generated 4-words-or-fewer topic. Frontend prefers this over `display_name`. */

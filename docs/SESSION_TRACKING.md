@@ -110,10 +110,22 @@ A `/clear` is genuinely a new conversation, and we treat it as such:
 * Counters reset (`event_count`, `tool_counts`, `stop_count`,
   `stop_blocked_count`)
 * `started_at` reset to now
-* `cwd_history` preserved (the window may have moved between projects
-  before the `/clear`, and that history is window-scoped, not
-  conversation-scoped)
+* `cwd` preserved (it's the launch directory of the window, frozen on
+  first observation — see "Launch cwd" below)
 * `pid` and `display_name` preserved — same window
+
+### Launch cwd
+
+`SessionState.cwd` is the directory the window was launched in, set once
+on first observation (whichever fires first — scanner reading
+`~/.claude/sessions/<pid>.json`, or the first hook payload) and never
+overwritten. Claude Code can chdir mid-session (a `cd` in a Bash tool
+persists across calls), but the launch dir is the only stable label for
+"which window is this?". An earlier iteration tracked a `cwd_history`
+list and let `display_name` drift to the deepest path seen, which made
+titles like `coach/src-tauri` appear after Claude touched a subdirectory
+even though the user had launched it in `coach`. The fixed-on-first
+rule eliminates that drift.
 
 The activity log is global and keyed by hook `session_id`, so the old
 conversation's events stay searchable in the global log but vanish from
@@ -196,7 +208,7 @@ exactly what they are.
 
 * **Per-conversation rows.** We could add a "history" view that lists
   every conversation a window has had, with each one's counters. Not
-  needed for the current bug, easy to add later — `cwd_history`-style.
+  needed for the current bug, easy to add later.
 * **WSL2 / containerised Claude Code talking to a host-side Coach.**
   TCP traffic from inside WSL2 to a host service goes through a
   Hyper-V vmbus proxy, so the PID Coach sees would be the proxy on the

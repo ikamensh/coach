@@ -248,11 +248,8 @@ pub async fn replay_session(
     session_id: String,
     mode: Option<String>,
 ) -> Result<replay::ReplayResult, String> {
-    let coach = state.read().await;
     let mode = mode.unwrap_or_else(|| "away".to_string());
-    let priorities = coach.priorities.clone();
-    drop(coach);
-    replay::replay_session(&session_id, &mode, &priorities)
+    replay::replay_session(&session_id, &mode, state.inner()).await
 }
 
 #[tauri::command]

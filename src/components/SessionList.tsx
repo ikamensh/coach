@@ -1,5 +1,6 @@
 import { useCoachStore } from "../store/useCoachStore";
 import { formatDuration } from "../utils/time";
+import { abbreviateCwd } from "../utils/path";
 import { OwlIcon } from "./OwlIcon";
 import { CursorIcon } from "./CursorIcon";
 import { ActivityBar } from "./ActivityBar";
@@ -11,18 +12,6 @@ export function topTools(toolCounts: Record<string, number>, n = 3): string {
     .slice(0, n)
     .map(([name, count]) => `${name}: ${count}`)
     .join(", ");
-}
-
-function abbreviateCwd(cwd: string | null): string {
-  if (!cwd) return "unknown";
-  const home = "/Users/";
-  if (cwd.startsWith(home)) {
-    const rest = cwd.slice(home.length);
-    const slashIdx = rest.indexOf("/");
-    if (slashIdx >= 0) return "~" + rest.slice(slashIdx);
-    return "~";
-  }
-  return cwd;
 }
 
 export function SessionList() {

@@ -50,7 +50,7 @@ COMMANDS:
     config set rule <id> <on|off>          enable/disable a rule
 
     sessions list [--limit N] [--json]     list saved Claude Code sessions
-    replay <session-id> [--mode away|present] [--json]
+    replay <session-id> [--mode away|present|llm] [--json]
 
     help, --help, -h                       this message
     version, --version, -V                 print version
@@ -515,12 +515,24 @@ fn cmd_sessions(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_replay(args: &[String]) -> Result<(), String> {
-    let session_id = args.first().ok_or("usage: coach replay <session-id> [--mode away|present]")?;
+    let session_id = args.first().ok_or(
+        "usage: coach replay <session-id> [--mode away|present|llm]",
+    )?;
     let mode = parse_named_string(&args[1..], "--mode")?.unwrap_or_else(|| "away".to_string());
     let json_out = args.iter().any(|a| a == "--json");
 
-    let priorities = Settings::load().priorities;
-    let result = replay::replay_session(session_id, &mode, &priorities)?;
+    // Replay is async because `--mode llm` calls into the LLM coach.
+    // Spin up a one-shot multi-thread runtime + an in-process
+    // CoachState seeded from the user's settings — no daemon involved.
+    use crate::state::{CoachState, SharedState};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(Settings::load())));
+    let result = runtime.block_on(replay::replay_session(session_id, &mode, &state))?;
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
