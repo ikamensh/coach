@@ -8,24 +8,48 @@ use tauri::{
 
 const TRAY_ID: &str = "coach-tray";
 
-/// Generate a small colored circle icon for the system tray.
-fn circle_icon(r: u8, g: u8, b: u8) -> Image<'static> {
-    const SIZE: u32 = 22;
+/// Generate an iris-style tray icon: black pupil, colored iris with
+/// concentric rings perturbed by radial fibers, dark limbus outline.
+/// Rendered at 2x retina resolution with anti-aliased edges.
+fn iris_icon(r: u8, g: u8, b: u8) -> Image<'static> {
+    const SIZE: u32 = 44;
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
     let center = SIZE as f32 / 2.0;
-    let radius = center - 2.0;
+    let outer = center - 1.5;
+    let pupil = outer * 0.30;
+
     for y in 0..SIZE {
         for x in 0..SIZE {
             let dx = x as f32 - center + 0.5;
             let dy = y as f32 - center + 0.5;
             let dist = (dx * dx + dy * dy).sqrt();
-            if dist <= radius {
-                let idx = ((y * SIZE + x) * 4) as usize;
-                rgba[idx] = r;
-                rgba[idx + 1] = g;
-                rgba[idx + 2] = b;
-                rgba[idx + 3] = 255;
+            if dist > outer + 1.0 {
+                continue;
             }
+
+            let idx = ((y * SIZE + x) * 4) as usize;
+
+            // Anti-aliased outer edge and pupil edge.
+            let outer_alpha = (outer + 0.5 - dist).clamp(0.0, 1.0);
+            let pupil_alpha = (pupil + 0.5 - dist).clamp(0.0, 1.0);
+
+            // Iris pattern (relevant outside pupil).
+            let n = ((dist - pupil) / (outer - pupil)).clamp(0.0, 1.0);
+            let angle = dy.atan2(dx);
+            // Two-frequency angular fibers — gives the iris an irregular,
+            // organic look instead of perfectly concentric rings.
+            let fibers = (angle * 13.0).sin() * 0.20 + (angle * 7.0 + 1.7).cos() * 0.12;
+            let rings = ((n * 6.0 + fibers * 1.8).sin() * 0.5 + 0.5) * 0.45 + 0.45;
+            // Darken near limbus for a defined outer edge.
+            let limbus = 1.0 - ((n - 0.85).max(0.0) * 6.5).min(0.7);
+            let bright = (rings * limbus).clamp(0.0, 1.0);
+
+            // Iris color, then blend pupil (black) over it via pupil_alpha.
+            let inv_pupil = 1.0 - pupil_alpha;
+            rgba[idx] = (r as f32 * bright * inv_pupil) as u8;
+            rgba[idx + 1] = (g as f32 * bright * inv_pupil) as u8;
+            rgba[idx + 2] = (b as f32 * bright * inv_pupil) as u8;
+            rgba[idx + 3] = (outer_alpha * 255.0) as u8;
         }
     }
     Image::new_owned(rgba, SIZE, SIZE)
@@ -35,8 +59,8 @@ fn circle_icon(r: u8, g: u8, b: u8) -> Image<'static> {
 pub fn update_icon(app: &tauri::AppHandle, mode: &CoachMode) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let (icon, tooltip) = match mode {
-            CoachMode::Present => (circle_icon(16, 185, 129), "Coach — Present"),
-            CoachMode::Away => (circle_icon(245, 158, 11), "Coach — Away"),
+            CoachMode::Present => (iris_icon(16, 185, 129), "Coach — Present"),
+            CoachMode::Away => (iris_icon(245, 158, 11), "Coach — Away"),
         };
         let _ = tray.set_icon(Some(icon));
         let _ = tray.set_tooltip(Some(tooltip));
@@ -81,7 +105,7 @@ pub fn setup(app: &mut tauri::App, state: SharedState) -> Result<(), Box<dyn std
     let menu_state = state;
 
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
-        .icon(circle_icon(16, 185, 129))
+        .icon(iris_icon(16, 185, 129))
         .tooltip("Coach — Present")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id().as_ref() {
