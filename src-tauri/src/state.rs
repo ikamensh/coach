@@ -171,6 +171,21 @@ fn derive_display_name(cwd_history: &[String], session_id: &str) -> String {
 
 const SESSION_ACTIVITY_CAP: usize = 200;
 const SESSION_TTL_SECS: u64 = 3600;
+/// Sessions that have had any activity within this window count as "active"
+/// for ordering purposes. Crossing this threshold is the only thing that
+/// can cause a session to change rank, so the list stays stable while you
+/// work and only occasionally demotes a session that has gone idle.
+const SESSION_ACTIVE_WINDOW_SECS: i64 = 15 * 60;
+
+/// Two-bucket activity classifier used by the snapshot sort.
+/// 0 = active (recent activity), 1 = idle.
+fn activity_bucket(last_event: DateTime<Utc>, now: DateTime<Utc>) -> u8 {
+    if (now - last_event).num_seconds() < SESSION_ACTIVE_WINDOW_SECS {
+        0
+    } else {
+        1
+    }
+}
 
 impl CoachState {
     pub fn from_settings(settings: Settings) -> Self {
@@ -278,7 +293,17 @@ impl CoachState {
                 activity: s.activity.iter().cloned().collect(),
             })
             .collect();
-        sessions.sort_by(|a, b| b.last_event.cmp(&a.last_event));
+        // Stable two-bucket sort: active sessions on top, idle below.
+        // Within a bucket, newest-started first. The only event that
+        // reorders the list is a session crossing the active/idle
+        // boundary — so the order stays stable while you're working.
+        sessions.sort_by(|a, b| {
+            let bucket_a = activity_bucket(a.last_event, now);
+            let bucket_b = activity_bucket(b.last_event, now);
+            bucket_a
+                .cmp(&bucket_b)
+                .then_with(|| b.started_at.cmp(&a.started_at))
+        });
 
         CoachSnapshot {
             sessions,
@@ -597,11 +622,11 @@ mod tests {
 
     // ── Snapshot properties ─────────────────────────────────────────────
 
-    /// Snapshot sessions should be sorted by last_event descending
-    /// (most recent first). We set timestamps manually to avoid
-    /// depending on wall-clock timing between calls.
+    /// Within the active bucket the order is by started_at descending
+    /// (newest session on top), and it must be stable as last_event ticks.
+    /// This is the regression test for "sessions keep swapping place".
     #[test]
-    fn snapshot_sessions_sorted_by_last_event_descending() {
+    fn snapshot_sort_is_stable_within_active_bucket() {
         use chrono::Duration;
 
         let mut state = test_state();
@@ -609,15 +634,60 @@ mod tests {
         state.session("s2", None);
         state.session("s3", None);
 
-        // Manually assign distinct timestamps: s2 oldest, s3 middle, s1 newest.
         let now = Utc::now();
-        state.sessions.get_mut("s2").unwrap().last_event_time = now - Duration::seconds(20);
-        state.sessions.get_mut("s3").unwrap().last_event_time = now - Duration::seconds(10);
+        // All three are active. started_at: s1 oldest, s2 middle, s3 newest.
+        state.sessions.get_mut("s1").unwrap().started_at = now - Duration::seconds(300);
+        state.sessions.get_mut("s2").unwrap().started_at = now - Duration::seconds(200);
+        state.sessions.get_mut("s3").unwrap().started_at = now - Duration::seconds(100);
+        // last_event jitters: s1 most recent, s3 oldest. Old sort would
+        // have produced [s1, s2, s3]; new sort must ignore last_event
+        // within a bucket and use started_at desc.
         state.sessions.get_mut("s1").unwrap().last_event_time = now;
+        state.sessions.get_mut("s2").unwrap().last_event_time = now - Duration::seconds(5);
+        state.sessions.get_mut("s3").unwrap().last_event_time = now - Duration::seconds(10);
 
         let snap = state.snapshot();
         let ids: Vec<&str> = snap.sessions.iter().map(|s| s.session_id.as_str()).collect();
-        assert_eq!(ids, vec!["s1", "s3", "s2"], "should be sorted newest-first");
+        assert_eq!(ids, vec!["s3", "s2", "s1"], "newest-started first, stable");
+    }
+
+    /// Idle sessions sit below active sessions regardless of when they started.
+    #[test]
+    fn snapshot_sort_demotes_idle_sessions() {
+        use chrono::Duration;
+
+        let mut state = test_state();
+        state.session("active_old", None);
+        state.session("idle_new", None);
+
+        let now = Utc::now();
+        // idle_new started recently but hasn't seen events for an hour.
+        state.sessions.get_mut("idle_new").unwrap().started_at = now - Duration::seconds(60);
+        state.sessions.get_mut("idle_new").unwrap().last_event_time =
+            now - Duration::seconds(60 * 60);
+        // active_old started long ago but is still active.
+        state.sessions.get_mut("active_old").unwrap().started_at = now - Duration::seconds(3000);
+        state.sessions.get_mut("active_old").unwrap().last_event_time = now;
+
+        let snap = state.snapshot();
+        let ids: Vec<&str> = snap.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["active_old", "idle_new"],
+            "active sessions outrank idle ones",
+        );
+    }
+
+    /// activity_bucket is the only thing that can change a session's rank,
+    /// so it must be a clean step at exactly SESSION_ACTIVE_WINDOW_SECS.
+    #[test]
+    fn activity_bucket_step_at_threshold() {
+        use chrono::Duration;
+        let now = Utc::now();
+        let just_inside = now - Duration::seconds(SESSION_ACTIVE_WINDOW_SECS - 1);
+        let just_outside = now - Duration::seconds(SESSION_ACTIVE_WINDOW_SECS);
+        assert_eq!(activity_bucket(just_inside, now), 0);
+        assert_eq!(activity_bucket(just_outside, now), 1);
     }
 
     /// token_status should reflect "user" source when a user token is set.
