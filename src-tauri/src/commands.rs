@@ -19,11 +19,11 @@ pub async fn get_state(state: tauri::State<'_, SharedState>) -> Result<CoachSnap
 pub async fn set_session_mode(
     state: tauri::State<'_, SharedState>,
     app: tauri::AppHandle,
-    session_id: String,
+    pid: u32,
     mode: CoachMode,
 ) -> Result<(), String> {
     let mut s = state.write().await;
-    if let Some(session) = s.sessions.get_mut(&session_id) {
+    if let Some(session) = s.sessions.get_mut(&pid) {
         session.mode = mode;
     }
     emit_snapshot(&app, &s)?;

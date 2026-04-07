@@ -34,6 +34,10 @@ fn expected_hook_urls(port: u16) -> Vec<(&'static str, String)> {
         ("Stop", format!("{}/hook/stop", base)),
         ("PostToolUse", format!("{}/hook/post-tool-use", base)),
         ("UserPromptSubmit", format!("{}/hook/user-prompt-submit", base)),
+        // SessionStart fires immediately on /clear, /resume, /compact, and
+        // launch — Coach uses it to detect new conversations within a
+        // window without waiting for the next tool call.
+        ("SessionStart", format!("{}/hook/session-start", base)),
     ]
 }
 
@@ -96,6 +100,41 @@ pub fn check_hook_status_at(port: u16, path: &std::path::Path) -> HookStatus {
 /// Merge coach hooks into ~/.claude/settings.json, preserving existing hooks.
 pub fn install_hooks(port: u16) -> Result<(), String> {
     install_hooks_at(port, &claude_settings_path())
+}
+
+/// Top up Coach's managed hooks if at least one is already installed —
+/// i.e. the user has previously opted in, and Coach has since gained a
+/// new managed hook (like SessionStart) that needs to be added.
+///
+/// Returns the names of any hooks that were newly added so the caller
+/// can log them.
+///
+/// **Does nothing** if no Coach hooks are installed yet — first-time
+/// install stays explicit, gated on the user clicking "Install Hooks".
+pub fn topup_managed_hooks(port: u16) -> Result<Vec<String>, String> {
+    topup_managed_hooks_at(port, &claude_settings_path())
+}
+
+pub fn topup_managed_hooks_at(
+    port: u16,
+    path: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let status = check_hook_status_at(port, path);
+    let any_installed = status.hooks.iter().any(|h| h.installed);
+    if !any_installed {
+        return Ok(vec![]);
+    }
+    let missing: Vec<String> = status
+        .hooks
+        .iter()
+        .filter(|h| !h.installed)
+        .map(|h| h.event.clone())
+        .collect();
+    if missing.is_empty() {
+        return Ok(vec![]);
+    }
+    install_hooks_at(port, path)?;
+    Ok(missing)
 }
 
 pub fn install_hooks_at(port: u16, path: &std::path::Path) -> Result<(), String> {
@@ -479,7 +518,7 @@ mod tests {
         let status = check_hook_status_at(7700, std::path::Path::new("/nonexistent/path.json"));
         assert!(!status.installed);
         assert!(status.hooks.iter().all(|h| !h.installed));
-        assert_eq!(status.hooks.len(), 4); // PermissionRequest, Stop, PostToolUse, UserPromptSubmit
+        assert_eq!(status.hooks.len(), 5); // PermissionRequest, Stop, PostToolUse, UserPromptSubmit, SessionStart
     }
 
     /// After install_hooks_at writes hooks to a temp file, check_hook_status_at
@@ -510,7 +549,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
         // Each event should have exactly one entry.
-        for event in ["PermissionRequest", "Stop", "PostToolUse", "UserPromptSubmit"] {
+        for event in ["PermissionRequest", "Stop", "PostToolUse", "UserPromptSubmit", "SessionStart"] {
             let arr = content["hooks"][event].as_array().unwrap();
             assert_eq!(arr.len(), 1, "event {event} should have exactly 1 entry after double install");
         }
@@ -602,5 +641,104 @@ mod tests {
 
         let hooks = content["hooks"].as_object().unwrap();
         assert!(hooks.is_empty(), "all coach-only events should be cleaned up");
+    }
+
+    // ── topup_managed_hooks ─────────────────────────────────────────────
+
+    /// On a clean settings file with no Coach hooks, top-up does nothing —
+    /// first install must be explicit.
+    #[test]
+    fn topup_does_nothing_when_no_hooks_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        let added = topup_managed_hooks_at(7700, &path).unwrap();
+        assert!(added.is_empty());
+
+        let status = check_hook_status_at(7700, &path);
+        assert!(!status.installed);
+        assert!(status.hooks.iter().all(|h| !h.installed));
+    }
+
+    /// When Coach hooks are partially installed (e.g. user upgraded and
+    /// Coach gained a new managed hook), top-up adds only the missing
+    /// ones and reports them.
+    #[test]
+    fn topup_fills_in_missing_hooks_when_some_already_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Pre-install one Coach hook (simulating an older Coach version
+        // that only managed PostToolUse).
+        let partial = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "hooks": [{"type": "http", "url": "http://localhost:7700/hook/post-tool-use"}]
+                }]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&partial).unwrap()).unwrap();
+
+        let added = topup_managed_hooks_at(7700, &path).unwrap();
+
+        // The other four managed hooks should be reported as added.
+        let mut sorted = added.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "PermissionRequest".to_string(),
+                "SessionStart".to_string(),
+                "Stop".to_string(),
+                "UserPromptSubmit".to_string(),
+            ]
+        );
+
+        let status = check_hook_status_at(7700, &path);
+        assert!(status.installed, "all five hooks should now be installed");
+    }
+
+    /// Idempotent: running top-up again right after returns no additions.
+    #[test]
+    fn topup_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        install_hooks_at(7700, &path).unwrap();
+        let added = topup_managed_hooks_at(7700, &path).unwrap();
+        assert!(added.is_empty(), "fully-installed state requires no top-up");
+    }
+
+    /// User's pre-existing non-Coach hooks must survive a top-up.
+    #[test]
+    fn topup_preserves_non_coach_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Pre-install one Coach hook + one user command hook.
+        let mixed = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "echo user-hook"}]},
+                    {"hooks": [{"type": "http", "url": "http://localhost:7700/hook/stop"}]}
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&mixed).unwrap()).unwrap();
+
+        topup_managed_hooks_at(7700, &path).unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let stop_entries = content["hooks"]["Stop"].as_array().unwrap();
+        // Both the user's command hook and Coach's http hook should still be present.
+        assert_eq!(stop_entries.len(), 2);
+        let kinds: Vec<&str> = stop_entries
+            .iter()
+            .map(|e| e["hooks"][0]["type"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"command"));
+        assert!(kinds.contains(&"http"));
     }
 }

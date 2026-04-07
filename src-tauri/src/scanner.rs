@@ -6,11 +6,16 @@ use std::time::Duration;
 
 use crate::state::{SharedState, EVENT_STATE_UPDATED};
 
+/// Minimal view of `~/.claude/sessions/<pid>.json`.
+///
+/// We **only** trust `pid` and `cwd` from this file. The `session_id`
+/// stored inside is whatever conversation Claude Code launched with —
+/// always stale once the user has run `/clear`. The current conversation
+/// id arrives via hooks; see docs/SESSION_TRACKING.md.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeSessionFile {
     pub pid: u32,
-    pub session_id: String,
     pub cwd: Option<String>,
     pub started_at: i64, // Unix millis
 }
@@ -25,13 +30,42 @@ fn sessions_dir() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("sessions"))
 }
 
-/// Check if a process exists via POSIX kill(pid, 0).
-/// Signal 0 sends nothing but returns success if the process exists.
+/// Check if a process with the given PID is currently alive.
+///
+/// On Unix this uses `kill(pid, 0)` — signal 0 sends nothing but returns
+/// success if the process exists. On Windows it opens the process handle
+/// and checks `GetExitCodeProcess` for `STILL_ACTIVE`.
+#[cfg(unix)]
 pub fn is_pid_alive(pid: u32) -> bool {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetExitCodeProcess(handle: Handle, exit_code: *mut u32) -> i32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
 }
 
 pub fn scan_live_sessions() -> Vec<ClaudeSessionFile> {
@@ -76,31 +110,24 @@ pub async fn run_session_scanner(state: SharedState, app_handle: tauri::AppHandl
 
 pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHandle>) {
     let live = scan_live_sessions();
-    let live_ids: HashSet<String> = live.iter().map(|s| s.session_id.clone()).collect();
+    let live_pids: HashSet<u32> = live.iter().map(|s| s.pid).collect();
 
     let mut coach = state.write().await;
     let mut changed = false;
 
     for session in &live {
-        let is_new = !coach.sessions.contains_key(&session.session_id);
-        coach.register_discovered(
-            &session.session_id,
+        let created = coach.register_discovered_pid(
+            session.pid,
             session.cwd.as_deref(),
             session.started_at_utc(),
-            session.pid,
         );
-        if is_new {
-            coach.log(
-                &session.session_id,
-                "Scanner",
-                "session discovered",
-                session.cwd.clone(),
-            );
+        if created {
+            coach.log(session.pid, "Scanner", "process discovered", session.cwd.clone());
             changed = true;
         }
     }
 
-    let dead = coach.remove_dead_sessions(&live_ids);
+    let dead = coach.remove_dead_pids(&live_pids);
     if !dead.is_empty() {
         changed = true;
     }
@@ -119,10 +146,12 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn write_session_file(dir: &Path, pid: u32, session_id: &str, cwd: &str) {
+    fn write_session_file(dir: &Path, pid: u32, cwd: &str) {
+        // sessionId is included for realism but the scanner ignores it
+        // (see docs/SESSION_TRACKING.md).
         let content = serde_json::json!({
             "pid": pid,
-            "sessionId": session_id,
+            "sessionId": format!("ignored-{pid}"),
             "cwd": cwd,
             "startedAt": 1775383533697_i64,
             "kind": "interactive",
@@ -140,7 +169,6 @@ mod tests {
         let json = r#"{"pid":27014,"sessionId":"abc-123","cwd":"/tmp","startedAt":1775383533697,"kind":"interactive","entrypoint":"cli"}"#;
         let session: ClaudeSessionFile = serde_json::from_str(json).unwrap();
         assert_eq!(session.pid, 27014);
-        assert_eq!(session.session_id, "abc-123");
         assert_eq!(session.cwd, Some("/tmp".into()));
     }
 
@@ -149,7 +177,6 @@ mod tests {
     fn started_at_utc_roundtrips() {
         let session = ClaudeSessionFile {
             pid: 1,
-            session_id: "test".into(),
             cwd: None,
             started_at: 1775383533697,
         };
@@ -166,11 +193,11 @@ mod tests {
     fn scan_finds_sessions_with_live_pid() {
         let dir = TempDir::new().unwrap();
         let my_pid = std::process::id();
-        write_session_file(dir.path(), my_pid, "live-session", "/tmp/project");
+        write_session_file(dir.path(), my_pid, "/tmp/project");
 
         let sessions = scan_live_sessions_in(dir.path());
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "live-session");
+        assert_eq!(sessions[0].pid, my_pid);
     }
 
     /// Session files with a dead PID should be skipped.
@@ -178,7 +205,7 @@ mod tests {
     fn scan_skips_dead_pid() {
         let dir = TempDir::new().unwrap();
         // PID 99999 is almost certainly dead
-        write_session_file(dir.path(), 99999, "dead-session", "/tmp/gone");
+        write_session_file(dir.path(), 99999, "/tmp/gone");
 
         if !is_pid_alive(99999) {
             let sessions = scan_live_sessions_in(dir.path());

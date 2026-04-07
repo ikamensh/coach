@@ -4,23 +4,39 @@
 /// endpoints — this covers the contract between Claude Code and Coach without
 /// requiring Claude Code to be installed.
 ///
+/// PID resolution is normally handled by `lsof` against the request's TCP
+/// peer port. Tests run client and server in the same process, so we inject
+/// a fake resolver (`fake_resolver_from_sid`) that hashes the session_id to
+/// a deterministic non-zero u32. Tests can compute the same fake PID via
+/// `coach_lib::server::fake_pid_for_sid` to look up state.
+///
 /// The `test_with_real_claude_code` test (ignored by default) launches the
-/// actual `claude` CLI against a temporary project and checks that its session
-/// appears in Coach state.  Run it with:
+/// actual `claude` CLI against a temporary project and checks that its
+/// session appears in Coach state. Run it with:
 ///     cargo test -p coach -- --ignored
+use coach_lib::server::fake_pid_for_sid;
 use coach_lib::settings::Settings;
 use coach_lib::state::CoachState;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Start the hook server on an OS-assigned port and return its base URL.
 async fn start_test_server() -> (String, Arc<RwLock<CoachState>>) {
     let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
-    let router = coach_lib::server::create_router_headless(state.clone());
+    let router = coach_lib::server::create_router_headless(
+        state.clone(),
+        coach_lib::server::fake_resolver_from_sid(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     (format!("http://127.0.0.1:{}", port), state)
 }
@@ -67,6 +83,7 @@ async fn post_tool_use_creates_session() {
     let sessions = snap["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["session_id"], "sess-1");
+    assert_eq!(sessions[0]["pid"], fake_pid_for_sid("sess-1"));
     assert_eq!(sessions[0]["cwd"], "/tmp/my-project");
     assert_eq!(sessions[0]["event_count"], 1);
 }
@@ -147,7 +164,8 @@ async fn permission_request_auto_approves_in_away_mode() {
     {
         let mut s = state.write().await;
         s.default_mode = coach_lib::state::CoachMode::Away;
-        if let Some(sess) = s.sessions.get_mut("away-sess") {
+        let pid = fake_pid_for_sid("away-sess");
+        if let Some(sess) = s.sessions.get_mut(&pid) {
             sess.mode = coach_lib::state::CoachMode::Away;
         }
     }
@@ -190,7 +208,8 @@ async fn stop_blocks_then_allows_on_cooldown() {
 
     {
         let mut s = state.write().await;
-        if let Some(sess) = s.sessions.get_mut("stop-sess") {
+        let pid = fake_pid_for_sid("stop-sess");
+        if let Some(sess) = s.sessions.get_mut(&pid) {
             sess.mode = coach_lib::state::CoachMode::Away;
         }
     }
@@ -234,53 +253,125 @@ async fn stop_blocks_then_allows_on_cooldown() {
     assert!(resp.as_object().unwrap().is_empty(), "cooldown passthrough should be {{}}");
 }
 
-// ── Scanner discovers live sessions from ~/.claude/sessions/ ──────────
+// ── /clear handling: same window, new conversation ────────────────────
 
-/// The scanner should pick up real Claude Code sessions running on this
-/// machine.  We verify this by reading the session files ourselves and
-/// checking that sync_sessions registers them in CoachState.
+/// The big regression test: a /clear in a Claude Code window must NOT
+/// produce a duplicate row. Same fake PID, new session_id → existing
+/// session is replaced (counters reset, conversation id swapped) instead
+/// of a second session being created.
+#[tokio::test]
+async fn clear_replaces_session_in_same_window() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Two PostToolUse events for the original conversation.
+    for tool in ["Read", "Bash"] {
+        client
+            .post(format!("{base}/hook/post-tool-use"))
+            .json(&serde_json::json!({
+                "session_id": "before-clear",
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool,
+                "cwd": "/projects/coach"
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // SessionStart fires immediately after /clear with the new conv id.
+    // Critical: in real Claude Code the source TCP port stays inside the
+    // same Claude Code process, so the resolver returns the same PID.
+    // Our fake resolver hashes session_id, so we need to spoof: instead
+    // of a new session_id giving a new fake PID (which would fail to
+    // simulate /clear), we directly inject the cache entry.
+    {
+        let mut s = state.write().await;
+        let pid = fake_pid_for_sid("before-clear");
+        s.session_id_to_pid.insert("after-clear".to_string(), pid);
+    }
+
+    client
+        .post(format!("{base}/hook/session-start"))
+        .json(&serde_json::json!({
+            "session_id": "after-clear",
+            "hook_event_name": "SessionStart",
+            "source": "clear",
+            "cwd": "/projects/coach"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Session list still has exactly ONE entry, but it's now the new
+    // conversation with reset counters.
+    let snap: serde_json::Value = client
+        .get(format!("{base}/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sessions = snap["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "no duplicate row after /clear");
+    assert_eq!(sessions[0]["session_id"], "after-clear");
+    // SessionStart counts as one event in the new conversation.
+    assert_eq!(sessions[0]["event_count"], 1);
+    let tool_counts = sessions[0]["tool_counts"].as_object().unwrap();
+    assert!(tool_counts.is_empty(), "tool counts reset on /clear");
+    // PID is still the same window.
+    assert_eq!(sessions[0]["pid"], fake_pid_for_sid("before-clear"));
+}
+
+// ── Scanner / hook integration ────────────────────────────────────────
+
+/// The scanner should populate one entry per live PID found in
+/// ~/.claude/sessions/. The launch-time sessionId in the file is
+/// ignored — sessions start with empty current_session_id until a hook
+/// fills it in.
 #[tokio::test]
 async fn scanner_discovers_real_sessions() {
     let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
 
-    // Run a sync (reads real ~/.claude/sessions/).
     coach_lib::scanner::sync_sessions(&state, None).await;
 
     let coach = state.read().await;
     let live_files = coach_lib::scanner::scan_live_sessions();
 
-    // Every live session file should have a matching entry in state.
     for file in &live_files {
-        let sess = coach.sessions.get(&file.session_id);
-        assert!(
-            sess.is_some(),
-            "session {} from file should be in state",
-            file.session_id
-        );
-        let sess = sess.unwrap();
-        assert_eq!(sess.pid, Some(file.pid));
+        let sess = coach
+            .sessions
+            .get(&file.pid)
+            .unwrap_or_else(|| panic!("PID {} from session file should be in state", file.pid));
+        assert_eq!(sess.pid, file.pid);
         assert_eq!(sess.event_count, 0, "discovered sessions start with 0 events");
     }
 }
 
-/// A hook event arriving for a scanner-discovered session should merge
-/// cleanly: increment event_count while preserving the PID.
+/// A hook event arriving for a scanner-discovered PID should adopt the
+/// conversation id without resetting started_at — the scanner already
+/// populated it from the file.
 #[tokio::test]
-async fn hook_merges_with_scanner_discovered_session() {
-    let (_base, state) = start_test_server().await;
+async fn hook_adopts_scanner_discovered_pid() {
+    let (base, state) = start_test_server().await;
 
-    // Simulate scanner discovering a session.
+    // Simulate scanner discovering a process. Use the hash for the
+    // hook session_id we're about to send so the resolver lines up.
+    let sid = "adopt-me";
+    let scanner_pid = fake_pid_for_sid(sid);
+    let scanner_started = chrono::Utc::now() - chrono::Duration::hours(1);
     {
         let mut coach = state.write().await;
-        coach.register_discovered("scan-merge", Some("/tmp/project"), chrono::Utc::now(), 42);
+        coach.register_discovered_pid(scanner_pid, Some("/tmp/project"), scanner_started);
     }
 
-    // Now a hook event arrives for the same session.
+    // Hook event arrives.
     let client = reqwest::Client::new();
     client
-        .post(format!("{_base}/hook/post-tool-use"))
+        .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
-            "session_id": "scan-merge",
+            "session_id": sid,
             "hook_event_name": "PostToolUse",
             "tool_name": "Read",
             "cwd": "/tmp/project"
@@ -290,9 +381,13 @@ async fn hook_merges_with_scanner_discovered_session() {
         .unwrap();
 
     let coach = state.read().await;
-    let sess = coach.sessions.get("scan-merge").unwrap();
-    assert_eq!(sess.event_count, 1, "hook should increment from 0 to 1");
-    assert_eq!(sess.pid, Some(42), "PID should be preserved after hook update");
+    let sess = coach.sessions.get(&scanner_pid).unwrap();
+    assert_eq!(sess.current_session_id, sid);
+    assert_eq!(sess.event_count, 1);
+    assert_eq!(
+        sess.started_at, scanner_started,
+        "scanner started_at must survive the first hook"
+    );
 }
 
 // ── Outdated models rule ────────────────────────────────────────────────
@@ -302,7 +397,6 @@ async fn post_tool_use_triggers_outdated_models_rule() {
     let (base, _state) = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Write tool with outdated model in content → should get additionalContext.
     let resp: serde_json::Value = client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
@@ -334,7 +428,6 @@ async fn post_tool_use_passes_through_current_models() {
     let (base, _state) = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Write tool with current model → no intervention.
     let resp: serde_json::Value = client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
@@ -375,14 +468,12 @@ async fn post_tool_use_passes_through_current_models() {
 fn validate_hook_response(resp: &serde_json::Value, hook_event: &str) {
     let obj = resp.as_object().unwrap_or_else(|| panic!("{hook_event}: response must be object"));
 
-    // Empty object = passthrough, always valid.
     if obj.is_empty() {
         return;
     }
 
     match hook_event {
         "Stop" => {
-            // Stop hooks use top-level fields, never hookSpecificOutput.
             assert!(
                 resp.get("hookSpecificOutput").is_none(),
                 "Stop: must NOT use hookSpecificOutput"
@@ -399,7 +490,6 @@ fn validate_hook_response(resp: &serde_json::Value, hook_event: &str) {
             }
         }
         "PermissionRequest" | "PostToolUse" => {
-            // These use hookSpecificOutput.
             for key in obj.keys() {
                 assert!(
                     key == "hookSpecificOutput",
@@ -422,7 +512,6 @@ fn validate_hook_response(resp: &serde_json::Value, hook_event: &str) {
                 );
             }
 
-            // PermissionRequest decision must be { behavior: "allow"|"deny" }.
             if hook_event == "PermissionRequest" {
                 if let Some(decision) = hso.get("decision") {
                     assert!(decision.is_object(), "PermissionRequest: decision must be an object");
@@ -441,7 +530,6 @@ fn validate_hook_response(resp: &serde_json::Value, hook_event: &str) {
 
 #[tokio::test]
 async fn all_hook_responses_conform_to_claude_code_schema() {
-    // Exercises every hook endpoint in every mode and validates the response schema.
     let (base, state) = start_test_server().await;
     let client = reqwest::Client::new();
 
@@ -480,7 +568,8 @@ async fn all_hook_responses_conform_to_claude_code_schema() {
     {
         let mut s = state.write().await;
         s.default_mode = coach_lib::state::CoachMode::Away;
-        if let Some(sess) = s.sessions.get_mut("schema-present") {
+        let pid = fake_pid_for_sid("schema-present");
+        if let Some(sess) = s.sessions.get_mut(&pid) {
             sess.mode = coach_lib::state::CoachMode::Away;
         }
     }
@@ -536,11 +625,9 @@ async fn all_hook_responses_conform_to_claude_code_schema() {
 
 #[tokio::test]
 async fn post_tool_use_rule_response_schema() {
-    // When a rule fires, the PostToolUse response must still conform to schema.
     let (base, _state) = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Write tool input that triggers the outdated_models rule.
     let resp: serde_json::Value = client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
@@ -559,7 +646,6 @@ async fn post_tool_use_rule_response_schema() {
         .unwrap();
 
     validate_hook_response(&resp, "PostToolUse");
-    // Rule should have fired — verify additionalContext is present.
     assert!(
         resp["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -570,14 +656,11 @@ async fn post_tool_use_rule_response_schema() {
 
 // ── LLM mode fallback + observer wiring ────────────────────────────────
 //
-// These tests cover the new code paths (chained evaluator, fire-and-forget
+// These tests cover the LLM code paths (chained evaluator, fire-and-forget
 // observer) without needing a real LLM key. `chain_openai` fails fast at the
 // "no token for primary provider" check before making any HTTP call, so the
 // failure paths run in milliseconds.
 
-/// Helper: switch a CoachState into LLM engine mode with the OpenAI provider
-/// but without any API token. This is the "user enabled the observer but
-/// hasn't put a key in" scenario — every LLM call will fail at snapshot_config.
 async fn put_in_llm_mode_no_key(state: &Arc<RwLock<CoachState>>) {
     let mut s = state.write().await;
     s.coach_mode = coach_lib::settings::EngineMode::Llm;
@@ -586,20 +669,14 @@ async fn put_in_llm_mode_no_key(state: &Arc<RwLock<CoachState>>) {
         model: "gpt-5.4-mini".into(),
     };
     s.api_tokens.clear();
-    // Also wipe any env-resolved token so the test is hermetic regardless
-    // of the developer's shell environment.
     s.env_tokens.clear();
 }
 
-/// In LLM mode + Away, when the LLM call fails (no key) the Stop hook must
-/// still return a valid block response — falling back to the fixed
-/// away_message instead of bubbling the LLM error to Claude Code.
 #[tokio::test]
 async fn stop_in_llm_mode_falls_back_to_fixed_when_no_key() {
     let (base, state) = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Create the session via PostToolUse first.
     client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
@@ -614,7 +691,8 @@ async fn stop_in_llm_mode_falls_back_to_fixed_when_no_key() {
     put_in_llm_mode_no_key(&state).await;
     {
         let mut s = state.write().await;
-        if let Some(sess) = s.sessions.get_mut("llm-fallback") {
+        let pid = fake_pid_for_sid("llm-fallback");
+        if let Some(sess) = s.sessions.get_mut(&pid) {
             sess.mode = coach_lib::state::CoachMode::Away;
         }
     }
@@ -632,7 +710,6 @@ async fn stop_in_llm_mode_falls_back_to_fixed_when_no_key() {
         .await
         .unwrap();
 
-    // Schema must still be valid (the whole point of the fallback).
     validate_hook_response(&resp, "Stop");
     assert_eq!(resp["decision"], "block");
     let reason = resp["reason"].as_str().unwrap();
@@ -642,10 +719,6 @@ async fn stop_in_llm_mode_falls_back_to_fixed_when_no_key() {
     );
 }
 
-/// In LLM mode + observer-capable provider, every PostToolUse should spawn
-/// the observer task. With no API key, the task fails fast and records an
-/// "Observer/error" entry in the session activity. This proves the wiring
-/// without needing a working LLM.
 #[tokio::test]
 async fn observer_fires_in_llm_mode_and_records_failure() {
     let (base, state) = start_test_server().await;
@@ -666,14 +739,12 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
         .unwrap();
     assert_eq!(resp.status(), 200, "hook must respond immediately");
 
-    // Observer is fire-and-forget. Wait briefly for the spawned task to
-    // run, fail at no-token, and record the error.
+    let pid = fake_pid_for_sid("obs-fires");
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         let s = state.read().await;
-        if let Some(sess) = s.sessions.get("obs-fires") {
+        if let Some(sess) = s.sessions.get(&pid) {
             if sess.activity.iter().any(|a| a.hook_event == "Observer") {
-                // Found it.
                 let observer_entry = sess
                     .activity
                     .iter()
@@ -690,15 +761,11 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
     panic!("observer task never recorded an Observer entry within 500ms");
 }
 
-/// In Rules mode, PostToolUse must NOT spawn an observer task — the LLM is
-/// supposed to be off. Verify the session has zero Observer entries even
-/// after waiting (regression test for "always firing the observer").
 #[tokio::test]
 async fn observer_does_not_fire_in_rules_mode() {
     let (base, state) = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Default is Rules mode. Don't change it.
     client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
@@ -711,11 +778,11 @@ async fn observer_does_not_fire_in_rules_mode() {
         .await
         .unwrap();
 
-    // Even with a generous wait, no observer entry should appear.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let s = state.read().await;
-    let sess = s.sessions.get("rules-only").expect("session should exist");
+    let pid = fake_pid_for_sid("rules-only");
+    let sess = s.sessions.get(&pid).expect("session should exist");
     let observer_entries: Vec<_> = sess
         .activity
         .iter()
@@ -728,10 +795,6 @@ async fn observer_does_not_fire_in_rules_mode() {
     );
 }
 
-/// In LLM mode with a provider that ISN'T observer-capable (e.g. google),
-/// PostToolUse must skip the observer task entirely — there's no chained
-/// path for non-OpenAI providers in rig 0.34. Same regression check as
-/// above but exercising the OBSERVER_CAPABLE_PROVIDERS gate.
 #[tokio::test]
 async fn observer_does_not_fire_for_non_capable_provider() {
     let (base, state) = start_test_server().await;
@@ -763,7 +826,8 @@ async fn observer_does_not_fire_for_non_capable_provider() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let s = state.read().await;
-    let sess = s.sessions.get("google-llm").expect("session should exist");
+    let pid = fake_pid_for_sid("google-llm");
+    let sess = s.sessions.get(&pid).expect("session should exist");
     assert!(
         sess.activity.iter().all(|a| a.hook_event != "Observer"),
         "non-capable provider must not spawn observer"
@@ -775,7 +839,6 @@ async fn observer_does_not_fire_for_non_capable_provider() {
 #[tokio::test]
 #[ignore] // Requires `claude` CLI — run with: cargo test -p coach -- --ignored
 async fn test_with_real_claude_code() {
-    // Verify claude is installed.
     let which = tokio::process::Command::new("which")
         .arg("claude")
         .output()
@@ -789,7 +852,6 @@ async fn test_with_real_claude_code() {
     let (base, _state) = start_test_server().await;
     let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
 
-    // Create a temp project with hooks pointing to our test server.
     let tmp = tempfile::tempdir().unwrap();
     let claude_dir = tmp.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
@@ -807,7 +869,6 @@ async fn test_with_real_claude_code() {
     )
     .unwrap();
 
-    // Claude Code needs a git repo to find project root.
     tokio::process::Command::new("git")
         .args(["init"])
         .current_dir(tmp.path())
@@ -815,7 +876,6 @@ async fn test_with_real_claude_code() {
         .await
         .unwrap();
 
-    // Run claude in print mode — minimal API usage.
     let output = tokio::process::Command::new("claude")
         .args(["-p", "respond with just the word hello", "--output-format", "text"])
         .current_dir(tmp.path())
@@ -831,7 +891,6 @@ async fn test_with_real_claude_code() {
         output.status
     );
 
-    // Check that at least one session was tracked.
     let client = reqwest::Client::new();
     let snap: serde_json::Value = client
         .get(format!("{base}/state"))
@@ -874,7 +933,6 @@ async fn user_prompt_submit_records_activity() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // Response is a passthrough — no decision body.
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(
         body.get("hookSpecificOutput").is_none()
@@ -882,7 +940,6 @@ async fn user_prompt_submit_records_activity() {
         "user prompt submit should pass through, got: {body}",
     );
 
-    // The activity entry should be on the session snapshot.
     let snap: serde_json::Value = client
         .get(format!("{base}/state"))
         .send()
@@ -904,8 +961,6 @@ async fn user_prompt_submit_records_activity() {
     assert_eq!(activity[0]["detail"], "make the sessions stop jumping around");
 }
 
-/// Long prompts must be truncated so a paste-bomb doesn't bloat the
-/// activity queue. The truncation marker is "…".
 #[tokio::test]
 async fn user_prompt_submit_truncates_long_prompts() {
     let (base, _state) = start_test_server().await;

@@ -20,6 +20,9 @@ interface ActivityEntry {
 }
 
 interface SessionSnapshot {
+  /// OS PID — stable across /clear, the canonical identity for a window.
+  pid: number;
+  /// Current conversation id — changes on /clear.
   session_id: string;
   mode: CoachMode;
   cwd: string | null;
@@ -83,12 +86,12 @@ interface CoachState {
   initialized: boolean;
   initError: string | null;
   view: "main" | "settings" | "hooks" | "session" | "dev";
-  selectedSessionId: string | null;
+  selectedPid: number | null;
 }
 
 interface CoachActions {
   init: () => Promise<void>;
-  setSessionMode: (sessionId: string, mode: CoachMode) => Promise<void>;
+  setSessionMode: (pid: number, mode: CoachMode) => Promise<void>;
   setAllMode: (mode: CoachMode) => Promise<void>;
   setPriorities: (priorities: string[]) => Promise<void>;
   addPriority: (priority: string) => Promise<void>;
@@ -98,7 +101,7 @@ interface CoachActions {
   setApiToken: (provider: string, token: string) => Promise<void>;
   setModel: (model: ModelConfig) => Promise<void>;
   setView: (view: "main" | "settings" | "hooks" | "session" | "dev") => void;
-  selectSession: (id: string | null) => void;
+  selectSession: (pid: number | null) => void;
   setEngineMode: (mode: EngineMode) => Promise<void>;
   setRules: (rules: CoachRule[]) => Promise<void>;
   toggleRule: (id: string) => Promise<void>;
@@ -140,7 +143,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   initialized: false,
   initError: null,
   view: "main",
-  selectedSessionId: null,
+  selectedPid: null,
 
   init: async () => {
     if (get().initialized) return;
@@ -191,11 +194,11 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
       });
   },
 
-  setSessionMode: async (sessionId, mode) => {
-    await invoke("set_session_mode", { sessionId, mode });
+  setSessionMode: async (pid, mode) => {
+    await invoke("set_session_mode", { pid, mode });
     set((s) => ({
       sessions: s.sessions.map((sess) =>
-        sess.session_id === sessionId ? { ...sess, mode } : sess,
+        sess.pid === pid ? { ...sess, mode } : sess,
       ),
     }));
   },
@@ -256,7 +259,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
 
   setView: (view) => set({ view }),
 
-  selectSession: (id) => set({ selectedSessionId: id, view: id ? "session" : "main" }),
+  selectSession: (pid) => set({ selectedPid: pid, view: pid !== null ? "session" : "main" }),
 
   setEngineMode: async (coachMode) => {
     await invoke("set_coach_mode", { coachMode });

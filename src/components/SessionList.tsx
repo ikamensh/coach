@@ -101,8 +101,8 @@ export function SessionList() {
         <ul className="space-y-1">
           {sessions.map((session) => (
             <li
-              key={session.session_id}
-              onClick={() => selectSession(session.session_id)}
+              key={session.pid}
+              onClick={() => selectSession(session.pid)}
               className="flex items-start gap-3 bg-zinc-100 dark:bg-zinc-800/50 rounded-lg px-3 py-2 cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors"
             >
               <OwlIcon
@@ -119,7 +119,7 @@ export function SessionList() {
                     onClick={(e) => {
                       e.stopPropagation();
                       setSessionMode(
-                        session.session_id,
+                        session.pid,
                         session.mode === "present" ? "away" : "present",
                       );
                     }}

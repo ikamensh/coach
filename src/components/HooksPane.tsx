@@ -4,6 +4,8 @@ const HOOK_DESCRIPTIONS: Record<string, string> = {
   PermissionRequest: "Auto-approves tool use when you're away",
   Stop: "When away, tells Claude to keep working with your priorities",
   PostToolUse: "Tracks session activity (observation only)",
+  UserPromptSubmit: "Marks user turns on the activity timeline",
+  SessionStart: "Detects /clear, /resume, /compact instantly so the session row swaps to the new conversation without waiting for the next tool call",
 };
 
 export function HooksPane() {

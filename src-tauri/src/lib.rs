@@ -1,5 +1,6 @@
 mod commands;
 pub mod llm;
+pub mod pid_resolver;
 pub mod replay;
 pub mod rules;
 pub mod scanner;
@@ -38,6 +39,19 @@ pub fn run() {
             let port = settings.port;
             eprintln!("[coach] setup: port={port}, priorities={:?}", settings.priorities);
             let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(settings)));
+
+            // Top up Coach's managed hooks if the user has previously
+            // opted in. Adds anything we've added to the managed set
+            // since they last installed (e.g. SessionStart) without
+            // making them click "Install Hooks" again. No-op on
+            // unconfigured machines — first install stays explicit.
+            match settings::topup_managed_hooks(port) {
+                Ok(added) if !added.is_empty() => {
+                    eprintln!("[coach] setup: topped up managed hooks: {added:?}");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[coach] setup: hook top-up failed: {e}"),
+            }
 
             app.manage(state.clone());
 
