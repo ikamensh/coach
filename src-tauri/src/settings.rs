@@ -587,15 +587,19 @@ fn default_model() -> ModelConfig {
     }
 }
 
-/// Providers that support stateful coach sessions (response-id chaining
-/// or equivalent server-side conversation state). Two mechanisms:
-///   • OpenAI: server-side state via Responses API + previous_response_id.
+/// Providers that support stateful coach sessions via `session_send`.
+/// Three mechanisms, in decreasing cost efficiency:
+///   • OpenAI: server-side state via Responses API + previous_response_id
+///     (native, O(1) per call).
 ///   • Anthropic: client-side message history with prompt caching
-///     (~10% of full input cost on the cached prefix).
-/// Other providers (google, openrouter) can still serve the rules engine
+///     (emulated, ~10% of full input cost on the cached prefix).
+///   • Google Gemini: client-side message history, no usable prefix
+///     cache — full input charged every call (emulated, O(N) per call).
+///     Pair with a cheap Flash model to keep observer cost tolerable.
+/// Other providers (openrouter, …) can still serve the rules engine
 /// and one-shot stop evaluation; they just can't accumulate observer
-/// context cheaply.
-pub const OBSERVER_CAPABLE_PROVIDERS: &[&str] = &["openai", "anthropic"];
+/// context at all.
+pub const OBSERVER_CAPABLE_PROVIDERS: &[&str] = &["openai", "anthropic", "google"];
 
 fn default_priorities() -> Vec<String> {
     vec![
@@ -715,12 +719,19 @@ mod tests {
         assert!(OBSERVER_CAPABLE_PROVIDERS.contains(&"anthropic"));
     }
 
-    /// Google must NOT be observer-capable in 0.34 — rig has a TODO at
-    /// providers/gemini/completion.rs for cachedContent. Regression
-    /// test in case someone adds it without verifying upstream support.
+    /// Google is observer-capable via the emulated path: client-side
+    /// history, no prefix caching. Cost scales with conversation length,
+    /// so users should pair it with a cheap Flash model.
     #[test]
-    fn google_is_not_observer_capable_yet() {
-        assert!(!OBSERVER_CAPABLE_PROVIDERS.contains(&"google"));
+    fn google_is_observer_capable() {
+        assert!(OBSERVER_CAPABLE_PROVIDERS.contains(&"google"));
+    }
+
+    /// openrouter remains unsupported: it's a chat-completions proxy
+    /// with no session primitive and no caching primitive we can drive.
+    #[test]
+    fn openrouter_is_not_observer_capable() {
+        assert!(!OBSERVER_CAPABLE_PROVIDERS.contains(&"openrouter"));
     }
 
     /// Priorities should ship with sensible non-empty defaults so the

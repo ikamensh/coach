@@ -498,6 +498,91 @@ pub async fn chain_anthropic(
     Ok((text, new_history))
 }
 
+// ── Stateful chain via Google Gemini (pure history resend) ────────────
+
+/// Low-level call into Google's Gemini API. Gemini has no server-side
+/// conversation state (no `previous_response_id`) and rig 0.34 does not
+/// surface the `cachedContent` API in a way that fits a growing
+/// observer chain — so the only honest option is to resend the full
+/// history each call and pay full input rate on every turn.
+///
+/// This is the same pattern Google's own Python SDK uses for
+/// `genai.ChatSession.send_message`: it's a client-side convenience
+/// that feels like a session but ships the accumulated history every
+/// turn under the hood. We do the same in `session_send`'s google arm.
+///
+/// Caller maintains the history Vec (threaded through `CoachChain::Google`).
+/// On return, the vec grows by two messages: the user turn and the
+/// assistant reply.
+pub async fn chain_gemini(
+    state: &SharedState,
+    system: Option<&str>,
+    history: &[crate::state::CoachMessage],
+    new_message: &str,
+    max_output_tokens: Option<u32>,
+) -> Result<(String, Vec<crate::state::CoachMessage>), String> {
+    use rig::client::CompletionClient;
+    use rig::completion::{AssistantContent, Completion};
+    use rig::message::Message as RigMessage;
+
+    let cfg = snapshot_config(state).await?;
+    if cfg.primary.provider != "google" {
+        return Err(format!(
+            "chain_gemini requires the Google provider; current: {}",
+            cfg.primary.provider
+        ));
+    }
+
+    let client = gemini::Client::new(&cfg.primary_token).map_err(|e| fmt_err("google", e))?;
+    let mut builder = client.agent(&cfg.primary.model);
+    if let Some(s) = system {
+        builder = builder.preamble(s);
+    }
+    let agent = builder.build();
+
+    let rig_history: Vec<RigMessage> = history
+        .iter()
+        .map(|m| match m.role {
+            crate::state::CoachRole::User => RigMessage::user(&m.content),
+            crate::state::CoachRole::Assistant => RigMessage::assistant(&m.content),
+        })
+        .collect();
+
+    // Gemini accepts max_tokens via the standard CompletionRequestBuilder,
+    // same shape as the Anthropic call. Default to 200 when unset.
+    let max = max_output_tokens.unwrap_or(200) as u64;
+    let resp = agent
+        .completion(new_message, rig_history)
+        .await
+        .map_err(|e| fmt_err("google", e))?
+        .max_tokens(max)
+        .send()
+        .await
+        .map_err(|e| fmt_err("google", e))?;
+
+    let text = resp
+        .choice
+        .iter()
+        .filter_map(|c| match c {
+            AssistantContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    let mut new_history = history.to_vec();
+    new_history.push(crate::state::CoachMessage {
+        role: crate::state::CoachRole::User,
+        content: new_message.to_string(),
+    });
+    new_history.push(crate::state::CoachMessage {
+        role: crate::state::CoachRole::Assistant,
+        content: text.clone(),
+    });
+
+    Ok((text, new_history))
+}
+
 // ── Observer + chained stop ────────────────────────────────────────────
 
 /// System message established on the first call in a coach session.
@@ -557,6 +642,7 @@ async fn read_provider(state: &SharedState) -> String {
 /// |----------|------|-----------|
 /// | `openai` | **native** | Responses API `previous_response_id`, O(1) per call. |
 /// | `anthropic` | emulated | Client-side `Vec<CoachMessage>` + `with_automatic_caching()`. Cached prefix ~10% of full input rate. |
+/// | `google` | emulated | Client-side `Vec<CoachMessage>`, full history resent every call. No prefix caching that fits a growing chain — use cheap Flash models to keep cost tolerable. |
 /// | others | unsupported | Returns `Err`. |
 ///
 /// Emulated providers emit a once-per-process stderr warning on first
@@ -608,6 +694,22 @@ pub async fn session_send(
             )
             .await?;
             Ok((text, CoachChain::Anthropic { history: new_history }))
+        }
+        "google" => {
+            warn_emulation_once("google", "client-side history, no prefix caching");
+            let history = match chain {
+                CoachChain::Google { history } => history.clone(),
+                _ => Vec::new(),
+            };
+            let (text, new_history) = chain_gemini(
+                state,
+                Some(system_prompt),
+                &history,
+                message,
+                constraints.max_output_tokens,
+            )
+            .await?;
+            Ok((text, CoachChain::Google { history: new_history }))
         }
         other => Err(format!(
             "session_send: provider {other} has no session support (native or emulated)"
@@ -1283,5 +1385,171 @@ mod live_tests {
             assert!(decision.message.is_some(), "block decision should carry a message");
         }
         assert!(matches!(new_chain, crate::state::CoachChain::Anthropic { .. }));
+    }
+
+    // ── Gemini live tests ───────────────────────────────────────────────
+    //
+    // Same shape as Anthropic: client-side history, gated on
+    // GOOGLE_API_KEY + #[ignore]. The point of these tests is to catch
+    // request-shape regressions (wrong role mapping, missing max_tokens,
+    // etc.) and confirm continuity actually works when we resend the
+    // accumulated history.
+
+    fn live_state_google() -> Option<SharedState> {
+        let token = std::env::var("GOOGLE_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .filter(|v| !v.is_empty())?;
+        let state = CoachState {
+            sessions: HashMap::new(),
+            session_id_to_pid: HashMap::new(),
+            priorities: vec!["Test priority".into()],
+            port: 7700,
+            theme: Theme::System,
+            default_mode: CoachMode::Present,
+            model: ModelConfig {
+                provider: "google".into(),
+                // Cheap fast default — pick the current Flash model that
+                // rig 0.34 knows about. Override by editing locally if a
+                // newer Flash ships.
+                model: "gemini-2.5-flash".into(),
+            },
+            api_tokens: HashMap::from([("google".into(), token)]),
+            env_tokens: HashMap::new(),
+            http_client: reqwest::Client::new(),
+            coach_mode: EngineMode::Llm,
+            rules: vec![],
+        };
+        Some(Arc::new(RwLock::new(state)))
+    }
+
+    /// Smallest Gemini round-trip — exercises the request builder,
+    /// role conversion, and max_tokens plumbing.
+    #[tokio::test]
+    #[ignore]
+    async fn live_chain_gemini_basic() {
+        let Some(state) = live_state_google() else { return };
+        let (text, new_history) = chain_gemini(
+            &state,
+            Some("You are a test bot. Respond with one word."),
+            &[],
+            "Reply with the single word: hello",
+            Some(20),
+        )
+        .await
+        .expect("chain_gemini failed");
+        assert!(!text.is_empty(), "expected non-empty text");
+        assert_eq!(new_history.len(), 2, "history should grow by user+assistant");
+        assert_eq!(new_history[0].role, crate::state::CoachRole::User);
+        assert_eq!(new_history[1].role, crate::state::CoachRole::Assistant);
+    }
+
+    /// Gemini preserves context across turns the same way Anthropic does:
+    /// by us resending the growing history. Model should recall a token
+    /// planted on the previous turn.
+    #[tokio::test]
+    #[ignore]
+    async fn live_chain_gemini_continues_context_via_history() {
+        let Some(state) = live_state_google() else { return };
+        let system = "You are a test bot. Reply tersely.";
+
+        let (_t1, h1) = chain_gemini(
+            &state,
+            Some(system),
+            &[],
+            "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
+            Some(20),
+        )
+        .await
+        .expect("first call failed");
+
+        let (text, _h2) = chain_gemini(
+            &state,
+            Some(system),
+            &h1,
+            "What was the token I told you to remember? Reply with just the token.",
+            Some(30),
+        )
+        .await
+        .expect("second call failed");
+
+        assert!(
+            text.contains("PURPLE-OWL-42"),
+            "model didn't remember across turns; got: {text}"
+        );
+    }
+
+    /// observe_event chain accumulation for Gemini via session_send.
+    /// First call seeds the history; second call extends it. Same
+    /// invariants as the Anthropic version.
+    #[tokio::test]
+    #[ignore]
+    async fn live_observe_event_chain_gemini() {
+        let Some(state) = live_state_google() else { return };
+        let priorities = vec!["Code quality".into()];
+
+        let event1 = build_observer_event(
+            "Edit",
+            &serde_json::json!({
+                "file_path": "/tmp/x.py",
+                "new_string": "def add(a, b):\n    return a + b\n"
+            }),
+        );
+        let (_t1, chain1) =
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
+                .await
+                .expect("first observe_event failed");
+        let h1 = match &chain1 {
+            crate::state::CoachChain::Google { history } => history.clone(),
+            other => panic!("expected Google chain, got {other:?}"),
+        };
+        assert_eq!(h1.len(), 2, "first call should produce user+assistant pair");
+
+        let event2 = build_observer_event(
+            "Bash",
+            &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+        );
+        let (_t2, chain2) = observe_event(&state, &priorities, &chain1, &event2)
+            .await
+            .expect("second observe_event failed");
+        let h2 = match &chain2 {
+            crate::state::CoachChain::Google { history } => history.clone(),
+            other => panic!("expected Google chain, got {other:?}"),
+        };
+        assert_eq!(h2.len(), 4, "history should grow to 4 messages");
+    }
+
+    /// evaluate_stop_chained over Gemini must produce a parseable
+    /// StopDecision. Gemini doesn't honor `response_format: json_object`,
+    /// so we rely on prompt-level instructions + strip_code_fence.
+    #[tokio::test]
+    #[ignore]
+    async fn live_evaluate_stop_chained_gemini() {
+        let Some(state) = live_state_google() else { return };
+        let priorities = vec!["Finish the task".into()];
+
+        let event = build_observer_event(
+            "Edit",
+            &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+        );
+        let (_t, observed_chain) =
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
+                .await
+                .expect("observe failed");
+
+        let (decision, new_chain) = evaluate_stop_chained(
+            &state,
+            &priorities,
+            &observed_chain,
+            Some("end_turn"),
+        )
+        .await
+        .expect("evaluate_stop_chained failed");
+
+        let _ = decision.allow;
+        if !decision.allow {
+            assert!(decision.message.is_some(), "block decision should carry a message");
+        }
+        assert!(matches!(new_chain, crate::state::CoachChain::Google { .. }));
     }
 }

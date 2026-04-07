@@ -871,12 +871,15 @@ async fn observer_does_not_fire_for_non_capable_provider() {
     let (base, state) = start_test_server().await;
     let client = reqwest::Client::new();
 
+    // openrouter is the one provider still NOT in OBSERVER_CAPABLE_PROVIDERS
+    // — google joined the list once the emulated chain_gemini path landed,
+    // so we pick openrouter to keep this gate test meaningful.
     {
         let mut s = state.write().await;
         s.coach_mode = coach_lib::settings::EngineMode::Llm;
         s.model = coach_lib::settings::ModelConfig {
-            provider: "google".into(),
-            model: "gemini-2.5-flash".into(),
+            provider: "openrouter".into(),
+            model: "openrouter/auto".into(),
         };
         s.api_tokens.clear();
         s.env_tokens.clear();
@@ -885,7 +888,7 @@ async fn observer_does_not_fire_for_non_capable_provider() {
     client
         .post(format!("{base}/hook/post-tool-use"))
         .json(&serde_json::json!({
-            "session_id": "google-llm",
+            "session_id": "openrouter-llm",
             "hook_event_name": "PostToolUse",
             "tool_name": "Edit",
             "tool_input": {"file_path": "/x.py", "new_string": "ok"}
@@ -897,7 +900,7 @@ async fn observer_does_not_fire_for_non_capable_provider() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let s = state.read().await;
-    let pid = fake_pid_for_sid("google-llm");
+    let pid = fake_pid_for_sid("openrouter-llm");
     let sess = s.sessions.get(&pid).expect("session should exist");
     assert!(
         sess.activity.iter().all(|a| a.hook_event != "Observer"),

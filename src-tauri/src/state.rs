@@ -24,7 +24,10 @@ pub enum CoachMode {
 //     store the latest id and pass it as previous_response_id next call.
 //   • Anthropic: no server state. We keep the message history client-side
 //     (cached cheap via prompt caching).
-// `CoachChain` lets one SessionState field cover both — and stays
+//   • Google Gemini: no server state, no usable prefix caching for a
+//     growing conversation. Pure client-side history, full input charged
+//     on every call.
+// `CoachChain` lets one SessionState field cover all three — and stays
 // `Empty` until the first observer call.
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -49,6 +52,9 @@ pub enum CoachChain {
         response_id: String,
     },
     Anthropic {
+        history: Vec<CoachMessage>,
+    },
+    Google {
         history: Vec<CoachMessage>,
     },
 }
