@@ -153,14 +153,26 @@ pub fn prepare_log_file(
     Ok((file, path))
 }
 
-/// Open a fresh timestamped log file for this launch and redirect the
-/// process's stderr + stdout to it. Returns the path so the caller can
-/// announce it. On any I/O error, leaves the original stderr/stdout
-/// untouched and returns `None`.
+/// Open a fresh timestamped log file under the platform's default
+/// log directory and redirect stderr + stdout to it. Thin wrapper
+/// over [`init_for_app_in`]. Use this from production code paths
+/// only — tests should always go through `init_for_app_in` with an
+/// explicit tempdir to avoid polluting `~/Library/Logs/Coach/`.
 pub fn init_for_app() -> Option<PathBuf> {
-    let dir = log_dir();
+    init_for_app_in(&log_dir())
+}
+
+/// Open a fresh timestamped log file under `dir` and redirect the
+/// process's stderr + stdout to it. Returns the path so the caller
+/// can announce it. On any I/O error, leaves the original stderr/
+/// stdout untouched and returns `None`.
+///
+/// Tests that want to exercise the redirect path pass a tempdir;
+/// production callers go through [`init_for_app`] which uses
+/// [`log_dir`].
+pub fn init_for_app_in(dir: &Path) -> Option<PathBuf> {
     let now = chrono::Local::now();
-    let (file, path) = match prepare_log_file(&dir, now, KEEP_LAUNCHES) {
+    let (file, path) = match prepare_log_file(dir, now, KEEP_LAUNCHES) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("[coach] could not open log file under {dir:?}: {e}");
