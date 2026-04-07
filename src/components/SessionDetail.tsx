@@ -9,18 +9,16 @@ function formatTime(iso: string): string {
 export function SessionDetail() {
   const sessions = useCoachStore((s) => s.sessions);
   const selectedSessionId = useCoachStore((s) => s.selectedSessionId);
-  const activityLog = useCoachStore((s) => s.activityLog);
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
   const selectSession = useCoachStore((s) => s.selectSession);
 
   const session = sessions.find((s) => s.session_id === selectedSessionId);
 
-  const sessionEntries = useMemo(() => {
-    if (!selectedSessionId) return [];
-    return [...activityLog]
-      .filter((e) => e.session_id === selectedSessionId)
-      .reverse();
-  }, [activityLog, selectedSessionId]);
+  // Newest-first for the timeline display.
+  const sessionEntries = useMemo(
+    () => (session ? [...session.activity].reverse() : []),
+    [session],
+  );
 
   if (!session) {
     return (

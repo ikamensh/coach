@@ -102,9 +102,6 @@ pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHa
 
     let dead = coach.remove_dead_sessions(&live_ids);
     if !dead.is_empty() {
-        for id in &dead {
-            coach.log(id, "Scanner", "session ended", None);
-        }
         changed = true;
     }
 

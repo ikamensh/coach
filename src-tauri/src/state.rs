@@ -28,7 +28,6 @@ pub enum Theme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityEntry {
     pub timestamp: DateTime<Utc>,
-    pub session_id: String,
     pub hook_event: String,
     pub action: String,
     pub detail: Option<String>,
@@ -48,6 +47,9 @@ pub struct SessionSnapshot {
     pub stop_count: usize,
     pub stop_blocked_count: usize,
     pub cwd_history: Vec<String>,
+    pub coach_last_assessment: Option<String>,
+    /// Recent activity for this session, oldest-first.
+    pub activity: Vec<ActivityEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,13 +71,15 @@ pub struct TokenStatus {
 pub struct CoachSnapshot {
     pub sessions: Vec<SessionSnapshot>,
     pub priorities: Vec<String>,
-    pub activity_log: Vec<ActivityEntry>,
     pub port: u16,
     pub theme: Theme,
     pub model: ModelConfig,
     pub token_status: HashMap<String, TokenStatus>,
     pub coach_mode: EngineMode,
     pub rules: Vec<CoachRule>,
+    /// Providers that support stateful coach sessions. Frontend uses this
+    /// to mark unsupported choices in the model picker.
+    pub observer_capable_providers: Vec<String>,
 }
 
 pub struct SessionState {
@@ -93,12 +97,21 @@ pub struct SessionState {
     pub cwd_history: Vec<String>,
     /// PID of the Claude Code process, set by the session scanner.
     pub pid: Option<u32>,
+    /// OpenAI Responses API chain handle. Set by the first observer call,
+    /// passed back as `previous_response_id` on subsequent calls so the
+    /// model accumulates context server-side without us resending history.
+    pub coach_response_id: Option<String>,
+    /// Latest free-text observation produced by the coach LLM. Surfaces in
+    /// the session detail UI.
+    pub coach_last_assessment: Option<String>,
+    /// Recent activity entries (hook events, coach decisions, scanner notes).
+    /// Oldest-first; capped at SESSION_ACTIVITY_CAP.
+    pub activity: VecDeque<ActivityEntry>,
 }
 
 pub struct CoachState {
     pub sessions: HashMap<String, SessionState>,
     pub priorities: Vec<String>,
-    pub activity_log: VecDeque<ActivityEntry>,
     pub port: u16,
     pub theme: Theme,
     pub default_mode: CoachMode,
@@ -156,7 +169,7 @@ fn derive_display_name(cwd_history: &[String], session_id: &str) -> String {
     }
 }
 
-const MAX_LOG_ENTRIES: usize = 200;
+const SESSION_ACTIVITY_CAP: usize = 200;
 const SESSION_TTL_SECS: u64 = 3600;
 
 impl CoachState {
@@ -164,7 +177,6 @@ impl CoachState {
         Self {
             sessions: HashMap::new(),
             priorities: settings.priorities,
-            activity_log: VecDeque::new(),
             port: settings.port,
             theme: settings.theme,
             default_mode: CoachMode::Present,
@@ -236,6 +248,9 @@ impl CoachState {
                     stop_blocked_count: 0,
                     cwd_history,
                     pid: None,
+                    coach_response_id: None,
+                    coach_last_assessment: None,
+                    activity: VecDeque::new(),
                 }
             })
     }
@@ -259,6 +274,8 @@ impl CoachState {
                 stop_count: s.stop_count,
                 stop_blocked_count: s.stop_blocked_count,
                 cwd_history: s.cwd_history.clone(),
+                coach_last_assessment: s.coach_last_assessment.clone(),
+                activity: s.activity.iter().cloned().collect(),
             })
             .collect();
         sessions.sort_by(|a, b| b.last_event.cmp(&a.last_event));
@@ -266,7 +283,6 @@ impl CoachState {
         CoachSnapshot {
             sessions,
             priorities: self.priorities.clone(),
-            activity_log: self.activity_log.iter().cloned().collect(),
             port: self.port,
             theme: self.theme.clone(),
             model: self.model.clone(),
@@ -295,9 +311,16 @@ impl CoachState {
             },
             coach_mode: self.coach_mode.clone(),
             rules: self.rules.clone(),
+            observer_capable_providers: crate::settings::OBSERVER_CAPABLE_PROVIDERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
+    /// Append an activity entry to the given session's queue. Silently
+    /// drops the entry if the session no longer exists — log calls are
+    /// best-effort and should never crash the hook server.
     pub fn log(
         &mut self,
         session_id: &str,
@@ -305,15 +328,17 @@ impl CoachState {
         action: &str,
         detail: Option<String>,
     ) {
-        self.activity_log.push_back(ActivityEntry {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        session.activity.push_back(ActivityEntry {
             timestamp: Utc::now(),
-            session_id: session_id.to_string(),
             hook_event: hook_event.to_string(),
             action: action.to_string(),
             detail,
         });
-        while self.activity_log.len() > MAX_LOG_ENTRIES {
-            self.activity_log.pop_front();
+        while session.activity.len() > SESSION_ACTIVITY_CAP {
+            session.activity.pop_front();
         }
     }
 
@@ -356,6 +381,9 @@ impl CoachState {
                 stop_blocked_count: 0,
                 cwd_history,
                 pid: Some(pid),
+                coach_response_id: None,
+                coach_last_assessment: None,
+                activity: VecDeque::new(),
             },
         );
     }
@@ -407,7 +435,6 @@ mod tests {
         CoachState {
             sessions: HashMap::new(),
             priorities: vec!["Simplicity".into()],
-            activity_log: VecDeque::new(),
             port: 7700,
             theme: Theme::System,
             default_mode: CoachMode::Present,
@@ -507,30 +534,65 @@ mod tests {
 
     // ── Activity log ────────────────────────────────────────────────────
 
-    /// log() should append entries to the activity log.
+    /// log() should append entries to the targeted session's activity queue.
     #[test]
-    fn log_adds_entries() {
+    fn log_adds_entries_to_session() {
         let mut state = test_state();
+        state.session("s1", None);
         state.log("s1", "PostToolUse", "observed", None);
         state.log("s1", "Stop", "blocked", Some("priorities".into()));
 
-        assert_eq!(state.activity_log.len(), 2);
-        assert_eq!(state.activity_log[0].action, "observed");
-        assert_eq!(state.activity_log[1].detail, Some("priorities".into()));
+        let activity = &state.sessions.get("s1").unwrap().activity;
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].action, "observed");
+        assert_eq!(activity[1].detail, Some("priorities".into()));
     }
 
-    /// The activity log should be capped at MAX_LOG_ENTRIES (200).
-    /// Adding more entries should drop the oldest ones.
+    /// log() for a non-existent session must be a silent no-op
+    /// (best-effort logging — never crash the hook server).
     #[test]
-    fn log_is_capped_at_200_entries() {
+    fn log_for_unknown_session_is_silent_noop() {
         let mut state = test_state();
-        for i in 0..210 {
+        state.log("ghost", "PostToolUse", "observed", None);
+        assert!(state.sessions.is_empty());
+    }
+
+    /// Each session's queue is capped independently at SESSION_ACTIVITY_CAP.
+    #[test]
+    fn log_is_capped_per_session() {
+        let mut state = test_state();
+        state.session("s1", None);
+        for i in 0..SESSION_ACTIVITY_CAP + 10 {
             state.log("s1", "PostToolUse", &format!("entry-{i}"), None);
         }
-        assert_eq!(state.activity_log.len(), MAX_LOG_ENTRIES);
-        // The oldest entries (0..9) should have been pruned.
-        assert_eq!(state.activity_log[0].action, "entry-10");
-        assert_eq!(state.activity_log[199].action, "entry-209");
+        let activity = &state.sessions.get("s1").unwrap().activity;
+        assert_eq!(activity.len(), SESSION_ACTIVITY_CAP);
+        // The oldest 10 should have been pruned.
+        assert_eq!(activity[0].action, "entry-10");
+        assert_eq!(
+            activity[SESSION_ACTIVITY_CAP - 1].action,
+            format!("entry-{}", SESSION_ACTIVITY_CAP + 9),
+        );
+    }
+
+    /// Property: a chatty session must not evict another session's history.
+    /// This is the regression test for the original "shared global log" bug.
+    #[test]
+    fn busy_session_does_not_evict_quiet_session() {
+        let mut state = test_state();
+        state.session("quiet", None);
+        state.session("busy", None);
+
+        state.log("quiet", "PostToolUse", "first", Some("Read".into()));
+
+        // Hammer the busy session well past the per-session cap.
+        for i in 0..SESSION_ACTIVITY_CAP * 3 {
+            state.log("busy", "PostToolUse", &format!("noise-{i}"), None);
+        }
+
+        let quiet = &state.sessions.get("quiet").unwrap().activity;
+        assert_eq!(quiet.len(), 1, "quiet session must keep its only entry");
+        assert_eq!(quiet[0].action, "first");
     }
 
     // ── Snapshot properties ─────────────────────────────────────────────
@@ -608,7 +670,6 @@ mod tests {
         let state = CoachState {
             sessions: HashMap::new(),
             priorities: original.priorities.clone(),
-            activity_log: VecDeque::new(),
             port: original.port,
             theme: original.theme.clone(),
             default_mode: CoachMode::Present,
@@ -633,7 +694,7 @@ mod tests {
     }
 
     /// to_settings should not include transient state like sessions or
-    /// activity log — those are runtime-only.
+    /// activity — those are runtime-only.
     #[test]
     fn to_settings_excludes_transient_state() {
         let mut state = test_state();
@@ -643,9 +704,9 @@ mod tests {
         let settings = state.to_settings();
         let json = serde_json::to_value(&settings).unwrap();
 
-        // Settings JSON should not contain sessions or activity_log keys.
+        // Settings JSON should not contain sessions or per-session activity.
         assert!(json.get("sessions").is_none());
-        assert!(json.get("activity_log").is_none());
+        assert!(json.get("activity").is_none());
     }
 
     // ── prune_stale ─────────────────────────────────────────────────────

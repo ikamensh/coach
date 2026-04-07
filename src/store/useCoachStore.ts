@@ -14,7 +14,6 @@ interface CoachRule {
 
 interface ActivityEntry {
   timestamp: string;
-  session_id: string;
   hook_event: string;
   action: string;
   detail: string | null;
@@ -33,6 +32,7 @@ interface SessionSnapshot {
   stop_count: number;
   stop_blocked_count: number;
   cwd_history: string[];
+  activity: ActivityEntry[];
 }
 
 interface ModelConfig {
@@ -48,7 +48,6 @@ interface TokenStatus {
 interface CoachSnapshot {
   sessions: SessionSnapshot[];
   priorities: string[];
-  activity_log: ActivityEntry[];
   port: number;
   theme: Theme;
   model: ModelConfig;
@@ -72,7 +71,6 @@ interface HookStatus {
 interface CoachState {
   sessions: SessionSnapshot[];
   priorities: string[];
-  activityLog: ActivityEntry[];
   port: number;
   theme: Theme;
   model: ModelConfig;
@@ -125,12 +123,11 @@ function applyThemeClass(theme: Theme) {
   }
 }
 
-export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, HookStatus, EngineMode, CoachRule };
+export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, ActivityEntry, HookStatus, EngineMode, CoachRule };
 
 export const useCoachStore = create<CoachStore>((set, get) => ({
   sessions: [],
   priorities: [],
-  activityLog: [],
   port: 7700,
   theme: "system",
   model: { provider: "google", model: "gemini-2.5-flash" },
@@ -155,7 +152,6 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
       set({
         sessions: snapshot.sessions,
         priorities: snapshot.priorities,
-        activityLog: snapshot.activity_log,
         port: snapshot.port,
         theme: snapshot.theme,
         model: snapshot.model,
@@ -176,7 +172,6 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
       set({
         sessions: s.sessions,
         priorities: s.priorities,
-        activityLog: s.activity_log,
         model: s.model,
         tokenStatus: s.token_status,
         engineMode: s.coach_mode,

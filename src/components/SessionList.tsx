@@ -1,4 +1,6 @@
 import { useCoachStore } from "../store/useCoachStore";
+import { OwlIcon } from "./OwlIcon";
+import { ActivityBar } from "./ActivityBar";
 
 export function projectName(cwd: string | null): string {
   if (!cwd) return "unknown";
@@ -103,10 +105,10 @@ export function SessionList() {
               onClick={() => selectSession(session.session_id)}
               className="flex items-start gap-3 bg-zinc-100 dark:bg-zinc-800/50 rounded-lg px-3 py-2 cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors"
             >
-              <div
-                className={`w-2 h-2 rounded-full flex-shrink-0 mt-1.5 ${
-                  session.mode === "away" ? "bg-amber-500" : "bg-emerald-500"
-                }`}
+              <OwlIcon
+                size={26}
+                color={session.mode === "away" ? "#a1a1aa" : "#e8743c"}
+                className="flex-shrink-0 mt-0.5"
               />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between gap-2">
@@ -139,6 +141,7 @@ export function SessionList() {
                     <span> · {topTools(session.tool_counts)}</span>
                   )}
                 </div>
+                <ActivityBar entries={session.activity} />
               </div>
             </li>
           ))}

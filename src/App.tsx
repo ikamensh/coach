@@ -3,7 +3,6 @@ import { useCoachStore } from "./store/useCoachStore";
 import { useZoom } from "./hooks/useZoom";
 import { SessionList } from "./components/SessionList";
 import { PriorityList } from "./components/PriorityList";
-import { ActivityLog } from "./components/ActivityLog";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { SettingsPane } from "./components/SettingsPane";
 import { HooksPane } from "./components/HooksPane";
@@ -153,12 +152,10 @@ function AppInner() {
         </div>
       </div>
 
-      <SessionList />
-      <PriorityList />
-
-      <div className="flex-1 min-h-0 flex flex-col">
-        <ActivityLog />
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <SessionList />
       </div>
+      <PriorityList />
 
       <div className="text-xs text-zinc-400 dark:text-zinc-600 text-center flex items-center justify-center gap-2">
         <span>v{__APP_VERSION__}</span>
