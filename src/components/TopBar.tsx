@@ -96,14 +96,13 @@ export function TopBar({ title, onBack, rightSlot }: TopBarProps) {
           />
           Hooks
         </button>
-        {import.meta.env.DEV && (
-          <button
-            onClick={() => setView("dev")}
-            className={navButtonClass(view === "dev")}
-          >
-            Replay
-          </button>
-        )}
+        {/* TODO: gate behind import.meta.env.DEV again once we're out of active testing */}
+        <button
+          onClick={() => setView("dev")}
+          className={navButtonClass(view === "dev")}
+        >
+          Replay
+        </button>
         <button
           onClick={() => setView("settings")}
           className={navButtonClass(view === "settings")}
