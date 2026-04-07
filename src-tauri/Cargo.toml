@@ -1,6 +1,6 @@
 [package]
 name = "coach"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 
 [lib]
@@ -23,6 +23,7 @@ reqwest = { version = "0.12", features = ["json"] }
 rig-core = { version = "0.34", default-features = false, features = ["reqwest", "rustls"] }
 schemars = "1"
 tauri-plugin-single-instance = "2.4.1"
+netstat2 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"

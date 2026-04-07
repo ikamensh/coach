@@ -35,7 +35,7 @@ lingered until their 1-hour TTL expired.
 | Match hook → scanner record by `session_id` | The two ids never agree after a `/clear`. Bug we started with. |
 | Match by `cwd` | Breaks the moment the user runs two windows in the same project, which is the normal case for the user this is being built for. |
 | Mtime of `~/.claude/projects/<cwd>/<sid>.jsonl` | Doesn't tell us which PID owns it. |
-| `lsof` on the JSONL | Claude Code closes the file between writes, so it's never open when we look. |
+| `lsof` on the JSONL transcript file | Claude Code closes the file between writes, so it's never open when we look. |
 | `transcript_path` field in the hook payload | Same string as `session_id`, same problem. |
 | Hook payload field with PID | Doesn't exist. Empirically captured a real payload — Claude Code sends `session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`, `tool_name`, `tool_input`, `tool_response`, `tool_use_id`. No process info. |
 | Wrap the hook in a `command`-type script that captures `$PPID` | Works, but gives up the clean HTTP design, costs a subprocess per hook, and complicates installation. |
@@ -50,16 +50,42 @@ that connection. That is the only signal that is **always correct** and
 how often the user has typed `/clear`.
 
 We extract the peer port from each request via axum's
-`ConnectInfo<SocketAddr>`, then ask the OS which PID owns it:
+`ConnectInfo<SocketAddr>`, then ask the OS which PID owns it. We use the
+`netstat2` crate, which is a thin Rust wrapper over the platform-native
+APIs:
 
-```
-lsof -nP -iTCP@127.0.0.1:<peer_port>
-```
+* **macOS/iOS**: `sysctl(KIPC.PCBLIST)`
+* **Linux/Android**: `/proc/net/tcp` + netlink
+* **Windows**: `GetExtendedTcpTable` from `iphlpapi.dll`
 
-We filter out our own PID and read off Claude Code's. The lookup costs
-~50ms on macOS. We pay it **once per conversation** (the first hook of a
-new `session_id`), then cache `session_id → pid`. Subsequent hooks for the
-same conversation are zero-cost.
+`netstat2::get_sockets_info` returns a structured list of every TCP
+socket the kernel knows about, with the owning PID(s) attached. We
+filter for `local_port == peer_port` and pick the first PID that isn't
+ours (loopback connections show both ends in the table). The lookup is
+**~1.5ms** on macOS and we pay it **once per conversation** (the first
+hook of a new `session_id`), then cache `session_id → pid`. Subsequent
+hooks for the same conversation are zero-cost.
+
+Why not shell out to `lsof` / `netstat -ano`? The earlier iteration did
+exactly that on macOS. We replaced it with `netstat2` because:
+
+* **One implementation across all three platforms** instead of three
+  parsers, three formats, three sets of edge cases.
+* **30× faster** on the hot path (~1.5ms vs ~50ms for lsof).
+* **No string parsing** — the kernel hands back typed data, no parser
+  to break when an OS update changes a header line.
+* **No runtime dependency** — there is no longer an "is `lsof` on
+  PATH?" failure mode that silently degrades Coach to "zero sessions
+  ever". `netstat2` is statically linked into the binary.
+* **No localization risk** — `netstat -ano` headers are translated on
+  non-English Windows installs.
+
+The cost is a build-time dependency on `libclang` for macOS/Linux
+developers (`netstat2` uses `bindgen` to generate FFI bindings to BSD
+sysctl headers and Linux netlink structs). macOS developers already
+have `libclang` via Xcode, which Tauri requires anyway. Windows
+developers need nothing — `bindgen` is gated off on Windows in
+`netstat2`'s manifest.
 
 We also register Coach's hook server for the `SessionStart` hook, which
 Claude Code fires immediately after `/clear` (and on `startup`, `resume`,
@@ -105,7 +131,7 @@ ConnectInfo<SocketAddr>  ──►  peer port
 session_id_to_pid cache hit?
         │ no
         ▼
-pid_resolver::resolve(peer_port)  ──►  PID  (one lsof call)
+pid_resolver::resolve(peer_port)  ──►  PID  (~1.5ms netstat2 call)
         │
         ▼  cache (session_id → pid)
         │
@@ -138,21 +164,20 @@ the conversation actually has been running for that long — it just
 didn't have a tool call yet). This is distinct from the `/clear` reset
 path, which moves `started_at` to "now".
 
-### When lsof fails
+### When resolution fails
 
-Three failure modes:
+Two failure modes:
 
-1. lsof not installed (very rare on macOS/Linux base systems).
-2. The connection has already torn down by the time we look (would only
-   happen if axum somehow handed off the request after the connection was
-   closed; I don't believe this is possible with how `ConnectInfo` works).
-3. Permission issues seeing other users' sockets (not relevant — both
-   processes run as the same user).
+1. The connection has already torn down by the time we look (would only
+   happen if axum somehow handed off the request after the connection
+   was closed; not possible with how `ConnectInfo` works in practice).
+2. The kernel call itself errors (extremely rare — would mean the
+   process has been denied access to its own TCP table).
 
-When resolution fails we **do not** create a phantom session row. We log
-the event to the activity log under the hook's `session_id` and move on.
-The next successful resolution will reattach the row. Better to
-under-report briefly than to silently grow ghosts again.
+When resolution fails we **do not** create a phantom session row. We
+drop the event from session-list bookkeeping and move on. The next
+successful resolution will reattach the row. Better to under-report
+briefly than to silently grow ghosts again.
 
 ## What we register with Claude Code
 
@@ -172,7 +197,8 @@ exactly what they are.
 * **Per-conversation rows.** We could add a "history" view that lists
   every conversation a window has had, with each one's counters. Not
   needed for the current bug, easy to add later — `cwd_history`-style.
-* **Cross-platform PID resolution without `lsof`.** A future change could
-  use `libproc` on macOS and `/proc/net/tcp` on Linux for sub-millisecond
-  lookups. Not worth the dependency until we feel the latency, which
-  we won't because we cache.
+* **WSL2 / containerised Claude Code talking to a host-side Coach.**
+  TCP traffic from inside WSL2 to a host service goes through a
+  Hyper-V vmbus proxy, so the PID Coach sees would be the proxy on the
+  Windows side, not the actual Claude Code process. Out of scope until
+  someone actually runs that configuration.
