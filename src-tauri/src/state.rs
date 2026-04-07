@@ -140,6 +140,7 @@ pub struct SessionSnapshot {
     pub stop_blocked_count: usize,
     pub cwd_history: Vec<String>,
     pub coach_last_assessment: Option<String>,
+    pub coach_last_error: Option<String>,
     /// Tag for the active chain backend ("empty" / "openai" / "anthropic").
     pub coach_chain_kind: String,
     /// Number of messages the coach holds in its conversation. For Anthropic
@@ -220,6 +221,10 @@ pub struct SessionState {
     /// the previous one.
     pub coach_chain: CoachChain,
     pub coach_last_assessment: Option<String>,
+    /// Most recent failure message from the LLM coach. Lives alongside
+    /// `coach_last_assessment` rather than replacing it — a stale successful
+    /// assessment plus a fresh error is a valid state worth seeing.
+    pub coach_last_error: Option<String>,
     /// Counts every successful coach LLM call on this session — observer
     /// events plus chained stop evaluations. Reset on `/clear`.
     pub coach_calls: usize,
@@ -429,6 +434,7 @@ impl CoachState {
                 sess.last_stop_blocked = None;
                 sess.coach_chain = CoachChain::Empty;
                 sess.coach_last_assessment = None;
+                sess.coach_last_error = None;
                 sess.coach_calls = 0;
                 sess.coach_errors = 0;
                 sess.coach_last_called_at = None;
@@ -466,6 +472,7 @@ impl CoachState {
                         cwd_history,
                         coach_chain: CoachChain::Empty,
                         coach_last_assessment: None,
+                        coach_last_error: None,
                         coach_calls: 0,
                         coach_errors: 0,
                         coach_last_called_at: None,
@@ -502,6 +509,7 @@ impl CoachState {
                 stop_blocked_count: s.stop_blocked_count,
                 cwd_history: s.cwd_history.clone(),
                 coach_last_assessment: s.coach_last_assessment.clone(),
+                coach_last_error: s.coach_last_error.clone(),
                 coach_chain_kind: s.coach_chain.kind().to_string(),
                 coach_chain_messages: match &s.coach_chain {
                     // Anthropic + Google both store the literal turn list —
@@ -635,6 +643,7 @@ impl CoachState {
                 cwd_history,
                 coach_chain: CoachChain::Empty,
                 coach_last_assessment: None,
+                coach_last_error: None,
                 coach_calls: 0,
                 coach_errors: 0,
                 coach_last_called_at: None,

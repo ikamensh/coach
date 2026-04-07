@@ -23,6 +23,7 @@ export function SessionDetail() {
   const selectedPid = useCoachStore((s) => s.selectedPid);
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
   const setView = useCoachStore((s) => s.setView);
+  const engineMode = useCoachStore((s) => s.engineMode);
 
   const session = sessions.find((s) => s.pid === selectedPid);
 
@@ -102,23 +103,28 @@ export function SessionDetail() {
         </div>
       </section>
 
-      {/* Coach panel — visible whenever the LLM coach has done anything on
-          this session, including just errors. Hidden only when truly idle. */}
-      {(session.coach_calls > 0 ||
-        session.coach_errors > 0 ||
-        session.coach_last_assessment) && (
-        <section>
-          <div className="flex items-baseline justify-between mb-2">
-            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
-              Coach
-            </h2>
-            <span className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono uppercase">
-              {session.coach_chain_kind === "empty"
+      {/* Coach panel — always rendered so the user knows the section exists.
+          Three states:
+            • Has activity → full telemetry grid + last assessment
+            • Rules mode → "disabled, click to enable LLM" hint
+            • LLM mode but no activity yet → "waiting for first call" hint */}
+      <section>
+        <div className="flex items-baseline justify-between mb-2">
+          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
+            Coach
+          </h2>
+          <span className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono uppercase">
+            {engineMode === "rules"
+              ? "rules"
+              : session.coach_chain_kind === "empty"
                 ? "idle"
                 : session.coach_chain_kind}
-            </span>
-          </div>
+          </span>
+        </div>
 
+        {session.coach_calls > 0 ||
+        session.coach_errors > 0 ||
+        session.coach_last_assessment ? (
           <div className="bg-amber-50 dark:bg-amber-500/5 border border-amber-200/60 dark:border-amber-500/20 rounded px-3 py-2 space-y-2">
             {/* Activity row: calls, errors, message count */}
             <div className="grid grid-cols-3 gap-2 text-xs">
@@ -159,6 +165,19 @@ export function SessionDetail() {
                 </div>
               </div>
             </div>
+
+            {/* Last error — surfaced in red so the user doesn't have to
+                hunt through the timeline to find what failed. */}
+            {session.coach_last_error && (
+              <div className="border-t border-amber-200/40 dark:border-amber-500/10 pt-2">
+                <div className="text-[10px] uppercase tracking-wide text-red-500 dark:text-red-400 mb-1">
+                  Last error
+                </div>
+                <div className="text-xs text-red-600 dark:text-red-400 font-mono whitespace-pre-wrap break-all">
+                  {session.coach_last_error}
+                </div>
+              </div>
+            )}
 
             {/* Tokens row: last call vs cumulative. Only when we have any. */}
             {(session.coach_last_usage ||
@@ -215,8 +234,27 @@ export function SessionDetail() {
               </div>
             )}
           </div>
-        </section>
-      )}
+        ) : engineMode === "rules" ? (
+          <div className="text-xs text-zinc-600 dark:text-zinc-400 bg-zinc-50 dark:bg-zinc-800/30 border border-zinc-200/60 dark:border-zinc-700/40 rounded px-3 py-2">
+            Coach is disabled — using the Rules engine (pattern-matching only).
+            To get live LLM assessments and stop blocking,{" "}
+            <button
+              type="button"
+              onClick={() => setView("settings")}
+              className="text-emerald-600 dark:text-emerald-400 hover:underline"
+            >
+              switch to LLM mode in Settings
+            </button>
+            .
+          </div>
+        ) : (
+          <div className="text-xs text-zinc-600 dark:text-zinc-400 bg-zinc-50 dark:bg-zinc-800/30 border border-zinc-200/60 dark:border-zinc-700/40 rounded px-3 py-2">
+            LLM mode is on, but Coach hasn't been called yet on this session.
+            Flip the session to <strong>Away</strong> and let Claude run one
+            tool — assessments will appear here.
+          </div>
+        )}
+      </section>
 
       {/* Tools */}
       {toolEntries.length > 0 && (

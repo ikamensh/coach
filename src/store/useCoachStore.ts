@@ -45,6 +45,7 @@ interface SessionSnapshot {
   stop_blocked_count: number;
   cwd_history: string[];
   coach_last_assessment: string | null;
+  coach_last_error: string | null;
   /// "empty" | "openai" | "anthropic" — which backend the chain is using.
   coach_chain_kind: string;
   /// Number of messages currently held in the coach's conversation.

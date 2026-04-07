@@ -831,6 +831,13 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
                 assert_eq!(sess.coach_calls, 0, "no successful call yet");
                 assert!(sess.coach_last_called_at.is_none());
                 assert_eq!(sess.coach_total_usage.input_tokens, 0);
+                // The error message must be captured so the panel can show
+                // it. Should match the activity log detail exactly.
+                assert!(sess.coach_last_error.is_some());
+                assert_eq!(
+                    sess.coach_last_error.as_deref(),
+                    observer_entry.detail.as_deref(),
+                );
                 return;
             }
         }

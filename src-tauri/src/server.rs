@@ -328,6 +328,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                 let mut coach = state.coach.write().await;
                 if let Some(s) = coach.sessions.get_mut(&pid) {
                     s.coach_errors += 1;
+                    s.coach_last_error = Some(e.clone());
                 }
                 emit_update(&state.emitter, &coach);
                 drop(coach);
@@ -504,6 +505,7 @@ async fn run_observer(
             let mut s = coach.write().await;
             if let Some(sess) = s.sessions.get_mut(&input.pid) {
                 sess.coach_errors += 1;
+                sess.coach_last_error = Some(e.clone());
             }
             s.log(input.pid, "Observer", "error", Some(e));
             emit_update(&emitter, &s);
