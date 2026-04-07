@@ -22,6 +22,12 @@ interface ActivityEntry {
 
 type SessionClient = "claude" | "cursor";
 
+interface CoachUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+}
+
 interface SessionSnapshot {
   /** OS PID — stable across /clear, the canonical identity for a window. */
   pid: number;
@@ -38,6 +44,19 @@ interface SessionSnapshot {
   stop_count: number;
   stop_blocked_count: number;
   cwd_history: string[];
+  coach_last_assessment: string | null;
+  /// "empty" | "openai" | "anthropic" — which backend the chain is using.
+  coach_chain_kind: string;
+  /// Number of messages currently held in the coach's conversation.
+  coach_chain_messages: number;
+  /// Successful coach LLM calls (observer + chained stop).
+  coach_calls: number;
+  /// Failed coach LLM calls.
+  coach_errors: number;
+  coach_last_called_at: string | null;
+  coach_last_latency_ms: number | null;
+  coach_last_usage: CoachUsage | null;
+  coach_total_usage: CoachUsage;
   activity: ActivityEntry[];
   client: SessionClient;
 }
@@ -146,7 +165,7 @@ function applyThemeClass(theme: Theme) {
   }
 }
 
-export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, SessionClient, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule, CoachView };
+export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, SessionClient, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule, CoachView, CoachUsage };
 
 export const useCoachStore = create<CoachStore>((set, get) => ({
   sessions: [],

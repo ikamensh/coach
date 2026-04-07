@@ -59,6 +59,37 @@ pub enum CoachChain {
     },
 }
 
+impl CoachChain {
+    /// Short tag suitable for the frontend.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            CoachChain::Empty => "empty",
+            CoachChain::OpenAi { .. } => "openai",
+            CoachChain::Anthropic { .. } => "anthropic",
+            CoachChain::Google { .. } => "google",
+        }
+    }
+}
+
+/// Token accounting for a single coach LLM call (or summed across calls).
+/// Mirrors the three rig::completion::Usage fields we actually care about.
+/// `cached_input_tokens` is non-zero only for providers with prompt caching
+/// (Anthropic with `with_automatic_caching()`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoachUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+}
+
+impl std::ops::AddAssign for CoachUsage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -109,6 +140,22 @@ pub struct SessionSnapshot {
     pub stop_blocked_count: usize,
     pub cwd_history: Vec<String>,
     pub coach_last_assessment: Option<String>,
+    /// Tag for the active chain backend ("empty" / "openai" / "anthropic").
+    pub coach_chain_kind: String,
+    /// Number of messages the coach holds in its conversation. For Anthropic
+    /// this is the literal client-side history length; for OpenAI it's a
+    /// counter we maintain because the Responses API only hands back an id.
+    pub coach_chain_messages: usize,
+    /// Successful coach LLM calls (observer + chained stop).
+    pub coach_calls: usize,
+    /// Failed coach LLM calls.
+    pub coach_errors: usize,
+    /// When the most recent successful coach call completed.
+    pub coach_last_called_at: Option<DateTime<Utc>>,
+    /// Wall-clock latency of the most recent successful coach call.
+    pub coach_last_latency_ms: Option<u64>,
+    pub coach_last_usage: Option<CoachUsage>,
+    pub coach_total_usage: CoachUsage,
     /// Recent activity for the current conversation, oldest-first.
     pub activity: Vec<ActivityEntry>,
     /// Which agent CLI / IDE this session belongs to. Drives the icon
@@ -173,6 +220,14 @@ pub struct SessionState {
     /// the previous one.
     pub coach_chain: CoachChain,
     pub coach_last_assessment: Option<String>,
+    /// Counts every successful coach LLM call on this session — observer
+    /// events plus chained stop evaluations. Reset on `/clear`.
+    pub coach_calls: usize,
+    pub coach_errors: usize,
+    pub coach_last_called_at: Option<DateTime<Utc>>,
+    pub coach_last_latency_ms: Option<u64>,
+    pub coach_last_usage: Option<CoachUsage>,
+    pub coach_total_usage: CoachUsage,
     pub activity: VecDeque<ActivityEntry>,
     /// Which agent CLI / IDE this session belongs to. Set once on
     /// creation (Claude by default) and only updated by `mark_client`,
@@ -374,6 +429,12 @@ impl CoachState {
                 sess.last_stop_blocked = None;
                 sess.coach_chain = CoachChain::Empty;
                 sess.coach_last_assessment = None;
+                sess.coach_calls = 0;
+                sess.coach_errors = 0;
+                sess.coach_last_called_at = None;
+                sess.coach_last_latency_ms = None;
+                sess.coach_last_usage = None;
+                sess.coach_total_usage = CoachUsage::default();
                 sess.activity.clear();
                 if let Some(cwd) = cwd {
                     sess.cwd = Some(cwd.to_string());
@@ -405,6 +466,12 @@ impl CoachState {
                         cwd_history,
                         coach_chain: CoachChain::Empty,
                         coach_last_assessment: None,
+                        coach_calls: 0,
+                        coach_errors: 0,
+                        coach_last_called_at: None,
+                        coach_last_latency_ms: None,
+                        coach_last_usage: None,
+                        coach_total_usage: CoachUsage::default(),
                         activity: VecDeque::new(),
                         client: SessionClient::default(),
                     },
@@ -435,6 +502,24 @@ impl CoachState {
                 stop_blocked_count: s.stop_blocked_count,
                 cwd_history: s.cwd_history.clone(),
                 coach_last_assessment: s.coach_last_assessment.clone(),
+                coach_chain_kind: s.coach_chain.kind().to_string(),
+                coach_chain_messages: match &s.coach_chain {
+                    // Anthropic + Google both store the literal turn list —
+                    // len is exact.
+                    CoachChain::Anthropic { history } => history.len(),
+                    CoachChain::Google { history } => history.len(),
+                    // OpenAI Responses API gives us only an opaque id, so the
+                    // visible "messages held" count == successful calls. Each
+                    // call appends one user + one assistant message server-side.
+                    CoachChain::OpenAi { .. } => s.coach_calls * 2,
+                    CoachChain::Empty => 0,
+                },
+                coach_calls: s.coach_calls,
+                coach_errors: s.coach_errors,
+                coach_last_called_at: s.coach_last_called_at,
+                coach_last_latency_ms: s.coach_last_latency_ms,
+                coach_last_usage: s.coach_last_usage,
+                coach_total_usage: s.coach_total_usage,
                 activity: s.activity.iter().cloned().collect(),
                 client: s.client,
             })
@@ -550,6 +635,12 @@ impl CoachState {
                 cwd_history,
                 coach_chain: CoachChain::Empty,
                 coach_last_assessment: None,
+                coach_calls: 0,
+                coach_errors: 0,
+                coach_last_called_at: None,
+                coach_last_latency_ms: None,
+                coach_last_usage: None,
+                coach_total_usage: CoachUsage::default(),
                 activity: VecDeque::new(),
                 // The file scanner only walks `~/.claude/projects` so any
                 // session it discovers is necessarily Claude Code.
@@ -942,6 +1033,108 @@ mod tests {
         assert_eq!(snap.sessions[0].session_id, "conv-X");
         assert_eq!(snap.sessions[0].display_name, "coach");
         assert_eq!(snap.sessions[0].tool_counts.get("Read"), Some(&3));
+    }
+
+    /// Property: every coach_* field on SessionState is mirrored onto the
+    /// snapshot, and coach_chain_messages is derived correctly from the chain
+    /// (Anthropic: literal history length; OpenAI: calls * 2 since each call
+    /// appends a user + assistant pair server-side).
+    #[test]
+    fn snapshot_mirrors_coach_telemetry_fields() {
+        let mut state = test_state();
+        state.apply_hook_event(7, "s", Some("/p"));
+        let usage = CoachUsage { input_tokens: 100, output_tokens: 20, cached_input_tokens: 10 };
+        let now = Utc::now();
+        {
+            let s = state.sessions.get_mut(&7).unwrap();
+            s.coach_chain = CoachChain::Anthropic {
+                history: vec![
+                    CoachMessage { role: CoachRole::User, content: "u1".into() },
+                    CoachMessage { role: CoachRole::Assistant, content: "a1".into() },
+                    CoachMessage { role: CoachRole::User, content: "u2".into() },
+                    CoachMessage { role: CoachRole::Assistant, content: "a2".into() },
+                ],
+            };
+            s.coach_last_assessment = Some("looks fine".into());
+            s.coach_calls = 2;
+            s.coach_errors = 1;
+            s.coach_last_called_at = Some(now);
+            s.coach_last_latency_ms = Some(420);
+            s.coach_last_usage = Some(usage);
+            s.coach_total_usage = CoachUsage {
+                input_tokens: 200,
+                output_tokens: 40,
+                cached_input_tokens: 20,
+            };
+        }
+        let snap = state.snapshot();
+        let sess = &snap.sessions[0];
+        assert_eq!(sess.coach_chain_kind, "anthropic");
+        assert_eq!(sess.coach_chain_messages, 4, "anthropic count == history.len()");
+        assert_eq!(sess.coach_calls, 2);
+        assert_eq!(sess.coach_errors, 1);
+        assert_eq!(sess.coach_last_called_at, Some(now));
+        assert_eq!(sess.coach_last_latency_ms, Some(420));
+        assert_eq!(sess.coach_last_usage, Some(usage));
+        assert_eq!(sess.coach_total_usage.input_tokens, 200);
+        assert_eq!(sess.coach_last_assessment.as_deref(), Some("looks fine"));
+
+        // Round-trip through JSON: catches any serde-incompatible field
+        // shapes we might introduce later.
+        let json = serde_json::to_string(&snap).expect("snapshot must serialize");
+        assert!(json.contains("\"coach_chain_kind\":\"anthropic\""));
+        assert!(json.contains("\"coach_chain_messages\":4"));
+    }
+
+    /// OpenAI chains have no client-side message list, so we approximate
+    /// the held-message count as `calls * 2` (one user + one assistant per call).
+    #[test]
+    fn snapshot_openai_chain_messages_derived_from_calls() {
+        let mut state = test_state();
+        state.apply_hook_event(8, "s", Some("/p"));
+        {
+            let s = state.sessions.get_mut(&8).unwrap();
+            s.coach_chain = CoachChain::OpenAi { response_id: "resp_xyz".into() };
+            s.coach_calls = 5;
+        }
+        let snap = state.snapshot();
+        assert_eq!(snap.sessions[0].coach_chain_kind, "openai");
+        assert_eq!(snap.sessions[0].coach_chain_messages, 10);
+    }
+
+    /// Regression: /clear must wipe coach telemetry along with the chain.
+    /// Otherwise the panel would show stale call counts and "12s ago" for a
+    /// brand-new conversation that has yet to call the LLM.
+    #[test]
+    fn clear_resets_coach_telemetry() {
+        let mut state = test_state();
+        state.apply_hook_event(9, "old", Some("/p"));
+        {
+            let s = state.sessions.get_mut(&9).unwrap();
+            s.coach_chain = CoachChain::OpenAi { response_id: "resp_old".into() };
+            s.coach_calls = 7;
+            s.coach_errors = 2;
+            s.coach_last_called_at = Some(Utc::now());
+            s.coach_last_latency_ms = Some(300);
+            s.coach_last_usage = Some(CoachUsage {
+                input_tokens: 50,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            });
+            s.coach_total_usage = CoachUsage {
+                input_tokens: 500,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+            };
+        }
+        state.apply_hook_event(9, "new", Some("/p"));
+        let s = state.sessions.get(&9).unwrap();
+        assert_eq!(s.coach_calls, 0);
+        assert_eq!(s.coach_errors, 0);
+        assert!(s.coach_last_called_at.is_none());
+        assert!(s.coach_last_latency_ms.is_none());
+        assert!(s.coach_last_usage.is_none());
+        assert_eq!(s.coach_total_usage, CoachUsage::default());
     }
 
     // ── from_settings / to_settings roundtrip ───────────────────────────

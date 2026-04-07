@@ -249,6 +249,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
     //     observer's chain so the model uses everything observed so far.
     //   • One-shot fallback: any other provider — sends only the digest.
     if coach_mode == EngineMode::Llm {
+        let started = std::time::Instant::now();
         let chained = if provider_capable {
             match crate::llm::evaluate_stop_chained(
                 &state.coach,
@@ -258,7 +259,9 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
             )
             .await
             {
-                Ok((decision, new_chain)) => Some(Ok((decision, Some(new_chain)))),
+                Ok((decision, new_chain, usage)) => {
+                    Some(Ok((decision, Some(new_chain), Some(usage))))
+                }
                 Err(e) => Some(Err(e)),
             }
         } else {
@@ -269,20 +272,31 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
             Some(r) => r,
             None => crate::llm::evaluate_stop(&state.coach, &ctx)
                 .await
-                .map(|d| (d, None)),
+                .map(|d| (d, None, None)),
         };
 
         match result {
-            Ok((decision, new_chain)) if decision.allow => {
+            Ok((decision, new_chain, usage)) if decision.allow => {
+                let latency_ms = started.elapsed().as_millis() as u64;
                 let mut coach = state.coach.write().await;
-                if let (Some(s), Some(c)) = (coach.sessions.get_mut(&pid), new_chain) {
-                    s.coach_chain = c;
+                if let Some(s) = coach.sessions.get_mut(&pid) {
+                    if let Some(c) = new_chain {
+                        s.coach_chain = c;
+                    }
+                    s.coach_calls += 1;
+                    s.coach_last_called_at = Some(chrono::Utc::now());
+                    s.coach_last_latency_ms = Some(latency_ms);
+                    if let Some(u) = usage {
+                        s.coach_last_usage = Some(u);
+                        s.coach_total_usage += u;
+                    }
                 }
                 coach.log(pid, "Stop", "allowed (LLM)", None);
                 emit_update(&state.emitter, &coach);
                 return Json(serde_json::json!({}));
             }
-            Ok((decision, new_chain)) => {
+            Ok((decision, new_chain, usage)) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
                 let mut coach = state.coach.write().await;
                 let message = decision
                     .message
@@ -294,6 +308,13 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                     if let Some(c) = new_chain {
                         s.coach_chain = c;
                     }
+                    s.coach_calls += 1;
+                    s.coach_last_called_at = Some(chrono::Utc::now());
+                    s.coach_last_latency_ms = Some(latency_ms);
+                    if let Some(u) = usage {
+                        s.coach_last_usage = Some(u);
+                        s.coach_total_usage += u;
+                    }
                 }
                 coach.log(pid, "Stop", "blocked (LLM)", Some(message.clone()));
                 emit_update(&state.emitter, &coach);
@@ -304,6 +325,12 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
             }
             Err(e) => {
                 eprintln!("[coach] LLM evaluate_stop failed, falling back: {e}");
+                let mut coach = state.coach.write().await;
+                if let Some(s) = coach.sessions.get_mut(&pid) {
+                    s.coach_errors += 1;
+                }
+                emit_update(&state.emitter, &coach);
+                drop(coach);
                 // Fall through to rules/cooldown behavior.
             }
         }
@@ -448,6 +475,7 @@ async fn run_observer(
     emitter: Option<tauri::AppHandle>,
     input: ObserverInput,
 ) {
+    let started = std::time::Instant::now();
     match crate::llm::observe_event(
         &coach,
         &input.priorities,
@@ -456,11 +484,17 @@ async fn run_observer(
     )
     .await
     {
-        Ok((text, new_chain)) => {
+        Ok((text, new_chain, usage)) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
             let mut s = coach.write().await;
             if let Some(sess) = s.sessions.get_mut(&input.pid) {
                 sess.coach_chain = new_chain;
                 sess.coach_last_assessment = Some(text.clone());
+                sess.coach_calls += 1;
+                sess.coach_last_called_at = Some(chrono::Utc::now());
+                sess.coach_last_latency_ms = Some(latency_ms);
+                sess.coach_last_usage = Some(usage);
+                sess.coach_total_usage += usage;
             }
             s.log(input.pid, "Observer", "noted", Some(text));
             emit_update(&emitter, &s);
@@ -468,6 +502,9 @@ async fn run_observer(
         Err(e) => {
             eprintln!("[coach] observer call failed: {e}");
             let mut s = coach.write().await;
+            if let Some(sess) = s.sessions.get_mut(&input.pid) {
+                sess.coach_errors += 1;
+            }
             s.log(input.pid, "Observer", "error", Some(e));
             emit_update(&emitter, &s);
         }

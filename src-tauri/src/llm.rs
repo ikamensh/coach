@@ -46,10 +46,21 @@ pub struct StopDecision {
 }
 
 /// Result of a chained call into OpenAI's Responses API: the assistant text
-/// plus the new `response_id` to pass as `previous_response_id` next time.
+/// plus the new `response_id` to pass as `previous_response_id` next time,
+/// plus the token usage so callers can roll up cost telemetry.
 pub struct ChainCall {
     pub text: String,
     pub response_id: String,
+    pub usage: crate::state::CoachUsage,
+}
+
+/// Convert rig's per-call usage record to our minimal three-field shape.
+fn to_coach_usage(u: rig::completion::Usage) -> crate::state::CoachUsage {
+    crate::state::CoachUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cached_input_tokens: u.cached_input_tokens,
+    }
 }
 
 /// Snapshot of session info passed to the coach LLM when evaluating a stop.
@@ -404,8 +415,9 @@ pub async fn chain_openai(
         .collect::<Vec<_>>()
         .join("");
     let response_id = resp.raw_response.id.clone();
+    let usage = to_coach_usage(resp.usage);
 
-    Ok(ChainCall { text, response_id })
+    Ok(ChainCall { text, response_id, usage })
 }
 
 // ── Stateful chain via Anthropic + prompt caching ──────────────────────
@@ -424,7 +436,7 @@ pub async fn chain_anthropic(
     history: &[crate::state::CoachMessage],
     new_message: &str,
     max_output_tokens: Option<u32>,
-) -> Result<(String, Vec<crate::state::CoachMessage>), String> {
+) -> Result<(String, Vec<crate::state::CoachMessage>, crate::state::CoachUsage), String> {
     use rig::agent::AgentBuilder;
     use rig::client::CompletionClient;
     use rig::completion::{AssistantContent, Completion};
@@ -483,6 +495,7 @@ pub async fn chain_anthropic(
         })
         .collect::<Vec<_>>()
         .join("");
+    let usage = to_coach_usage(resp.usage);
 
     // Build the updated history: existing + new user msg + assistant reply.
     let mut new_history = history.to_vec();
@@ -495,7 +508,7 @@ pub async fn chain_anthropic(
         content: text.clone(),
     });
 
-    Ok((text, new_history))
+    Ok((text, new_history, usage))
 }
 
 // ── Stateful chain via Google Gemini (pure history resend) ────────────
@@ -520,7 +533,7 @@ pub async fn chain_gemini(
     history: &[crate::state::CoachMessage],
     new_message: &str,
     max_output_tokens: Option<u32>,
-) -> Result<(String, Vec<crate::state::CoachMessage>), String> {
+) -> Result<(String, Vec<crate::state::CoachMessage>, crate::state::CoachUsage), String> {
     use rig::client::CompletionClient;
     use rig::completion::{AssistantContent, Completion};
     use rig::message::Message as RigMessage;
@@ -569,6 +582,7 @@ pub async fn chain_gemini(
         })
         .collect::<Vec<_>>()
         .join("");
+    let usage = to_coach_usage(resp.usage);
 
     let mut new_history = history.to_vec();
     new_history.push(crate::state::CoachMessage {
@@ -580,7 +594,7 @@ pub async fn chain_gemini(
         content: text.clone(),
     });
 
-    Ok((text, new_history))
+    Ok((text, new_history, usage))
 }
 
 // ── Observer + chained stop ────────────────────────────────────────────
@@ -653,7 +667,7 @@ pub async fn session_send(
     system_prompt: &str,
     message: &str,
     constraints: CallConstraints,
-) -> Result<(String, crate::state::CoachChain), String> {
+) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
     use crate::state::CoachChain;
 
     match read_provider(state).await.as_str() {
@@ -677,6 +691,7 @@ pub async fn session_send(
             Ok((
                 call.text,
                 CoachChain::OpenAi { response_id: call.response_id },
+                call.usage,
             ))
         }
         "anthropic" => {
@@ -685,7 +700,7 @@ pub async fn session_send(
                 CoachChain::Anthropic { history } => history.clone(),
                 _ => Vec::new(),
             };
-            let (text, new_history) = chain_anthropic(
+            let (text, new_history, usage) = chain_anthropic(
                 state,
                 Some(system_prompt),
                 &history,
@@ -693,7 +708,7 @@ pub async fn session_send(
                 constraints.max_output_tokens,
             )
             .await?;
-            Ok((text, CoachChain::Anthropic { history: new_history }))
+            Ok((text, CoachChain::Anthropic { history: new_history }, usage))
         }
         "google" => {
             warn_emulation_once("google", "client-side history, no prefix caching");
@@ -701,7 +716,7 @@ pub async fn session_send(
                 CoachChain::Google { history } => history.clone(),
                 _ => Vec::new(),
             };
-            let (text, new_history) = chain_gemini(
+            let (text, new_history, usage) = chain_gemini(
                 state,
                 Some(system_prompt),
                 &history,
@@ -709,7 +724,7 @@ pub async fn session_send(
                 constraints.max_output_tokens,
             )
             .await?;
-            Ok((text, CoachChain::Google { history: new_history }))
+            Ok((text, CoachChain::Google { history: new_history }, usage))
         }
         other => Err(format!(
             "session_send: provider {other} has no session support (native or emulated)"
@@ -741,7 +756,7 @@ pub async fn observe_event(
     priorities: &[String],
     chain: &crate::state::CoachChain,
     event: &str,
-) -> Result<(String, crate::state::CoachChain), String> {
+) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
     let system = coach_system_prompt(priorities);
     session_send(
         state,
@@ -763,7 +778,7 @@ pub async fn evaluate_stop_chained(
     priorities: &[String],
     chain: &crate::state::CoachChain,
     stop_reason: Option<&str>,
-) -> Result<(StopDecision, crate::state::CoachChain), String> {
+) -> Result<(StopDecision, crate::state::CoachChain, crate::state::CoachUsage), String> {
     let reason = stop_reason.unwrap_or("not specified");
     let prompt = format!(
         "The agent is requesting to stop. Stop reason from Claude: {reason}.\n\n\
@@ -771,7 +786,7 @@ pub async fn evaluate_stop_chained(
          {{\"allow\": true|false, \"message\": \"directive if blocking, null if allowing\"}}"
     );
     let system = coach_system_prompt(priorities);
-    let (text, new_chain) = session_send(
+    let (text, new_chain, usage) = session_send(
         state,
         chain,
         &system,
@@ -783,7 +798,7 @@ pub async fn evaluate_stop_chained(
     )
     .await?;
     let decision = parse_stop_decision(&text)?;
-    Ok((decision, new_chain))
+    Ok((decision, new_chain, usage))
 }
 
 /// Parse a StopDecision from a model response, tolerating models that
@@ -1145,7 +1160,7 @@ mod live_tests {
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
         );
-        let (_text1, chain1) =
+        let (_text1, chain1, _u1) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
                 .await
                 .expect("first observe_event failed");
@@ -1159,7 +1174,7 @@ mod live_tests {
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
         );
-        let (_text2, chain2) = observe_event(&state, &priorities, &chain1, &event2)
+        let (_text2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
             .await
             .expect("second observe_event failed");
         let id2 = match &chain2 {
@@ -1184,12 +1199,12 @@ mod live_tests {
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
         );
-        let (_text, observed_chain) =
+        let (_text, observed_chain, _u) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
                 .await
                 .expect("observe failed");
 
-        let (decision, new_chain) = evaluate_stop_chained(
+        let (decision, new_chain, _u2) = evaluate_stop_chained(
             &state,
             &priorities,
             &observed_chain,
@@ -1216,7 +1231,7 @@ mod live_tests {
     async fn live_evaluate_stop_chained_no_prior_context() {
         let Some(state) = live_state() else { return };
         let priorities = vec!["Do good work".into()];
-        let (_decision, new_chain) = evaluate_stop_chained(
+        let (_decision, new_chain, _u) = evaluate_stop_chained(
             &state,
             &priorities,
             &crate::state::CoachChain::Empty,
@@ -1263,7 +1278,7 @@ mod live_tests {
     #[ignore]
     async fn live_chain_anthropic_basic() {
         let Some(state) = live_state_anthropic() else { return };
-        let (text, new_history) = chain_anthropic(
+        let (text, new_history, usage) = chain_anthropic(
             &state,
             Some("You are a test bot. Respond with one word."),
             &[],
@@ -1274,6 +1289,10 @@ mod live_tests {
         .expect("chain_anthropic failed");
         assert!(!text.is_empty(), "expected non-empty text");
         assert_eq!(new_history.len(), 2, "history should grow by user+assistant");
+        // Usage should report something — both fields should be > 0 for any
+        // real call. This is the regression check for the rig field shape.
+        assert!(usage.input_tokens > 0, "expected non-zero input_tokens");
+        assert!(usage.output_tokens > 0, "expected non-zero output_tokens");
         assert_eq!(new_history[0].role, crate::state::CoachRole::User);
         assert_eq!(new_history[1].role, crate::state::CoachRole::Assistant);
     }
@@ -1287,7 +1306,7 @@ mod live_tests {
         let Some(state) = live_state_anthropic() else { return };
         let system = "You are a test bot. Reply tersely.";
 
-        let (_t1, h1) = chain_anthropic(
+        let (_t1, h1, _u1) = chain_anthropic(
             &state,
             Some(system),
             &[],
@@ -1297,7 +1316,7 @@ mod live_tests {
         .await
         .expect("first call failed");
 
-        let (text, _h2) = chain_anthropic(
+        let (text, _h2, _u2) = chain_anthropic(
             &state,
             Some(system),
             &h1,
@@ -1329,7 +1348,7 @@ mod live_tests {
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
         );
-        let (_t1, chain1) =
+        let (_t1, chain1, _u1) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
                 .await
                 .expect("first observe_event failed");
@@ -1343,7 +1362,7 @@ mod live_tests {
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
         );
-        let (_t2, chain2) = observe_event(&state, &priorities, &chain1, &event2)
+        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
@@ -1366,12 +1385,12 @@ mod live_tests {
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
         );
-        let (_t, observed_chain) =
+        let (_t, observed_chain, _u_obs) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
                 .await
                 .expect("observe failed");
 
-        let (decision, new_chain) = evaluate_stop_chained(
+        let (decision, new_chain, _u_stop) = evaluate_stop_chained(
             &state,
             &priorities,
             &observed_chain,
@@ -1429,7 +1448,7 @@ mod live_tests {
     #[ignore]
     async fn live_chain_gemini_basic() {
         let Some(state) = live_state_google() else { return };
-        let (text, new_history) = chain_gemini(
+        let (text, new_history, _usage) = chain_gemini(
             &state,
             Some("You are a test bot. Respond with one word."),
             &[],
@@ -1453,7 +1472,7 @@ mod live_tests {
         let Some(state) = live_state_google() else { return };
         let system = "You are a test bot. Reply tersely.";
 
-        let (_t1, h1) = chain_gemini(
+        let (_t1, h1, _u1) = chain_gemini(
             &state,
             Some(system),
             &[],
@@ -1463,7 +1482,7 @@ mod live_tests {
         .await
         .expect("first call failed");
 
-        let (text, _h2) = chain_gemini(
+        let (text, _h2, _u2) = chain_gemini(
             &state,
             Some(system),
             &h1,
@@ -1495,7 +1514,7 @@ mod live_tests {
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
         );
-        let (_t1, chain1) =
+        let (_t1, chain1, _u1) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
                 .await
                 .expect("first observe_event failed");
@@ -1509,7 +1528,7 @@ mod live_tests {
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
         );
-        let (_t2, chain2) = observe_event(&state, &priorities, &chain1, &event2)
+        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
@@ -1532,12 +1551,12 @@ mod live_tests {
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
         );
-        let (_t, observed_chain) =
+        let (_t, observed_chain, _u_obs) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
                 .await
                 .expect("observe failed");
 
-        let (decision, new_chain) = evaluate_stop_chained(
+        let (decision, new_chain, _u_stop) = evaluate_stop_chained(
             &state,
             &priorities,
             &observed_chain,

@@ -825,6 +825,12 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
                     observer_entry.action, "error",
                     "no-token failure should be logged as Observer/error"
                 );
+                // Counters: error path must tick coach_errors and leave
+                // coach_calls / usage at zero (no successful round-trip).
+                assert_eq!(sess.coach_errors, 1, "error counter should tick");
+                assert_eq!(sess.coach_calls, 0, "no successful call yet");
+                assert!(sess.coach_last_called_at.is_none());
+                assert_eq!(sess.coach_total_usage.input_tokens, 0);
                 return;
             }
         }

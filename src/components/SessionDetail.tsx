@@ -3,6 +3,21 @@ import { useCoachStore } from "../store/useCoachStore";
 import { formatDuration, formatTime, timeAgo } from "../utils/time";
 import { TopBar } from "./TopBar";
 
+/// Compact integer formatter — 1234 → "1.2k", 12345 → "12.3k", < 1000 → as-is.
+/// Used for token counts where exact precision adds noise.
+function formatTokens(n: number): string {
+  if (n < 1000) return n.toString();
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+/// Latency formatter — sub-second in ms, otherwise seconds with one decimal.
+function formatLatency(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+
 export function SessionDetail() {
   const sessions = useCoachStore((s) => s.sessions);
   const selectedPid = useCoachStore((s) => s.selectedPid);
@@ -86,6 +101,122 @@ export function SessionDetail() {
           )}
         </div>
       </section>
+
+      {/* Coach panel — visible whenever the LLM coach has done anything on
+          this session, including just errors. Hidden only when truly idle. */}
+      {(session.coach_calls > 0 ||
+        session.coach_errors > 0 ||
+        session.coach_last_assessment) && (
+        <section>
+          <div className="flex items-baseline justify-between mb-2">
+            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
+              Coach
+            </h2>
+            <span className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono uppercase">
+              {session.coach_chain_kind === "empty"
+                ? "idle"
+                : session.coach_chain_kind}
+            </span>
+          </div>
+
+          <div className="bg-amber-50 dark:bg-amber-500/5 border border-amber-200/60 dark:border-amber-500/20 rounded px-3 py-2 space-y-2">
+            {/* Activity row: calls, errors, message count */}
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                  Calls
+                </div>
+                <div className="tabular-nums text-zinc-700 dark:text-zinc-200">
+                  {session.coach_calls}
+                  {session.coach_errors > 0 && (
+                    <span className="text-red-500 dark:text-red-400 ml-1">
+                      · {session.coach_errors} err
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                  Chain
+                </div>
+                <div className="tabular-nums text-zinc-700 dark:text-zinc-200">
+                  {session.coach_chain_messages} msgs
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                  Last call
+                </div>
+                <div className="tabular-nums text-zinc-700 dark:text-zinc-200">
+                  {session.coach_last_called_at
+                    ? timeAgo(session.coach_last_called_at)
+                    : "—"}
+                  {session.coach_last_latency_ms !== null && (
+                    <span className="text-zinc-400 dark:text-zinc-500 ml-1">
+                      · {formatLatency(session.coach_last_latency_ms)}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Tokens row: last call vs cumulative. Only when we have any. */}
+            {(session.coach_last_usage ||
+              session.coach_total_usage.input_tokens > 0) && (
+              <div className="grid grid-cols-2 gap-2 text-xs border-t border-amber-200/40 dark:border-amber-500/10 pt-2">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                    Last call tokens
+                  </div>
+                  <div className="tabular-nums text-zinc-700 dark:text-zinc-200">
+                    {session.coach_last_usage ? (
+                      <>
+                        {formatTokens(session.coach_last_usage.input_tokens)} in
+                        {" / "}
+                        {formatTokens(session.coach_last_usage.output_tokens)} out
+                        {session.coach_last_usage.cached_input_tokens > 0 && (
+                          <span className="text-zinc-400 dark:text-zinc-500 ml-1">
+                            · {formatTokens(session.coach_last_usage.cached_input_tokens)} cached
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      "—"
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                    Cumulative tokens
+                  </div>
+                  <div className="tabular-nums text-zinc-700 dark:text-zinc-200">
+                    {formatTokens(session.coach_total_usage.input_tokens)} in
+                    {" / "}
+                    {formatTokens(session.coach_total_usage.output_tokens)} out
+                    {session.coach_total_usage.cached_input_tokens > 0 && (
+                      <span className="text-zinc-400 dark:text-zinc-500 ml-1">
+                        · {formatTokens(session.coach_total_usage.cached_input_tokens)} cached
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Last assessment text — the thing the user actually wants to read. */}
+            {session.coach_last_assessment && (
+              <div className="border-t border-amber-200/40 dark:border-amber-500/10 pt-2">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-1">
+                  Last assessment
+                </div>
+                <div className="text-xs text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
+                  {session.coach_last_assessment}
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* Tools */}
       {toolEntries.length > 0 && (
