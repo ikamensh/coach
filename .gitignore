@@ -3,3 +3,10 @@ dist/
 src-tauri/target/
 *.tsbuildinfo
 .DS_Store
+
+# Per-machine Claude Code state (settings.local.json, worktrees, etc.)
+.claude/
+
+# Tauri build artifacts: tauri-build regenerates these from
+# src-tauri/capabilities/ on every cargo build.
+src-tauri/gen/
