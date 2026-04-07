@@ -52,9 +52,9 @@ pub fn run() {
 
             // Top up Coach's managed hooks if the user has previously
             // opted in. Adds anything we've added to the managed set
-            // since they last installed (e.g. SessionStart) without
-            // making them click "Install Hooks" again. No-op on
-            // unconfigured machines — first install stays explicit.
+            // since they last installed without making them click
+            // "Install Hooks" again. No-op on unconfigured machines —
+            // first install stays explicit.
             match settings::topup_managed_hooks(port) {
                 Ok(added) if !added.is_empty() => {
                     eprintln!("[coach] setup: topped up managed hooks: {added:?}");
@@ -132,14 +132,27 @@ pub fn run() {
 /// just want the daemon should run.
 ///
 /// Blocks until either the server task exits, the scanner task exits,
-/// or the process receives Ctrl-C.
-pub async fn serve(port_override: Option<u16>) {
+/// or the process receives Ctrl-C. Returns `Err` so the CLI exits
+/// non-zero on bind failure or worker panic — that was the regression
+/// the A5 user story caught.
+pub async fn serve(port_override: Option<u16>) -> Result<(), String> {
     let mut settings = Settings::load();
     if let Some(p) = port_override {
         settings.port = p;
     }
     let port = settings.port;
-    eprintln!("[coach serve] starting on 127.0.0.1:{port}, priorities={:?}", settings.priorities);
+
+    // Pre-bind the listener BEFORE printing the banner or spawning any
+    // worker tasks. A port collision now becomes a clean Err propagated
+    // out through `cmd_serve` to a non-zero exit code with a readable
+    // message, instead of the previous "spawn → panic in worker → log
+    // it → exit 0" path.
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+
+    eprintln!("[coach serve] listening on {addr}, priorities={:?}", settings.priorities);
 
     let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(settings)));
 
@@ -158,7 +171,7 @@ pub async fn serve(port_override: Option<u16>) {
 
     let server_task = tokio::spawn({
         let s = state.clone();
-        async move { server::start_server(s, None, port).await }
+        async move { server::serve_on_listener(listener, s, None, port).await }
     });
     let scanner_task = tokio::spawn({
         let s = state.clone();
@@ -168,12 +181,13 @@ pub async fn serve(port_override: Option<u16>) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             eprintln!("[coach serve] received Ctrl-C, shutting down");
+            Ok(())
         }
         r = server_task => {
-            eprintln!("[coach serve] hook server task exited: {r:?}");
+            Err(format!("hook server task exited unexpectedly: {r:?}"))
         }
         r = scanner_task => {
-            eprintln!("[coach serve] scanner task exited: {r:?}");
+            Err(format!("scanner task exited unexpectedly: {r:?}"))
         }
     }
 }

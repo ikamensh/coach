@@ -116,15 +116,15 @@ fn run(result: Result<(), String>) -> i32 {
 /// Run the daemon without Tauri. Each invocation owns its own
 /// multi-thread tokio runtime — server + scanner need to make progress
 /// concurrently. Blocks until Ctrl-C or one of the long-running tasks
-/// exits.
+/// exits. Errors from `crate::serve` (notably bind failures) propagate
+/// here so the process exits non-zero with a readable message.
 fn cmd_serve(args: &[String]) -> Result<(), String> {
     let port_override = parse_named_u32(args, "--port")?.map(|p| p as u16);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
-    runtime.block_on(crate::serve(port_override));
-    Ok(())
+    runtime.block_on(crate::serve(port_override))
 }
 
 // ── status / mode (HTTP-only) ───────────────────────────────────────────

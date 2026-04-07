@@ -527,6 +527,48 @@ fn cli_serve_starts_headless_daemon_and_round_trips_config() {
     }
 }
 
+/// Regression test for the A5 user story: `coach serve --port N` must
+/// exit non-zero with a readable error when the requested port is
+/// already in use, instead of panicking inside a worker task and
+/// silently exiting 0.
+///
+/// We grab a free port via a stdlib `TcpListener`, then point `coach
+/// serve` at the same port. The bind in `lib::serve` runs before any
+/// worker is spawned, so failure should be immediate and clean.
+#[test]
+fn cli_serve_exits_nonzero_on_port_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+
+    // Hold the port from this process so the spawned `coach serve`
+    // cannot bind it. The listener is dropped at the end of the test
+    // automatically.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let output = Command::new(coach_bin())
+        .args(["serve", "--port", &port.to_string()])
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("failed to spawn `coach serve`");
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "expected non-zero exit on bind failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bind") || stderr.contains("in use"),
+        "expected a bind / in-use error in stderr, got: {stderr}"
+    );
+
+    // Sanity: the held listener is still ours.
+    drop(listener);
+}
+
 /// Property: `coach serve` exits cleanly when its process is killed
 /// (no orphaned listener on the port). Catches a regression where the
 /// HTTP server kept the port held after the parent CLI process died.

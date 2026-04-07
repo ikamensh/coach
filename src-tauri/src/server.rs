@@ -78,6 +78,11 @@ pub(crate) fn emit_update(emitter: &Option<tauri::AppHandle>, coach: &crate::sta
 /// configured resolver (lsof in production, hash-of-sid in tests).
 /// Returns None if the resolver fails — the caller should drop the
 /// event from session-list bookkeeping rather than create a phantom row.
+///
+/// Logs once per new `session_id`, on the first successful resolution.
+/// This is the only signal `coach serve`'s stderr emits per inbound
+/// hook event, which is enough to debug "is Coach actually seeing
+/// claude's hooks?" without drowning the log in per-event noise.
 async fn resolve_pid(state: &AppState, sid: &str, peer_port: u16) -> Option<u32> {
     {
         let coach = state.coach.read().await;
@@ -85,7 +90,11 @@ async fn resolve_pid(state: &AppState, sid: &str, peer_port: u16) -> Option<u32>
             return Some(pid);
         }
     }
-    (state.resolver)(peer_port, sid)
+    let pid = (state.resolver)(peer_port, sid);
+    if let Some(p) = pid {
+        eprintln!("[coach] resolved sid {sid} → pid {p} (peer port {peer_port})");
+    }
+    pid
 }
 
 /// Shared by Claude `/hook/permission-request` and Cursor `/cursor/hook/*` permission analogues.
@@ -693,17 +702,35 @@ pub fn create_router_headless(coach: SharedState, resolver: PidResolver) -> Rout
 /// Bind the production hook server. Pass `Some(app_handle)` from the
 /// Tauri GUI path to get state-update events emitted to the frontend;
 /// pass `None` for headless `coach serve` mode (CLI / VM tests / CI).
+///
+/// The Tauri GUI calls this from `lib.rs::run()` and panics on bind
+/// failure (the GUI has no clean way to surface the error). The
+/// headless `serve()` path pre-binds the listener itself via
+/// `serve_on_listener` so port collisions become a non-zero CLI exit
+/// with a clear error, not a panic-then-exit-0.
 pub async fn start_server(
     coach: SharedState,
     app_handle: Option<tauri::AppHandle>,
     port: u16,
 ) {
-    let app = build_router(coach, app_handle, lsof_resolver(port));
     let addr = format!("127.0.0.1:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
     eprintln!("Coach hook server listening on {}", addr);
+    serve_on_listener(listener, coach, app_handle, port).await;
+}
+
+/// Serve hook traffic on an already-bound listener. Used by the
+/// headless `serve()` path so it can pre-bind, fail fast on port
+/// collisions, and *then* announce success.
+pub async fn serve_on_listener(
+    listener: tokio::net::TcpListener,
+    coach: SharedState,
+    app_handle: Option<tauri::AppHandle>,
+    port: u16,
+) {
+    let app = build_router(coach, app_handle, lsof_resolver(port));
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

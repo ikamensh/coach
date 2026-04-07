@@ -34,10 +34,16 @@ fn expected_hook_urls(port: u16) -> Vec<(&'static str, String)> {
         ("Stop", format!("{}/hook/stop", base)),
         ("PostToolUse", format!("{}/hook/post-tool-use", base)),
         ("UserPromptSubmit", format!("{}/hook/user-prompt-submit", base)),
-        // SessionStart fires immediately on /clear, /resume, /compact, and
-        // launch — Coach uses it to detect new conversations within a
-        // window without waiting for the next tool call.
-        ("SessionStart", format!("{}/hook/session-start", base)),
+        // NOTE: SessionStart used to be in this list — fast `/clear`
+        // detection. Removed because Claude Code 2.1.92+ silently drops
+        // HTTP hooks for SessionStart (its debug log says
+        // "HTTP hooks are not supported for SessionStart"). Installing
+        // it produced a misleading ✓ in `coach hooks status` for a hook
+        // that would never fire. `/clear` is now detected lazily on the
+        // next tool call via the session_id-mismatch path in
+        // `state::apply_hook_event`. The HTTP route + handler in
+        // server.rs are still wired up because Cursor honours its own
+        // `sessionStart` hook — see `cursor_hook_events`.
     ]
 }
 
@@ -836,7 +842,9 @@ mod tests {
         let status = check_hook_status_at(7700, std::path::Path::new("/nonexistent/path.json"));
         assert!(!status.installed);
         assert!(status.hooks.iter().all(|h| !h.installed));
-        assert_eq!(status.hooks.len(), 5); // PermissionRequest, Stop, PostToolUse, UserPromptSubmit, SessionStart
+        // PermissionRequest, Stop, PostToolUse, UserPromptSubmit
+        // (SessionStart was removed — see comment on expected_hook_urls)
+        assert_eq!(status.hooks.len(), 4);
     }
 
     /// After install_hooks_at writes hooks to a temp file, check_hook_status_at
@@ -867,7 +875,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
         // Each event should have exactly one entry.
-        for event in ["PermissionRequest", "Stop", "PostToolUse", "UserPromptSubmit", "SessionStart"] {
+        for event in ["PermissionRequest", "Stop", "PostToolUse", "UserPromptSubmit"] {
             let arr = content["hooks"][event].as_array().unwrap();
             assert_eq!(arr.len(), 1, "event {event} should have exactly 1 entry after double install");
         }
@@ -1000,21 +1008,21 @@ mod tests {
 
         let added = topup_managed_hooks_at(7700, &path).unwrap();
 
-        // The other four managed hooks should be reported as added.
+        // The other three managed hooks should be reported as added.
+        // (Was four including SessionStart — see expected_hook_urls.)
         let mut sorted = added.clone();
         sorted.sort();
         assert_eq!(
             sorted,
             vec![
                 "PermissionRequest".to_string(),
-                "SessionStart".to_string(),
                 "Stop".to_string(),
                 "UserPromptSubmit".to_string(),
             ]
         );
 
         let status = check_hook_status_at(7700, &path);
-        assert!(status.installed, "all five hooks should now be installed");
+        assert!(status.installed, "all four managed hooks should now be installed");
     }
 
     /// Idempotent: running top-up again right after returns no additions.
