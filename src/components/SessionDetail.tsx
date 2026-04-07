@@ -53,7 +53,7 @@ export function SessionDetail() {
   return (
     <div className="flex flex-col gap-4 h-full overflow-y-auto">
       <TopBar
-        title={session.display_name}
+        title={session.coach_session_title ?? session.display_name}
         onBack={() => setView("main")}
         rightSlot={
           <button

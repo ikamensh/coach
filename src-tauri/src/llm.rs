@@ -801,6 +801,119 @@ pub async fn evaluate_stop_chained(
     Ok((decision, new_chain, usage))
 }
 
+// ── Session title (periodic) ────────────────────────────────────────────
+
+/// Snapshot of session signal we feed the namer. Kept tiny on purpose:
+/// the namer's job is to compress, not to read code. Built by the caller
+/// from the live `SessionState` so this module doesn't have to know about
+/// it.
+pub struct NameSessionInput {
+    pub priorities: Vec<String>,
+    pub cwd: Option<String>,
+    pub tool_counts: HashMap<String, usize>,
+    /// The most recent observer assessment, if any. The single best signal
+    /// for "what is this conversation actually about" because it already
+    /// encodes the observer's running interpretation.
+    pub last_assessment: Option<String>,
+}
+
+/// Build the prompt for `name_session`. Pure function so the test can
+/// pin its shape without making a real LLM call.
+pub fn build_name_session_prompt(input: &NameSessionInput) -> String {
+    let cwd = input.cwd.as_deref().unwrap_or("unknown");
+    let priorities = if input.priorities.is_empty() {
+        "(none set)".to_string()
+    } else {
+        input.priorities.join(", ")
+    };
+    let tools = if input.tool_counts.is_empty() {
+        "none yet".to_string()
+    } else {
+        let mut counts: Vec<(&String, &usize)> = input.tool_counts.iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(a.1));
+        counts
+            .iter()
+            .take(5)
+            .map(|(name, n)| format!("{name}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let assessment = input
+        .last_assessment
+        .as_deref()
+        .unwrap_or("(no assessment yet)");
+    format!(
+        "Summarize the primary topic of this coding session as a title of AT MOST 4 words.\n\
+         Reply with the title only — no quotes, no punctuation, no explanation.\n\n\
+         cwd: {cwd}\n\
+         priorities: {priorities}\n\
+         tools used: {tools}\n\
+         latest observer note: {assessment}"
+    )
+}
+
+/// Post-process the model's reply into a clean title: trim whitespace,
+/// strip surrounding quotes and trailing punctuation, drop a leading
+/// "Title:" label some models add, and cap at 4 words.
+///
+/// Returns `None` if the cleaned result is empty so the caller can leave
+/// the previous title in place rather than overwriting with garbage.
+pub fn clean_session_title(raw: &str) -> Option<String> {
+    // Strip code fences first — some models wrap short answers in ```.
+    let unfenced = strip_code_fence(raw.trim()).unwrap_or(raw.trim());
+
+    // Drop a "Title:" / "title -" prefix if present.
+    let after_label = unfenced
+        .strip_prefix("Title:")
+        .or_else(|| unfenced.strip_prefix("title:"))
+        .unwrap_or(unfenced)
+        .trim();
+
+    // Trim surrounding quotes / brackets, then trailing punctuation.
+    let trimmed = after_label
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '*')
+        .trim_end_matches(|c: char| c == '.' || c == ',' || c == ';' || c == ':')
+        .trim();
+
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let words: Vec<&str> = trimmed.split_whitespace().take(4).collect();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
+}
+
+/// Ask the coach to name the session in <=4 words. Stateless: uses a
+/// fresh `CoachChain::Empty` so the title turn never pollutes the
+/// observer chain that `evaluate_stop_chained` reads. Returns the cleaned
+/// title plus token usage.
+pub async fn name_session(
+    state: &SharedState,
+    input: &NameSessionInput,
+) -> Result<(String, crate::state::CoachUsage), String> {
+    let prompt = build_name_session_prompt(input);
+    // Tiny system prompt — the namer doesn't need the full coach preamble.
+    let system = "You name coding sessions. Respond with at most four words.";
+    let (text, _chain, usage) = session_send(
+        state,
+        &crate::state::CoachChain::Empty,
+        system,
+        &prompt,
+        CallConstraints {
+            max_output_tokens: Some(20),
+            require_json: false,
+        },
+    )
+    .await?;
+    let cleaned = clean_session_title(&text)
+        .ok_or_else(|| format!("name_session: empty title after cleaning: {text:?}"))?;
+    Ok((cleaned, usage))
+}
+
 /// Parse a StopDecision from a model response, tolerating models that
 /// wrap JSON in ```json … ``` fences (Anthropic does this sometimes).
 fn parse_stop_decision(text: &str) -> Result<StopDecision, String> {
@@ -1004,6 +1117,112 @@ mod tests {
         assert_eq!(strip_code_fence("x"), None);
         // Missing closing fence → None (caller can still try to parse as-is).
         assert_eq!(strip_code_fence("```json\nx"), None);
+    }
+
+    // ── Session title (name_session) ────────────────────────────────────
+
+    fn name_input(
+        priorities: Vec<&str>,
+        cwd: Option<&str>,
+        tools: &[(&str, usize)],
+        last_assessment: Option<&str>,
+    ) -> NameSessionInput {
+        NameSessionInput {
+            priorities: priorities.into_iter().map(String::from).collect(),
+            cwd: cwd.map(String::from),
+            tool_counts: tools.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            last_assessment: last_assessment.map(String::from),
+        }
+    }
+
+    /// The namer prompt must surface every signal the model is supposed
+    /// to use: cwd, priorities, top tools, and the latest assessment.
+    /// Wording is free to evolve; this only pins the contents.
+    #[test]
+    fn build_name_session_prompt_includes_signal() {
+        let input = name_input(
+            vec!["Simplicity"],
+            Some("/projects/coach"),
+            &[("Edit", 12), ("Read", 5)],
+            Some("investigating the auth bug"),
+        );
+        let p = build_name_session_prompt(&input);
+        for needle in [
+            "/projects/coach",
+            "Simplicity",
+            "Edit",
+            "12",
+            "investigating the auth bug",
+            "4 words",
+        ] {
+            assert!(p.contains(needle), "prompt missing {needle:?}: {p}");
+        }
+    }
+
+    /// Empty inputs must produce sensible placeholders, not blank lines
+    /// the model might interpret as missing fields. The namer should
+    /// never receive "tools used: \n".
+    #[test]
+    fn build_name_session_prompt_handles_empty_input() {
+        let input = name_input(vec![], None, &[], None);
+        let p = build_name_session_prompt(&input);
+        assert!(p.contains("none set"));
+        assert!(p.contains("none yet"));
+        assert!(p.contains("unknown"));
+        assert!(p.contains("(no assessment yet)"));
+    }
+
+    /// Property: clean_session_title is idempotent on already-clean input.
+    /// Once cleaned, re-cleaning must not change the title further.
+    #[test]
+    fn clean_session_title_is_idempotent() {
+        for raw in ["auth refactor", "fix login bug", "one"] {
+            let once = clean_session_title(raw).unwrap();
+            let twice = clean_session_title(&once).unwrap();
+            assert_eq!(once, twice, "second clean changed: {raw:?}");
+        }
+    }
+
+    /// Property: clean_session_title never returns more than 4 words.
+    /// This is the hard cap the user asked for.
+    #[test]
+    fn clean_session_title_caps_at_four_words() {
+        let raw = "refactoring the authentication middleware to satisfy compliance";
+        let cleaned = clean_session_title(raw).unwrap();
+        assert_eq!(cleaned.split_whitespace().count(), 4);
+        assert_eq!(cleaned, "refactoring the authentication middleware");
+    }
+
+    /// Models love to wrap short answers — strip quotes, fences, "Title:"
+    /// labels, and trailing punctuation regardless of which combo arrives.
+    #[test]
+    fn clean_session_title_strips_common_wrappers() {
+        let cases = [
+            ("\"auth refactor\"", "auth refactor"),
+            ("'auth refactor'", "auth refactor"),
+            ("Title: auth refactor", "auth refactor"),
+            ("title: auth refactor.", "auth refactor"),
+            ("```\nauth refactor\n```", "auth refactor"),
+            ("```text\nauth refactor\n```", "auth refactor"),
+            ("**auth refactor**", "auth refactor"),
+            ("auth refactor.", "auth refactor"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                clean_session_title(raw).as_deref(),
+                Some(expected),
+                "raw: {raw:?}",
+            );
+        }
+    }
+
+    /// Empty / whitespace-only / pure-punctuation replies must come back
+    /// as `None` so the caller leaves the previous title untouched.
+    #[test]
+    fn clean_session_title_rejects_empty_payloads() {
+        for raw in ["", "   ", "\"\"", "...", "**"] {
+            assert_eq!(clean_session_title(raw), None, "raw should be empty: {raw:?}");
+        }
     }
 
     /// warn_emulation_once must only fire once per provider per process.

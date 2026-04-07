@@ -379,6 +379,17 @@ async fn handle_stop(
     run_stop(&state, pid, payload).await
 }
 
+/// Session-title cadence: one call early so a useful title shows up
+/// quickly, then every `TITLE_INTERVAL_EVENTS` after that. Pure function
+/// so the rule is testable without spinning up the server.
+pub(crate) const TITLE_FIRST_EVENT: usize = 5;
+pub(crate) const TITLE_INTERVAL_EVENTS: usize = 15;
+
+pub(crate) fn should_request_title(event_count: usize) -> bool {
+    event_count == TITLE_FIRST_EVENT
+        || (event_count > TITLE_FIRST_EVENT && event_count % TITLE_INTERVAL_EVENTS == 0)
+}
+
 pub(crate) async fn run_post_tool_use(
     state: &AppState,
     pid: u32,
@@ -389,13 +400,14 @@ pub(crate) async fn run_post_tool_use(
     let tool_input = payload.tool_input.unwrap_or(serde_json::Value::Null);
 
     let observer_input;
+    let namer_input;
     let rule_message;
     {
         let mut coach = state.coach.write().await;
-        let prev_chain = {
+        let (prev_chain, event_count) = {
             let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
             *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
-            session.coach_chain.clone()
+            (session.coach_chain.clone(), session.event_count)
         };
 
         rule_message = check_rules(&coach.rules, &tool, &tool_input);
@@ -414,15 +426,32 @@ pub(crate) async fn run_post_tool_use(
         // Decide if we should fire the observer. Requires LLM mode + a
         // provider that supports stateful coach chains (OpenAI Responses
         // or Anthropic with prompt caching, currently).
-        observer_input = if coach.coach_mode == EngineMode::Llm
+        let llm_active = coach.coach_mode == EngineMode::Llm
             && crate::settings::OBSERVER_CAPABLE_PROVIDERS
-                .contains(&coach.model.provider.as_str())
-        {
+                .contains(&coach.model.provider.as_str());
+
+        observer_input = if llm_active {
             Some(ObserverInput {
                 pid,
                 priorities: coach.priorities.clone(),
                 prev_chain,
                 event: crate::llm::build_observer_event(&tool, &tool_input),
+            })
+        } else {
+            None
+        };
+
+        // Periodic title generation. Same provider/mode gate as the
+        // observer (one switch to disable both), but the title call is
+        // stateless so the namer turn never enters the observer chain
+        // that the Stop hook reads.
+        namer_input = if llm_active && should_request_title(event_count) {
+            let session = coach.sessions.get(&pid).expect("apply_hook_event populated");
+            Some(crate::llm::NameSessionInput {
+                priorities: coach.priorities.clone(),
+                cwd: session.cwd.clone(),
+                tool_counts: session.tool_counts.clone(),
+                last_assessment: session.coach_last_assessment.clone(),
             })
         } else {
             None
@@ -438,6 +467,14 @@ pub(crate) async fn run_post_tool_use(
         let emitter = state.emitter.clone();
         tokio::spawn(async move {
             run_observer(coach_state, emitter, input).await;
+        });
+    }
+
+    if let Some(input) = namer_input {
+        let coach_state = state.coach.clone();
+        let emitter = state.emitter.clone();
+        tokio::spawn(async move {
+            run_session_namer(coach_state, emitter, pid, input).await;
         });
     }
 
@@ -508,6 +545,43 @@ async fn run_observer(
                 sess.coach_last_error = Some(e.clone());
             }
             s.log(input.pid, "Observer", "error", Some(e));
+            emit_update(&emitter, &s);
+        }
+    }
+}
+
+/// Periodic session-title generation. Stateless LLM call (fresh chain),
+/// fire-and-forget like the observer. On success, writes the cleaned
+/// title to `coach_session_title`. On failure, surfaces the error in
+/// `coach_last_error` and increments `coach_errors` so the existing
+/// telemetry panel reflects it — same shape as `run_observer`.
+async fn run_session_namer(
+    coach: SharedState,
+    emitter: Option<tauri::AppHandle>,
+    pid: u32,
+    input: crate::llm::NameSessionInput,
+) {
+    match crate::llm::name_session(&coach, &input).await {
+        Ok((title, usage)) => {
+            let mut s = coach.write().await;
+            if let Some(sess) = s.sessions.get_mut(&pid) {
+                sess.coach_session_title = Some(title.clone());
+                sess.coach_calls += 1;
+                sess.coach_last_called_at = Some(chrono::Utc::now());
+                sess.coach_last_usage = Some(usage);
+                sess.coach_total_usage += usage;
+            }
+            s.log(pid, "Namer", "renamed", Some(title));
+            emit_update(&emitter, &s);
+        }
+        Err(e) => {
+            eprintln!("[coach] name_session failed: {e}");
+            let mut s = coach.write().await;
+            if let Some(sess) = s.sessions.get_mut(&pid) {
+                sess.coach_errors += 1;
+                sess.coach_last_error = Some(e.clone());
+            }
+            s.log(pid, "Namer", "error", Some(e));
             emit_update(&emitter, &s);
         }
     }
@@ -776,4 +850,34 @@ pub async fn serve_on_listener(
     )
     .await
     .expect("Hook server crashed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cadence rule has three contracts: never fire on the first few
+    /// hooks (the session has nothing to summarize), fire exactly once at
+    /// the early-trigger anchor, then fire on a steady interval.
+    #[test]
+    fn should_request_title_cadence() {
+        // No early firing — too little context to summarize.
+        for n in 0..TITLE_FIRST_EVENT {
+            assert!(!should_request_title(n), "fired too early at n={n}");
+        }
+        // First anchor.
+        assert!(should_request_title(TITLE_FIRST_EVENT));
+        // Quiet between the anchor and the next interval boundary.
+        for n in (TITLE_FIRST_EVENT + 1)..TITLE_INTERVAL_EVENTS {
+            assert!(!should_request_title(n), "spurious fire at n={n}");
+        }
+        // Interval boundaries fire.
+        for k in 1..6 {
+            let n = TITLE_INTERVAL_EVENTS * k;
+            assert!(should_request_title(n), "missed interval at n={n}");
+        }
+        // Off-by-one around an interval boundary stays quiet.
+        assert!(!should_request_title(TITLE_INTERVAL_EVENTS - 1));
+        assert!(!should_request_title(TITLE_INTERVAL_EVENTS + 1));
+    }
 }

@@ -97,7 +97,7 @@ export function SessionList() {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between gap-2">
                   <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">
-                    {session.display_name}
+                    {session.coach_session_title ?? session.display_name}
                   </div>
                   <button
                     onClick={(e) => {

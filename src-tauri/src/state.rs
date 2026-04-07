@@ -141,6 +141,9 @@ pub struct SessionSnapshot {
     pub cwd_history: Vec<String>,
     pub coach_last_assessment: Option<String>,
     pub coach_last_error: Option<String>,
+    /// Periodic 4-words-or-fewer topic produced by the coach LLM.
+    /// `None` until the first successful title call.
+    pub coach_session_title: Option<String>,
     /// Tag for the active chain backend ("empty" / "openai" / "anthropic").
     pub coach_chain_kind: String,
     /// Number of messages the coach holds in its conversation. For Anthropic
@@ -225,6 +228,11 @@ pub struct SessionState {
     /// `coach_last_assessment` rather than replacing it — a stale successful
     /// assessment plus a fresh error is a valid state worth seeing.
     pub coach_last_error: Option<String>,
+    /// 4-words-or-fewer topic for the current conversation, produced by
+    /// a periodic stateless LLM call. `None` until the first successful
+    /// title call. The frontend prefers this over the path-derived
+    /// `display_name` when set. Reset on `/clear`.
+    pub coach_session_title: Option<String>,
     /// Counts every successful coach LLM call on this session — observer
     /// events plus chained stop evaluations. Reset on `/clear`.
     pub coach_calls: usize,
@@ -435,6 +443,7 @@ impl CoachState {
                 sess.coach_chain = CoachChain::Empty;
                 sess.coach_last_assessment = None;
                 sess.coach_last_error = None;
+                sess.coach_session_title = None;
                 sess.coach_calls = 0;
                 sess.coach_errors = 0;
                 sess.coach_last_called_at = None;
@@ -473,6 +482,7 @@ impl CoachState {
                         coach_chain: CoachChain::Empty,
                         coach_last_assessment: None,
                         coach_last_error: None,
+                        coach_session_title: None,
                         coach_calls: 0,
                         coach_errors: 0,
                         coach_last_called_at: None,
@@ -510,6 +520,7 @@ impl CoachState {
                 cwd_history: s.cwd_history.clone(),
                 coach_last_assessment: s.coach_last_assessment.clone(),
                 coach_last_error: s.coach_last_error.clone(),
+                coach_session_title: s.coach_session_title.clone(),
                 coach_chain_kind: s.coach_chain.kind().to_string(),
                 coach_chain_messages: match &s.coach_chain {
                     // Anthropic + Google both store the literal turn list —
@@ -644,6 +655,7 @@ impl CoachState {
                 coach_chain: CoachChain::Empty,
                 coach_last_assessment: None,
                 coach_last_error: None,
+                coach_session_title: None,
                 coach_calls: 0,
                 coach_errors: 0,
                 coach_last_called_at: None,
@@ -1065,6 +1077,7 @@ mod tests {
                 ],
             };
             s.coach_last_assessment = Some("looks fine".into());
+            s.coach_session_title = Some("auth refactor".into());
             s.coach_calls = 2;
             s.coach_errors = 1;
             s.coach_last_called_at = Some(now);
@@ -1087,6 +1100,7 @@ mod tests {
         assert_eq!(sess.coach_last_usage, Some(usage));
         assert_eq!(sess.coach_total_usage.input_tokens, 200);
         assert_eq!(sess.coach_last_assessment.as_deref(), Some("looks fine"));
+        assert_eq!(sess.coach_session_title.as_deref(), Some("auth refactor"));
 
         // Round-trip through JSON: catches any serde-incompatible field
         // shapes we might introduce later.
@@ -1121,6 +1135,7 @@ mod tests {
         {
             let s = state.sessions.get_mut(&9).unwrap();
             s.coach_chain = CoachChain::OpenAi { response_id: "resp_old".into() };
+            s.coach_session_title = Some("old topic".into());
             s.coach_calls = 7;
             s.coach_errors = 2;
             s.coach_last_called_at = Some(Utc::now());
@@ -1144,6 +1159,10 @@ mod tests {
         assert!(s.coach_last_latency_ms.is_none());
         assert!(s.coach_last_usage.is_none());
         assert_eq!(s.coach_total_usage, CoachUsage::default());
+        assert!(
+            s.coach_session_title.is_none(),
+            "/clear must drop the previous conversation's LLM title"
+        );
     }
 
     // ── from_settings / to_settings roundtrip ───────────────────────────

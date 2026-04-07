@@ -46,6 +46,8 @@ interface SessionSnapshot {
   cwd_history: string[];
   coach_last_assessment: string | null;
   coach_last_error: string | null;
+  /** Periodic LLM-generated 4-words-or-fewer topic. Frontend prefers this over `display_name`. */
+  coach_session_title: string | null;
   /// "empty" | "openai" | "anthropic" — which backend the chain is using.
   coach_chain_kind: string;
   /// Number of messages currently held in the coach's conversation.
