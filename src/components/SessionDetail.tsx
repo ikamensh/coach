@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useCoachStore } from "../store/useCoachStore";
 import { formatDuration, timeAgo } from "./SessionList";
+import { TopBar } from "./TopBar";
 
 function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -23,17 +24,7 @@ export function SessionDetail() {
   if (!session) {
     return (
       <div className="flex flex-col gap-4 h-full">
-        <div className="flex items-center justify-between">
-          <h1 className="text-lg font-semibold text-zinc-800 dark:text-zinc-100">
-            Session
-          </h1>
-          <button
-            onClick={() => selectSession(null)}
-            className="text-sm text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
-          >
-            Back
-          </button>
-        </div>
+        <TopBar title="Session" onBack={() => selectSession(null)} />
         <p className="text-sm text-zinc-400 dark:text-zinc-500 italic text-center py-8">
           Session no longer active.
         </p>
@@ -49,35 +40,27 @@ export function SessionDetail() {
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-y-auto">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2 min-w-0">
+      <TopBar
+        title={session.display_name}
+        onBack={() => selectSession(null)}
+        rightSlot={
           <button
-            onClick={() => selectSession(null)}
-            className="text-sm text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 flex-shrink-0"
+            onClick={() =>
+              setSessionMode(
+                session.pid,
+                session.mode === "present" ? "away" : "present",
+              )
+            }
+            className={`text-xs px-2.5 py-1 rounded-md font-medium transition-colors flex-shrink-0 ${
+              session.mode === "away"
+                ? "bg-amber-500/20 text-amber-600 dark:text-amber-400 hover:bg-amber-500/30"
+                : "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/30"
+            }`}
           >
-            Back
+            {session.mode === "away" ? "Away" : "Present"}
           </button>
-          <h1 className="text-lg font-semibold text-zinc-800 dark:text-zinc-100 truncate">
-            {session.display_name}
-          </h1>
-        </div>
-        <button
-          onClick={() =>
-            setSessionMode(
-              session.pid,
-              session.mode === "present" ? "away" : "present",
-            )
-          }
-          className={`text-xs px-2.5 py-1 rounded-md font-medium transition-colors flex-shrink-0 ${
-            session.mode === "away"
-              ? "bg-amber-500/20 text-amber-600 dark:text-amber-400 hover:bg-amber-500/30"
-              : "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/30"
-          }`}
-        >
-          {session.mode === "away" ? "Away" : "Present"}
-        </button>
-      </div>
+        }
+      />
 
       {/* Overview */}
       <section>

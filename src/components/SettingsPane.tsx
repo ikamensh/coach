@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useCoachStore } from "../store/useCoachStore";
 import type { TokenSource } from "../store/useCoachStore";
+import { TopBar } from "./TopBar";
 
 export const PROVIDERS = [
   {
@@ -167,17 +168,7 @@ export function SettingsPane() {
 
   return (
     <div className="flex flex-col gap-4 h-full">
-      <div className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold text-zinc-800 dark:text-zinc-100">
-          Settings
-        </h1>
-        <button
-          onClick={() => setView("main")}
-          className="text-sm text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
-        >
-          Back
-        </button>
-      </div>
+      <TopBar title="Settings" onBack={() => setView("main")} />
 
       {/* Model Selection */}
       <section>

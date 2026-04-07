@@ -88,6 +88,39 @@ async fn post_tool_use_creates_session() {
     assert_eq!(sessions[0]["event_count"], 1);
 }
 
+/// Cursor routes use session id → synthetic PID (subprocess curl is not the agent).
+#[tokio::test]
+async fn cursor_after_shell_tracks_session() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/cursor/hook/after-shell"))
+        .json(&serde_json::json!({
+            "sessionId": "cursor-sess-1",
+            "command": "echo hi",
+            "cwd": "/tmp/cursor-proj"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let snap: serde_json::Value = client
+        .get(format!("{base}/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sessions = snap["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], "cursor-sess-1");
+    assert_eq!(sessions[0]["pid"], fake_pid_for_sid("cursor-sess-1"));
+    assert_eq!(sessions[0]["cwd"], "/tmp/cursor-proj");
+}
+
 #[tokio::test]
 async fn multiple_sessions_tracked_independently() {
     let (base, _state) = start_test_server().await;
@@ -959,6 +992,236 @@ async fn user_prompt_submit_records_activity() {
     assert_eq!(activity[0]["hook_event"], "UserPromptSubmit");
     assert_eq!(activity[0]["action"], "user spoke");
     assert_eq!(activity[0]["detail"], "make the sessions stop jumping around");
+}
+
+// ── /api/* CLI-facing endpoints ────────────────────────────────────────
+//
+// These mirror the Tauri commands. The CLI uses them when Coach is
+// running so the GUI's in-memory state stays consistent with the file
+// on disk. Property checked: each POST changes both the snapshot the
+// next GET sees AND the underlying CoachState (so a save() call would
+// reflect the change).
+
+#[tokio::test]
+async fn api_set_priorities_updates_state_and_snapshot() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/config/priorities"))
+        .json(&serde_json::json!({ "priorities": ["X", "Y", "Z"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The POST response itself should reflect the new value.
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    let priorities: Vec<String> = snap["priorities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(priorities, vec!["X", "Y", "Z"]);
+
+    // And the in-memory state should be updated, so a subsequent GET sees it.
+    let snap2: serde_json::Value = client
+        .get(format!("{base}/api/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snap2["priorities"][0], "X");
+
+    // And the underlying CoachState (the same one a save() would persist).
+    let s = state.read().await;
+    assert_eq!(s.priorities, vec!["X", "Y", "Z"]);
+}
+
+#[tokio::test]
+async fn api_set_all_sessions_mode_flips_every_session() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Create two sessions in present mode (the default).
+    for sid in ["one", "two"] {
+        client
+            .post(format!("{base}/hook/post-tool-use"))
+            .json(&serde_json::json!({
+                "session_id": sid,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read"
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let resp = client
+        .post(format!("{base}/api/sessions/mode"))
+        .json(&serde_json::json!({ "mode": "away" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let s = state.read().await;
+    assert!(
+        s.sessions.values().all(|sess| sess.mode == coach_lib::state::CoachMode::Away),
+        "every session must be in away mode after the bulk POST"
+    );
+    assert_eq!(s.default_mode, coach_lib::state::CoachMode::Away);
+}
+
+#[tokio::test]
+async fn api_set_session_mode_targets_one_pid() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    for sid in ["alpha", "beta"] {
+        client
+            .post(format!("{base}/hook/post-tool-use"))
+            .json(&serde_json::json!({
+                "session_id": sid,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read"
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let alpha_pid = fake_pid_for_sid("alpha");
+    let beta_pid = fake_pid_for_sid("beta");
+
+    let resp = client
+        .post(format!("{base}/api/sessions/{alpha_pid}/mode"))
+        .json(&serde_json::json!({ "mode": "away" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let s = state.read().await;
+    assert_eq!(
+        s.sessions.get(&alpha_pid).unwrap().mode,
+        coach_lib::state::CoachMode::Away
+    );
+    assert_eq!(
+        s.sessions.get(&beta_pid).unwrap().mode,
+        coach_lib::state::CoachMode::Present,
+        "beta must NOT be touched by a per-pid POST to alpha"
+    );
+}
+
+#[tokio::test]
+async fn api_set_session_mode_404_for_unknown_pid() {
+    let (base, _state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/sessions/999999/mode"))
+        .json(&serde_json::json!({ "mode": "away" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown pid must yield 404, not silent no-op");
+}
+
+#[tokio::test]
+async fn api_set_model_updates_state() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/api/config/model"))
+        .json(&serde_json::json!({ "provider": "anthropic", "model": "claude-sonnet-4-6" }))
+        .send()
+        .await
+        .unwrap();
+
+    let s = state.read().await;
+    assert_eq!(s.model.provider, "anthropic");
+    assert_eq!(s.model.model, "claude-sonnet-4-6");
+}
+
+#[tokio::test]
+async fn api_set_api_token_inserts_and_clears() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/api/config/api-token"))
+        .json(&serde_json::json!({ "provider": "openai", "token": "sk-test" }))
+        .send()
+        .await
+        .unwrap();
+    {
+        let s = state.read().await;
+        assert_eq!(s.api_tokens.get("openai").map(String::as_str), Some("sk-test"));
+    }
+
+    // Empty token deletes the entry — matches the Tauri command behavior.
+    client
+        .post(format!("{base}/api/config/api-token"))
+        .json(&serde_json::json!({ "provider": "openai", "token": "" }))
+        .send()
+        .await
+        .unwrap();
+    let s = state.read().await;
+    assert!(s.api_tokens.get("openai").is_none());
+}
+
+#[tokio::test]
+async fn api_set_coach_mode_round_trip() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/api/config/coach-mode"))
+        .json(&serde_json::json!({ "coach_mode": "llm" }))
+        .send()
+        .await
+        .unwrap();
+    {
+        let s = state.read().await;
+        assert_eq!(s.coach_mode, coach_lib::settings::EngineMode::Llm);
+    }
+
+    client
+        .post(format!("{base}/api/config/coach-mode"))
+        .json(&serde_json::json!({ "coach_mode": "rules" }))
+        .send()
+        .await
+        .unwrap();
+    let s = state.read().await;
+    assert_eq!(s.coach_mode, coach_lib::settings::EngineMode::Rules);
+}
+
+#[tokio::test]
+async fn api_set_rules_replaces_rule_list() {
+    let (base, state) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/api/config/rules"))
+        .json(&serde_json::json!({
+            "rules": [
+                { "id": "outdated_models", "enabled": false },
+                { "id": "custom_one", "enabled": true }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let s = state.read().await;
+    assert_eq!(s.rules.len(), 2);
+    assert!(s.rules.iter().any(|r| r.id == "outdated_models" && !r.enabled));
+    assert!(s.rules.iter().any(|r| r.id == "custom_one" && r.enabled));
 }
 
 #[tokio::test]

@@ -394,6 +394,96 @@ pub async fn chain_openai(
     Ok(ChainCall { text, response_id })
 }
 
+// ── Stateful chain via Anthropic + prompt caching ──────────────────────
+
+/// Low-level call into Anthropic's messages API. Anthropic has no
+/// server-side conversation state, so the caller maintains the message
+/// history and passes the running list in. The first call writes the
+/// cache breakpoint via `with_automatic_caching()`; subsequent calls
+/// hit the cache and pay ~10% of full input rate for the prefix.
+///
+/// Returns the assistant text and a NEW history vec with the user
+/// message and the assistant response appended.
+pub async fn chain_anthropic(
+    state: &SharedState,
+    system: Option<&str>,
+    history: &[crate::state::CoachMessage],
+    new_message: &str,
+    max_output_tokens: Option<u32>,
+) -> Result<(String, Vec<crate::state::CoachMessage>), String> {
+    use rig::agent::AgentBuilder;
+    use rig::client::CompletionClient;
+    use rig::completion::{AssistantContent, Completion};
+    use rig::message::Message as RigMessage;
+
+    let cfg = snapshot_config(state).await?;
+    if cfg.primary.provider != "anthropic" {
+        return Err(format!(
+            "chain_anthropic requires the Anthropic provider; current: {}",
+            cfg.primary.provider
+        ));
+    }
+
+    let client = anthropic::Client::new(&cfg.primary_token).map_err(|e| fmt_err("anthropic", e))?;
+    let model = client
+        .completion_model(&cfg.primary.model)
+        .with_automatic_caching();
+
+    let mut builder = AgentBuilder::new(model);
+    if let Some(s) = system {
+        builder = builder.preamble(s);
+    }
+
+    let agent = builder.build();
+
+    // Convert our role-typed history into rig messages.
+    let rig_history: Vec<RigMessage> = history
+        .iter()
+        .map(|m| match m.role {
+            crate::state::CoachRole::User => RigMessage::user(&m.content),
+            crate::state::CoachRole::Assistant => RigMessage::assistant(&m.content),
+        })
+        .collect();
+
+    // Anthropic requires max_tokens at the request level — additional_params
+    // is the wrong layer. CompletionRequestBuilder::max_tokens(u64) sets it.
+    // rig 0.34's `calculate_max_tokens` only recognizes claude-3-* and
+    // claude-sonnet-4-*; newer Haiku names like claude-haiku-4-5-* aren't
+    // matched, so we always pass it explicitly.
+    let max = max_output_tokens.unwrap_or(200) as u64;
+    let resp = agent
+        .completion(new_message, rig_history)
+        .await
+        .map_err(|e| fmt_err("anthropic", e))?
+        .max_tokens(max)
+        .send()
+        .await
+        .map_err(|e| fmt_err("anthropic", e))?;
+
+    let text = resp
+        .choice
+        .iter()
+        .filter_map(|c| match c {
+            AssistantContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Build the updated history: existing + new user msg + assistant reply.
+    let mut new_history = history.to_vec();
+    new_history.push(crate::state::CoachMessage {
+        role: crate::state::CoachRole::User,
+        content: new_message.to_string(),
+    });
+    new_history.push(crate::state::CoachMessage {
+        role: crate::state::CoachRole::Assistant,
+        content: text.clone(),
+    });
+
+    Ok((text, new_history))
+}
+
 // ── Observer + chained stop ────────────────────────────────────────────
 
 /// System message established on the first call in a coach session.
@@ -429,63 +519,138 @@ pub fn build_observer_event(tool_name: &str, tool_input: &serde_json::Value) -> 
     format!("Tool: {tool_name}\nInput: {input_pretty}")
 }
 
-/// Fire one observer call. Updates the response chain.
-/// First call (when `previous_response_id` is None) sets the system preamble.
+/// Read the active provider from state, releasing the lock immediately.
+async fn read_provider(state: &SharedState) -> String {
+    state.read().await.model.provider.clone()
+}
+
+/// Fire one observer call. Dispatches on the active provider:
+///   • OpenAI Responses API: chains via `previous_response_id`. System
+///     prompt is sent only on the first call.
+///   • Anthropic messages API: maintains client-side history. System
+///     prompt is sent every call (free with prompt caching).
+///
+/// Returns the assistant text and the updated chain handle. If the
+/// active provider doesn't support stateful coach sessions, returns Err.
 pub async fn observe_event(
     state: &SharedState,
     priorities: &[String],
-    previous_response_id: Option<&str>,
+    chain: &crate::state::CoachChain,
     event: &str,
-) -> Result<ChainCall, String> {
-    let system = if previous_response_id.is_none() {
-        Some(coach_system_prompt(priorities))
-    } else {
-        None
-    };
-    chain_openai(
-        state,
-        event,
-        system.as_deref(),
-        previous_response_id,
-        false,        // free-form text response
-        Some(80),     // brief acknowledgment is enough
-    )
-    .await
+) -> Result<(String, crate::state::CoachChain), String> {
+    use crate::state::CoachChain;
+
+    match read_provider(state).await.as_str() {
+        "openai" => {
+            let prev_id = match chain {
+                CoachChain::OpenAi { response_id } => Some(response_id.as_str()),
+                _ => None,
+            };
+            let system = if prev_id.is_none() {
+                Some(coach_system_prompt(priorities))
+            } else {
+                None
+            };
+            let call =
+                chain_openai(state, event, system.as_deref(), prev_id, false, Some(80)).await?;
+            Ok((
+                call.text,
+                CoachChain::OpenAi {
+                    response_id: call.response_id,
+                },
+            ))
+        }
+        "anthropic" => {
+            let history = match chain {
+                CoachChain::Anthropic { history } => history.clone(),
+                _ => Vec::new(),
+            };
+            // Anthropic resends system every call — caching makes it cheap.
+            let system = coach_system_prompt(priorities);
+            let (text, new_history) =
+                chain_anthropic(state, Some(&system), &history, event, Some(80)).await?;
+            Ok((text, CoachChain::Anthropic { history: new_history }))
+        }
+        other => Err(format!(
+            "stateful coach not supported for provider: {other}"
+        )),
+    }
 }
 
-/// Synchronous stop evaluation that continues the observer's response chain.
-/// Returns both the parsed decision and the new response_id (so the caller
-/// can persist it — useful for UI/debugging even though the chain ends here).
+/// Synchronous stop evaluation that continues the observer's chain.
+/// Returns the parsed decision and the new chain handle (the caller may
+/// keep it for UI/debugging even though the chain ends here).
 pub async fn evaluate_stop_chained(
     state: &SharedState,
     priorities: &[String],
-    previous_response_id: Option<&str>,
+    chain: &crate::state::CoachChain,
     stop_reason: Option<&str>,
-) -> Result<(StopDecision, String), String> {
-    let system = if previous_response_id.is_none() {
-        Some(coach_system_prompt(priorities))
-    } else {
-        None
-    };
+) -> Result<(StopDecision, crate::state::CoachChain), String> {
+    use crate::state::CoachChain;
+
     let reason = stop_reason.unwrap_or("not specified");
     let prompt = format!(
         "The agent is requesting to stop. Stop reason from Claude: {reason}.\n\n\
          Decide whether to allow or block. Respond with ONLY a JSON object:\n\
          {{\"allow\": true|false, \"message\": \"directive if blocking, null if allowing\"}}"
     );
-    let call = chain_openai(
-        state,
-        &prompt,
-        system.as_deref(),
-        previous_response_id,
-        true,         // require json_object
-        Some(200),
-    )
-    .await?;
 
-    let decision: StopDecision = serde_json::from_str(&call.text)
-        .map_err(|e| format!("stop decision JSON parse failed ({e}): {}", call.text))?;
-    Ok((decision, call.response_id))
+    match read_provider(state).await.as_str() {
+        "openai" => {
+            let prev_id = match chain {
+                CoachChain::OpenAi { response_id } => Some(response_id.as_str()),
+                _ => None,
+            };
+            let system = if prev_id.is_none() {
+                Some(coach_system_prompt(priorities))
+            } else {
+                None
+            };
+            let call =
+                chain_openai(state, &prompt, system.as_deref(), prev_id, true, Some(200)).await?;
+            let decision = parse_stop_decision(&call.text)?;
+            Ok((
+                decision,
+                CoachChain::OpenAi {
+                    response_id: call.response_id,
+                },
+            ))
+        }
+        "anthropic" => {
+            let history = match chain {
+                CoachChain::Anthropic { history } => history.clone(),
+                _ => Vec::new(),
+            };
+            let system = coach_system_prompt(priorities);
+            let (text, new_history) =
+                chain_anthropic(state, Some(&system), &history, &prompt, Some(200)).await?;
+            let decision = parse_stop_decision(&text)?;
+            Ok((decision, CoachChain::Anthropic { history: new_history }))
+        }
+        other => Err(format!(
+            "stateful coach not supported for provider: {other}"
+        )),
+    }
+}
+
+/// Parse a StopDecision from a model response, tolerating models that
+/// wrap JSON in ```json … ``` fences (Anthropic does this sometimes).
+fn parse_stop_decision(text: &str) -> Result<StopDecision, String> {
+    let trimmed = text.trim();
+    let json_str = strip_code_fence(trimmed).unwrap_or(trimmed);
+    serde_json::from_str(json_str)
+        .map_err(|e| format!("stop decision JSON parse failed ({e}): {text}"))
+}
+
+/// If the text is wrapped in a triple-backtick code fence (with or
+/// without a language tag), return just the inner content. Otherwise None.
+fn strip_code_fence(text: &str) -> Option<&str> {
+    let s = text.strip_prefix("```")?;
+    let after_lang = match s.find('\n') {
+        Some(i) => &s[i + 1..],
+        None => s,
+    };
+    after_lang.strip_suffix("```").map(str::trim)
 }
 
 #[cfg(test)]
@@ -759,20 +924,29 @@ mod live_tests {
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
         );
-        let r1 = observe_event(&state, &priorities, None, &event1)
-            .await
-            .expect("first observe_event failed");
-        assert!(r1.response_id.starts_with("resp_"));
+        let (_text1, chain1) =
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
+                .await
+                .expect("first observe_event failed");
+        let id1 = match &chain1 {
+            crate::state::CoachChain::OpenAi { response_id } => response_id.clone(),
+            other => panic!("expected OpenAi chain, got {other:?}"),
+        };
+        assert!(id1.starts_with("resp_"));
 
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
         );
-        let r2 = observe_event(&state, &priorities, Some(&r1.response_id), &event2)
+        let (_text2, chain2) = observe_event(&state, &priorities, &chain1, &event2)
             .await
             .expect("second observe_event failed");
-        assert!(r2.response_id.starts_with("resp_"));
-        assert_ne!(r1.response_id, r2.response_id);
+        let id2 = match &chain2 {
+            crate::state::CoachChain::OpenAi { response_id } => response_id.clone(),
+            other => panic!("expected OpenAi chain, got {other:?}"),
+        };
+        assert!(id2.starts_with("resp_"));
+        assert_ne!(id1, id2);
     }
 
     /// evaluate_stop_chained must always return a parseable StopDecision.
@@ -789,14 +963,15 @@ mod live_tests {
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
         );
-        let observed = observe_event(&state, &priorities, None, &event)
-            .await
-            .expect("observe failed");
+        let (_text, observed_chain) =
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
+                .await
+                .expect("observe failed");
 
-        let (decision, new_id) = evaluate_stop_chained(
+        let (decision, new_chain) = evaluate_stop_chained(
             &state,
             &priorities,
-            Some(&observed.response_id),
+            &observed_chain,
             Some("end_turn"),
         )
         .await
@@ -810,24 +985,184 @@ mod live_tests {
                 "blocking decision should carry a message"
             );
         }
-        assert!(new_id.starts_with("resp_"));
+        assert!(matches!(new_chain, crate::state::CoachChain::OpenAi { .. }));
     }
 
     /// First-call evaluate_stop_chained (no prior chain) should also work,
-    /// since the system preamble is set when previous_response_id is None.
+    /// since the system preamble is set when chain is Empty.
     #[tokio::test]
     #[ignore]
     async fn live_evaluate_stop_chained_no_prior_context() {
         let Some(state) = live_state() else { return };
         let priorities = vec!["Do good work".into()];
-        let (_decision, new_id) = evaluate_stop_chained(
+        let (_decision, new_chain) = evaluate_stop_chained(
             &state,
             &priorities,
-            None,
+            &crate::state::CoachChain::Empty,
             Some("end_turn"),
         )
         .await
         .expect("first-turn evaluate_stop_chained failed");
-        assert!(new_id.starts_with("resp_"));
+        assert!(matches!(new_chain, crate::state::CoachChain::OpenAi { .. }));
+    }
+
+    // ── Anthropic live tests ────────────────────────────────────────────
+    //
+    // Same shape as the OpenAI tests but the chain is client-side history
+    // instead of a server-side response_id. Gated on ANTHROPIC_API_KEY +
+    // #[ignore], no-ops cleanly when the key is missing.
+
+    fn live_state_anthropic() -> Option<SharedState> {
+        let token = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let state = CoachState {
+            sessions: HashMap::new(),
+            session_id_to_pid: HashMap::new(),
+            priorities: vec!["Test priority".into()],
+            port: 7700,
+            theme: Theme::System,
+            default_mode: CoachMode::Present,
+            model: ModelConfig {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5-20251001".into(),
+            },
+            api_tokens: HashMap::from([("anthropic".into(), token)]),
+            env_tokens: HashMap::new(),
+            http_client: reqwest::Client::new(),
+            coach_mode: EngineMode::Llm,
+            rules: vec![],
+        };
+        Some(Arc::new(RwLock::new(state)))
+    }
+
+    /// Smallest possible Anthropic round-trip — verifies the agent +
+    /// caching builder + extraction path works end to end.
+    #[tokio::test]
+    #[ignore]
+    async fn live_chain_anthropic_basic() {
+        let Some(state) = live_state_anthropic() else { return };
+        let (text, new_history) = chain_anthropic(
+            &state,
+            Some("You are a test bot. Respond with one word."),
+            &[],
+            "Reply with the single word: hello",
+            Some(20),
+        )
+        .await
+        .expect("chain_anthropic failed");
+        assert!(!text.is_empty(), "expected non-empty text");
+        assert_eq!(new_history.len(), 2, "history should grow by user+assistant");
+        assert_eq!(new_history[0].role, crate::state::CoachRole::User);
+        assert_eq!(new_history[1].role, crate::state::CoachRole::Assistant);
+    }
+
+    /// Anthropic preserves context across turns when client passes the
+    /// growing history back. The "test" of statefulness is whether the
+    /// model can recall a token from an earlier turn.
+    #[tokio::test]
+    #[ignore]
+    async fn live_chain_anthropic_continues_context_via_history() {
+        let Some(state) = live_state_anthropic() else { return };
+        let system = "You are a test bot. Reply tersely.";
+
+        let (_t1, h1) = chain_anthropic(
+            &state,
+            Some(system),
+            &[],
+            "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
+            Some(20),
+        )
+        .await
+        .expect("first call failed");
+
+        let (text, _h2) = chain_anthropic(
+            &state,
+            Some(system),
+            &h1,
+            "What was the token I told you to remember? Reply with just the token.",
+            Some(30),
+        )
+        .await
+        .expect("second call failed");
+
+        assert!(
+            text.contains("PURPLE-OWL-42"),
+            "model didn't remember across turns; got: {text}"
+        );
+    }
+
+    /// observe_event chain accumulation for Anthropic. First call seeds
+    /// the system prompt and history with one turn; second call extends
+    /// the history.
+    #[tokio::test]
+    #[ignore]
+    async fn live_observe_event_chain_anthropic() {
+        let Some(state) = live_state_anthropic() else { return };
+        let priorities = vec!["Code quality".into()];
+
+        let event1 = build_observer_event(
+            "Edit",
+            &serde_json::json!({
+                "file_path": "/tmp/x.py",
+                "new_string": "def add(a, b):\n    return a + b\n"
+            }),
+        );
+        let (_t1, chain1) =
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
+                .await
+                .expect("first observe_event failed");
+        let h1 = match &chain1 {
+            crate::state::CoachChain::Anthropic { history } => history.clone(),
+            other => panic!("expected Anthropic chain, got {other:?}"),
+        };
+        assert_eq!(h1.len(), 2, "first call should produce user+assistant pair");
+
+        let event2 = build_observer_event(
+            "Bash",
+            &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+        );
+        let (_t2, chain2) = observe_event(&state, &priorities, &chain1, &event2)
+            .await
+            .expect("second observe_event failed");
+        let h2 = match &chain2 {
+            crate::state::CoachChain::Anthropic { history } => history.clone(),
+            other => panic!("expected Anthropic chain, got {other:?}"),
+        };
+        assert_eq!(h2.len(), 4, "history should grow to 4 messages");
+    }
+
+    /// evaluate_stop_chained over Anthropic must produce a parseable
+    /// StopDecision. Tolerant of code-fenced JSON output via
+    /// strip_code_fence in parse_stop_decision.
+    #[tokio::test]
+    #[ignore]
+    async fn live_evaluate_stop_chained_anthropic() {
+        let Some(state) = live_state_anthropic() else { return };
+        let priorities = vec!["Finish the task".into()];
+
+        let event = build_observer_event(
+            "Edit",
+            &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+        );
+        let (_t, observed_chain) =
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
+                .await
+                .expect("observe failed");
+
+        let (decision, new_chain) = evaluate_stop_chained(
+            &state,
+            &priorities,
+            &observed_chain,
+            Some("end_turn"),
+        )
+        .await
+        .expect("evaluate_stop_chained failed");
+
+        let _ = decision.allow;
+        if !decision.allow {
+            assert!(decision.message.is_some(), "block decision should carry a message");
+        }
+        assert!(matches!(new_chain, crate::state::CoachChain::Anthropic { .. }));
     }
 }

@@ -17,6 +17,42 @@ pub enum CoachMode {
     Away,
 }
 
+// ── Coach LLM chain (per-session conversation handle) ─────────────────
+//
+// Different providers preserve conversation state in different ways:
+//   • OpenAI Responses API: server-side, indexed by response_id. We just
+//     store the latest id and pass it as previous_response_id next call.
+//   • Anthropic: no server state. We keep the message history client-side
+//     (cached cheap via prompt caching).
+// `CoachChain` lets one SessionState field cover both — and stays
+// `Empty` until the first observer call.
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoachRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CoachMessage {
+    pub role: CoachRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoachChain {
+    #[default]
+    Empty,
+    OpenAi {
+        response_id: String,
+    },
+    Anthropic {
+        history: Vec<CoachMessage>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -110,9 +146,10 @@ pub struct SessionState {
     /// All cwds this **window** has been in. Persists across `/clear`
     /// because it describes the process, not the conversation.
     pub cwd_history: Vec<String>,
-    /// OpenAI Responses API chain handle. Reset on `/clear` since the
-    /// new conversation has no shared context with the previous one.
-    pub coach_response_id: Option<String>,
+    /// Coach LLM chain handle (provider-specific). Reset to `Empty` on
+    /// `/clear` since the new conversation has no shared context with
+    /// the previous one.
+    pub coach_chain: CoachChain,
     pub coach_last_assessment: Option<String>,
     pub activity: VecDeque<ActivityEntry>,
 }
@@ -308,7 +345,7 @@ impl CoachState {
                 sess.stop_count = 0;
                 sess.stop_blocked_count = 0;
                 sess.last_stop_blocked = None;
-                sess.coach_response_id = None;
+                sess.coach_chain = CoachChain::Empty;
                 sess.coach_last_assessment = None;
                 sess.activity.clear();
                 if let Some(cwd) = cwd {
@@ -339,7 +376,7 @@ impl CoachState {
                         stop_count: 0,
                         stop_blocked_count: 0,
                         cwd_history,
-                        coach_response_id: None,
+                        coach_chain: CoachChain::Empty,
                         coach_last_assessment: None,
                         activity: VecDeque::new(),
                     },
@@ -482,7 +519,7 @@ impl CoachState {
                 stop_count: 0,
                 stop_blocked_count: 0,
                 cwd_history,
-                coach_response_id: None,
+                coach_chain: CoachChain::Empty,
                 coach_last_assessment: None,
                 activity: VecDeque::new(),
             },
@@ -639,7 +676,7 @@ mod tests {
             s.tool_counts.insert("Bash".into(), 9);
             s.stop_count = 3;
             s.stop_blocked_count = 2;
-            s.coach_response_id = Some("resp_old".into());
+            s.coach_chain = CoachChain::OpenAi { response_id: "resp_old".into() };
             s.activity.push_back(ActivityEntry {
                 timestamp: Utc::now(),
                 hook_event: "x".into(),
@@ -661,7 +698,7 @@ mod tests {
         assert!(sess.tool_counts.is_empty());
         assert_eq!(sess.stop_count, 0);
         assert_eq!(sess.stop_blocked_count, 0);
-        assert!(sess.coach_response_id.is_none());
+        assert_eq!(sess.coach_chain, CoachChain::Empty, "/clear must reset chain");
         assert!(sess.activity.is_empty());
         assert!(sess.started_at > original_started);
         // Window-scoped: preserved

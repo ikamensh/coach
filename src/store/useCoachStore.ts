@@ -71,6 +71,14 @@ interface HookStatus {
   hooks: HookEntryStatus[];
 }
 
+interface PathStatus {
+  install_path: string;
+  installed: boolean;
+  target: string | null;
+  matches_current_exe: boolean;
+  on_path: boolean;
+}
+
 interface CoachState {
   sessions: SessionSnapshot[];
   priorities: string[];
@@ -81,6 +89,8 @@ interface CoachState {
   engineMode: EngineMode;
   rules: CoachRule[];
   hookStatus: HookStatus | null;
+  cursorHookStatus: HookStatus | null;
+  pathStatus: PathStatus | null;
   modelError: string | null;
   modelValidating: boolean;
   initialized: boolean;
@@ -108,6 +118,12 @@ interface CoachActions {
   refreshHookStatus: () => Promise<void>;
   installHooks: () => Promise<void>;
   uninstallHooks: () => Promise<void>;
+  refreshCursorHookStatus: () => Promise<void>;
+  installCursorHooks: () => Promise<void>;
+  uninstallCursorHooks: () => Promise<void>;
+  refreshPathStatus: () => Promise<void>;
+  installPath: () => Promise<void>;
+  uninstallPath: () => Promise<void>;
 }
 
 type CoachStore = CoachState & CoachActions;
@@ -126,7 +142,7 @@ function applyThemeClass(theme: Theme) {
   }
 }
 
-export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, ActivityEntry, HookStatus, EngineMode, CoachRule };
+export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule };
 
 export const useCoachStore = create<CoachStore>((set, get) => ({
   sessions: [],
@@ -138,6 +154,8 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   engineMode: "rules",
   rules: [{ id: "outdated_models", enabled: true }],
   hookStatus: null,
+  cursorHookStatus: null,
+  pathStatus: null,
   modelError: null,
   modelValidating: false,
   initialized: false,
@@ -169,6 +187,8 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
     }
 
     get().refreshHookStatus();
+    get().refreshCursorHookStatus();
+    get().refreshPathStatus();
 
     await listen<CoachSnapshot>("coach-state-updated", (event) => {
       const s = event.payload;
@@ -291,5 +311,39 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   uninstallHooks: async () => {
     const hookStatus = await invoke<HookStatus>("uninstall_hooks");
     set({ hookStatus });
+  },
+
+  refreshCursorHookStatus: async () => {
+    const cursorHookStatus = await invoke<HookStatus>("get_cursor_hook_status");
+    set({ cursorHookStatus });
+  },
+
+  installCursorHooks: async () => {
+    const cursorHookStatus = await invoke<HookStatus>("install_cursor_hooks");
+    set({ cursorHookStatus });
+  },
+
+  uninstallCursorHooks: async () => {
+    const cursorHookStatus = await invoke<HookStatus>("uninstall_cursor_hooks");
+    set({ cursorHookStatus });
+  },
+
+  refreshPathStatus: async () => {
+    try {
+      const pathStatus = await invoke<PathStatus>("get_path_status");
+      set({ pathStatus });
+    } catch {
+      set({ pathStatus: null });
+    }
+  },
+
+  installPath: async () => {
+    const pathStatus = await invoke<PathStatus>("install_path");
+    set({ pathStatus });
+  },
+
+  uninstallPath: async () => {
+    const pathStatus = await invoke<PathStatus>("uninstall_path");
+    set({ pathStatus });
   },
 }));

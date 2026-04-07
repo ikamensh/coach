@@ -223,6 +223,250 @@ pub fn uninstall_hooks_at(port: u16, path: &std::path::Path) -> Result<(), Strin
     Ok(())
 }
 
+// ── Cursor Agent hooks (`~/.cursor/hooks.json`, `command` + stdin JSON) ──
+
+fn cursor_hooks_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("no home directory")
+        .join(".cursor")
+        .join("hooks.json")
+}
+
+/// `curl` commands Coach installs for each Cursor lifecycle hook (POST body = stdin JSON).
+pub fn expected_cursor_hook_commands(port: u16) -> Vec<(&'static str, String)> {
+    let base = format!("http://127.0.0.1:{}", port);
+    vec![
+        (
+            "sessionStart",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/session-start" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+        (
+            "beforeSubmitPrompt",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/before-submit-prompt" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+        (
+            "beforeShellExecution",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/before-shell" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+        (
+            "beforeMCPExecution",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/before-mcp" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+        (
+            "afterShellExecution",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/after-shell" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+        (
+            "afterMCPExecution",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/after-mcp" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+        (
+            "afterFileEdit",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/after-file-edit" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+        (
+            "stop",
+            format!(
+                r#"curl -sS -X POST "{}/cursor/hook/stop" -H "Content-Type: application/json" -d @-"#,
+                base
+            ),
+        ),
+    ]
+}
+
+fn cursor_command_matches(entry: &serde_json::Value, expected: &str) -> bool {
+    entry
+        .get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|cmd| cmd == expected)
+}
+
+fn is_managed_cursor_command(cmd: &str, port: u16) -> bool {
+    cmd.contains("/cursor/hook/")
+        && (cmd.contains(&format!("127.0.0.1:{}", port))
+            || cmd.contains(&format!("localhost:{}", port)))
+}
+
+pub fn check_cursor_hook_status(port: u16) -> HookStatus {
+    check_cursor_hook_status_at(port, &cursor_hooks_path())
+}
+
+pub fn check_cursor_hook_status_at(port: u16, path: &std::path::Path) -> HookStatus {
+    let expected = expected_cursor_hook_commands(port);
+
+    let settings: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let hooks_obj = settings.get("hooks");
+
+    let entries: Vec<HookEntryStatus> = expected
+        .iter()
+        .map(|(event, cmd)| {
+            let installed = hooks_obj
+                .and_then(|h| h.get(*event))
+                .and_then(|arr| arr.as_array())
+                .is_some_and(|entries| {
+                    entries.iter().any(|e| cursor_command_matches(e, cmd))
+                });
+
+            HookEntryStatus {
+                event: event.to_string(),
+                url: cmd.clone(),
+                installed,
+            }
+        })
+        .collect();
+
+    let all_installed = entries.iter().all(|e| e.installed);
+
+    HookStatus {
+        installed: all_installed,
+        path: path.display().to_string(),
+        hooks: entries,
+    }
+}
+
+pub fn install_cursor_hooks(port: u16) -> Result<(), String> {
+    install_cursor_hooks_at(port, &cursor_hooks_path())
+}
+
+pub fn install_cursor_hooks_at(port: u16, path: &std::path::Path) -> Result<(), String> {
+    let expected = expected_cursor_hook_commands(port);
+
+    let mut settings: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({ "version": 1, "hooks": {} }));
+
+    let settings_obj = settings
+        .as_object_mut()
+        .ok_or("Cursor hooks.json must be a JSON object")?;
+
+    if !settings_obj.contains_key("version") {
+        settings_obj.insert("version".into(), serde_json::json!(1));
+    }
+    if !settings_obj.contains_key("hooks") {
+        settings_obj.insert("hooks".into(), serde_json::json!({}));
+    }
+
+    let hooks_obj = settings_obj
+        .get_mut("hooks")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("hooks must be an object")?;
+
+    for (event, cmd) in &expected {
+        let entry = serde_json::json!({ "command": cmd });
+        if let Some(existing) = hooks_obj.get_mut(*event) {
+            if let Some(arr) = existing.as_array_mut() {
+                if !arr.iter().any(|e| cursor_command_matches(e, cmd)) {
+                    arr.push(entry);
+                }
+            }
+        } else {
+            hooks_obj.insert((*event).to_string(), serde_json::json!([entry]));
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+pub fn uninstall_cursor_hooks(port: u16) -> Result<(), String> {
+    uninstall_cursor_hooks_at(port, &cursor_hooks_path())
+}
+
+pub fn uninstall_cursor_hooks_at(port: u16, path: &std::path::Path) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| e.to_string())?;
+
+    let hooks_obj = settings
+        .get_mut("hooks")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("No hooks object in Cursor hooks.json")?;
+
+    for (_event, arr_val) in hooks_obj.iter_mut() {
+        if let Some(arr) = arr_val.as_array_mut() {
+            arr.retain(|entry| {
+                entry
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|cmd| !is_managed_cursor_command(cmd, port))
+                    .unwrap_or(true)
+            });
+        }
+    }
+
+    let empty_events: Vec<String> = hooks_obj
+        .iter()
+        .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in empty_events {
+        hooks_obj.remove(&key);
+    }
+
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+pub fn topup_managed_cursor_hooks(port: u16) -> Result<Vec<String>, String> {
+    topup_managed_cursor_hooks_at(port, &cursor_hooks_path())
+}
+
+pub fn topup_managed_cursor_hooks_at(
+    port: u16,
+    path: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let status = check_cursor_hook_status_at(port, path);
+    let any_installed = status.hooks.iter().any(|h| h.installed);
+    if !any_installed {
+        return Ok(vec![]);
+    }
+    let missing: Vec<String> = status
+        .hooks
+        .iter()
+        .filter(|h| !h.installed)
+        .map(|h| h.event.clone())
+        .collect();
+    if missing.is_empty() {
+        return Ok(vec![]);
+    }
+    install_cursor_hooks_at(port, path)?;
+    Ok(missing)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub provider: String,
@@ -291,10 +535,14 @@ fn default_model() -> ModelConfig {
 }
 
 /// Providers that support stateful coach sessions (response-id chaining
-/// or equivalent server-side conversation state). Currently only OpenAI's
-/// Responses API in rig 0.34. Other providers can still serve the rules
-/// engine and one-shot stop evaluation.
-pub const OBSERVER_CAPABLE_PROVIDERS: &[&str] = &["openai"];
+/// or equivalent server-side conversation state). Two mechanisms:
+///   • OpenAI: server-side state via Responses API + previous_response_id.
+///   • Anthropic: client-side message history with prompt caching
+///     (~10% of full input cost on the cached prefix).
+/// Other providers (google, openrouter) can still serve the rules engine
+/// and one-shot stop evaluation; they just can't accumulate observer
+/// context cheaply.
+pub const OBSERVER_CAPABLE_PROVIDERS: &[&str] = &["openai", "anthropic"];
 
 fn default_priorities() -> Vec<String> {
     vec![
@@ -337,7 +585,9 @@ impl Default for Settings {
     }
 }
 
-fn settings_path() -> PathBuf {
+/// Default location of `~/.coach/settings.json`. Exposed so the CLI
+/// can show users where it's reading from / writing to.
+pub fn settings_path() -> PathBuf {
     dirs::home_dir()
         .expect("no home directory")
         .join(".coach")
@@ -346,8 +596,13 @@ fn settings_path() -> PathBuf {
 
 impl Settings {
     pub fn load() -> Self {
-        let path = settings_path();
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&settings_path())
+    }
+
+    /// Path-injectable load. Used by `Settings::load` in production and
+    /// directly by the CLI's `--config-file` override and unit tests.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
                 eprintln!("Warning: failed to parse {}: {}", path.display(), e);
                 Self::default()
@@ -357,13 +612,19 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        let path = settings_path();
+        self.save_to(&settings_path());
+    }
+
+    /// Path-injectable save. Errors here are eprintln!'d rather than
+    /// returned so the GUI's hot path stays infallible — the CLI uses
+    /// the same code path and gets the same warning on stderr.
+    pub fn save_to(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = std::fs::write(path, json) {
                     eprintln!("Warning: failed to write {}: {}", path.display(), e);
                 }
             }
@@ -392,6 +653,21 @@ mod tests {
     #[test]
     fn openai_is_observer_capable() {
         assert!(OBSERVER_CAPABLE_PROVIDERS.contains(&"openai"));
+    }
+
+    /// Anthropic is observer-capable via client-side history + prompt
+    /// caching. rig 0.34 exposes `with_automatic_caching()` first-class.
+    #[test]
+    fn anthropic_is_observer_capable() {
+        assert!(OBSERVER_CAPABLE_PROVIDERS.contains(&"anthropic"));
+    }
+
+    /// Google must NOT be observer-capable in 0.34 — rig has a TODO at
+    /// providers/gemini/completion.rs for cachedContent. Regression
+    /// test in case someone adds it without verifying upstream support.
+    #[test]
+    fn google_is_not_observer_capable_yet() {
+        assert!(!OBSERVER_CAPABLE_PROVIDERS.contains(&"google"));
     }
 
     /// Priorities should ship with sensible non-empty defaults so the

@@ -1,5 +1,6 @@
 use axum::{
-    extract::{ConnectInfo, State as AxumState},
+    extract::{ConnectInfo, Path, State as AxumState},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -8,11 +9,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::settings::EngineMode;
+use crate::settings::{CoachRule, EngineMode, ModelConfig};
 use crate::state::{CoachMode, SharedState};
 
+mod cursor;
+
 #[derive(Deserialize)]
-struct HookPayload {
+pub(crate) struct HookPayload {
     session_id: Option<String>,
     #[allow(dead_code)]
     hook_event_name: Option<String>,
@@ -31,13 +34,13 @@ struct HookPayload {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct HookResponse {
+pub(crate) struct HookResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     hook_specific_output: Option<serde_json::Value>,
 }
 
 impl HookResponse {
-    fn passthrough() -> Self {
+    pub(crate) fn passthrough() -> Self {
         Self {
             hook_specific_output: None,
         }
@@ -51,20 +54,20 @@ impl HookResponse {
 pub type PidResolver = Arc<dyn Fn(u16, &str) -> Option<u32> + Send + Sync>;
 
 #[derive(Clone)]
-struct AppState {
-    coach: SharedState,
-    emitter: Option<tauri::AppHandle>,
+pub(crate) struct AppState {
+    pub(crate) coach: SharedState,
+    pub(crate) emitter: Option<tauri::AppHandle>,
     resolver: PidResolver,
 }
 
-fn session_id(payload: &HookPayload) -> String {
+pub(crate) fn session_id(payload: &HookPayload) -> String {
     payload
         .session_id
         .clone()
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn emit_update(emitter: &Option<tauri::AppHandle>, coach: &crate::state::CoachState) {
+pub(crate) fn emit_update(emitter: &Option<tauri::AppHandle>, coach: &crate::state::CoachState) {
     if let Some(handle) = emitter {
         use tauri::Emitter;
         let _ = handle.emit(crate::state::EVENT_STATE_UPDATED, coach.snapshot());
@@ -85,17 +88,14 @@ async fn resolve_pid(state: &AppState, sid: &str, peer_port: u16) -> Option<u32>
     (state.resolver)(peer_port, sid)
 }
 
-async fn handle_permission_request(
-    AxumState(state): AxumState<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(payload): Json<HookPayload>,
+/// Shared by Claude `/hook/permission-request` and Cursor `/cursor/hook/*` permission analogues.
+pub(crate) async fn run_permission_request(
+    state: &AppState,
+    pid: u32,
+    payload: HookPayload,
 ) -> Json<HookResponse> {
     let sid = session_id(&payload);
     let tool = payload.tool_name.clone().unwrap_or_default();
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] PermissionRequest: PID resolution failed for {sid}");
-        return Json(HookResponse::passthrough());
-    };
 
     let mut coach = state.coach.write().await;
     let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
@@ -117,11 +117,35 @@ async fn handle_permission_request(
     }
 }
 
+async fn handle_permission_request(
+    AxumState(state): AxumState<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<HookPayload>,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
+        eprintln!("[coach] PermissionRequest: PID resolution failed for {sid}");
+        return Json(HookResponse::passthrough());
+    };
+    run_permission_request(&state, pid, payload).await
+}
+
 /// SessionStart fires immediately when a new conversation begins:
 /// `startup` (Claude Code launched), `resume` (`/resume`), `clear`
 /// (`/clear`), or `compact` (`/compact`). All four mean the same thing
 /// to us: this PID has a fresh conversation. apply_hook_event handles
 /// the rest — same PID + new session_id triggers the reset path.
+pub(crate) async fn run_session_start(state: &AppState, pid: u32, payload: HookPayload) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let mut coach = state.coach.write().await;
+    coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
+    let source = payload.source.unwrap_or_else(|| "unknown".into());
+    coach.log(pid, "SessionStart", &source, None);
+    emit_update(&state.emitter, &coach);
+
+    Json(HookResponse::passthrough())
+}
+
 async fn handle_session_start(
     AxumState(state): AxumState<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -132,30 +156,18 @@ async fn handle_session_start(
         eprintln!("[coach] SessionStart: PID resolution failed for {sid}");
         return Json(HookResponse::passthrough());
     };
-
-    let mut coach = state.coach.write().await;
-    coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
-    let source = payload.source.unwrap_or_else(|| "unknown".into());
-    coach.log(pid, "SessionStart", &source, None);
-    emit_update(&state.emitter, &coach);
-
-    Json(HookResponse::passthrough())
+    run_session_start(&state, pid, payload).await
 }
 
 /// UserPromptSubmit fires whenever the user sends a turn to Claude Code.
 /// Cheap, always passes through — we just record it as a major event in
 /// the session timeline so the activity bar shows when the user spoke.
-async fn handle_user_prompt_submit(
-    AxumState(state): AxumState<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(payload): Json<HookPayload>,
+pub(crate) async fn run_user_prompt_submit(
+    state: &AppState,
+    pid: u32,
+    payload: HookPayload,
 ) -> Json<HookResponse> {
     let sid = session_id(&payload);
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] UserPromptSubmit: PID resolution failed for {sid}");
-        return Json(HookResponse::passthrough());
-    };
-
     let mut coach = state.coach.write().await;
     coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
 
@@ -176,22 +188,27 @@ async fn handle_user_prompt_submit(
     Json(HookResponse::passthrough())
 }
 
-const STOP_COOLDOWN: Duration = Duration::from_secs(15);
-
-async fn handle_stop(
+async fn handle_user_prompt_submit(
     AxumState(state): AxumState<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
-) -> Json<serde_json::Value> {
+) -> Json<HookResponse> {
     let sid = session_id(&payload);
     let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] Stop: PID resolution failed for {sid}");
-        return Json(serde_json::json!({}));
+        eprintln!("[coach] UserPromptSubmit: PID resolution failed for {sid}");
+        return Json(HookResponse::passthrough());
     };
+    run_user_prompt_submit(&state, pid, payload).await
+}
+
+const STOP_COOLDOWN: Duration = Duration::from_secs(15);
+
+pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -> Json<serde_json::Value> {
+    let sid = session_id(&payload);
 
     // Phase 1: read context, increment stop_count, release the lock
     // before we make any (potentially slow) LLM call.
-    let (coach_mode, provider_capable, prev_response_id, ctx) = {
+    let (coach_mode, provider_capable, prev_chain, ctx) = {
         let mut coach = state.coach.write().await;
         let priorities = coach.priorities.clone();
         let provider_capable = crate::settings::OBSERVER_CAPABLE_PROVIDERS
@@ -206,7 +223,7 @@ async fn handle_stop(
             return Json(serde_json::json!({}));
         }
 
-        let prev = session.coach_response_id.clone();
+        let prev_chain = session.coach_chain.clone();
         let ctx = crate::llm::StopContext {
             priorities,
             cwd: session.cwd.clone(),
@@ -215,24 +232,24 @@ async fn handle_stop(
             stop_blocked_count: session.stop_blocked_count,
             stop_reason: payload.stop_reason.clone(),
         };
-        (coach_mode, provider_capable, prev, ctx)
+        (coach_mode, provider_capable, prev_chain, ctx)
     };
 
     // Phase 2: LLM mode. Two paths:
-    //   • Chained (OpenAI Responses API): continues the observer's chain
-    //     so the model uses everything it's already seen this session.
+    //   • Chained (OpenAI Responses or Anthropic+caching): continues the
+    //     observer's chain so the model uses everything observed so far.
     //   • One-shot fallback: any other provider — sends only the digest.
     if coach_mode == EngineMode::Llm {
         let chained = if provider_capable {
             match crate::llm::evaluate_stop_chained(
                 &state.coach,
                 &ctx.priorities,
-                prev_response_id.as_deref(),
+                &prev_chain,
                 ctx.stop_reason.as_deref(),
             )
             .await
             {
-                Ok((decision, new_id)) => Some(Ok((decision, Some(new_id)))),
+                Ok((decision, new_chain)) => Some(Ok((decision, Some(new_chain)))),
                 Err(e) => Some(Err(e)),
             }
         } else {
@@ -247,16 +264,16 @@ async fn handle_stop(
         };
 
         match result {
-            Ok((decision, new_response_id)) if decision.allow => {
+            Ok((decision, new_chain)) if decision.allow => {
                 let mut coach = state.coach.write().await;
-                if let (Some(s), Some(id)) = (coach.sessions.get_mut(&pid), new_response_id) {
-                    s.coach_response_id = Some(id);
+                if let (Some(s), Some(c)) = (coach.sessions.get_mut(&pid), new_chain) {
+                    s.coach_chain = c;
                 }
                 coach.log(pid, "Stop", "allowed (LLM)", None);
                 emit_update(&state.emitter, &coach);
                 return Json(serde_json::json!({}));
             }
-            Ok((decision, new_response_id)) => {
+            Ok((decision, new_chain)) => {
                 let mut coach = state.coach.write().await;
                 let message = decision
                     .message
@@ -265,8 +282,8 @@ async fn handle_stop(
                 if let Some(s) = coach.sessions.get_mut(&pid) {
                     s.last_stop_blocked = Some(std::time::Instant::now());
                     s.stop_blocked_count += 1;
-                    if let Some(id) = new_response_id {
-                        s.coach_response_id = Some(id);
+                    if let Some(c) = new_chain {
+                        s.coach_chain = c;
                     }
                 }
                 coach.log(pid, "Stop", "blocked (LLM)", Some(message.clone()));
@@ -312,27 +329,36 @@ async fn handle_stop(
     }))
 }
 
-async fn handle_post_tool_use(
+async fn handle_stop(
     AxumState(state): AxumState<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
+) -> Json<serde_json::Value> {
+    let sid = session_id(&payload);
+    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
+        eprintln!("[coach] Stop: PID resolution failed for {sid}");
+        return Json(serde_json::json!({}));
+    };
+    run_stop(&state, pid, payload).await
+}
+
+pub(crate) async fn run_post_tool_use(
+    state: &AppState,
+    pid: u32,
+    payload: HookPayload,
 ) -> Json<HookResponse> {
     let sid = session_id(&payload);
     let tool = payload.tool_name.unwrap_or_default();
     let tool_input = payload.tool_input.unwrap_or(serde_json::Value::Null);
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] PostToolUse: PID resolution failed for {sid}");
-        return Json(HookResponse::passthrough());
-    };
 
     let observer_input;
     let rule_message;
     {
         let mut coach = state.coach.write().await;
-        let prev_response_id = {
+        let prev_chain = {
             let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
             *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
-            session.coach_response_id.clone()
+            session.coach_chain.clone()
         };
 
         rule_message = check_rules(&coach.rules, &tool, &tool_input);
@@ -349,7 +375,8 @@ async fn handle_post_tool_use(
         }
 
         // Decide if we should fire the observer. Requires LLM mode + a
-        // provider that can chain response_ids (rig only does this for OpenAI).
+        // provider that supports stateful coach chains (OpenAI Responses
+        // or Anthropic with prompt caching, currently).
         observer_input = if coach.coach_mode == EngineMode::Llm
             && crate::settings::OBSERVER_CAPABLE_PROVIDERS
                 .contains(&coach.model.provider.as_str())
@@ -357,7 +384,7 @@ async fn handle_post_tool_use(
             Some(ObserverInput {
                 pid,
                 priorities: coach.priorities.clone(),
-                previous_response_id: prev_response_id,
+                prev_chain,
                 event: crate::llm::build_observer_event(&tool, &tool_input),
             })
         } else {
@@ -387,10 +414,23 @@ async fn handle_post_tool_use(
     }
 }
 
+async fn handle_post_tool_use(
+    AxumState(state): AxumState<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<HookPayload>,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
+        eprintln!("[coach] PostToolUse: PID resolution failed for {sid}");
+        return Json(HookResponse::passthrough());
+    };
+    run_post_tool_use(&state, pid, payload).await
+}
+
 struct ObserverInput {
     pid: u32,
     priorities: Vec<String>,
-    previous_response_id: Option<String>,
+    prev_chain: crate::state::CoachChain,
     event: String,
 }
 
@@ -402,18 +442,18 @@ async fn run_observer(
     match crate::llm::observe_event(
         &coach,
         &input.priorities,
-        input.previous_response_id.as_deref(),
+        &input.prev_chain,
         &input.event,
     )
     .await
     {
-        Ok(call) => {
+        Ok((text, new_chain)) => {
             let mut s = coach.write().await;
             if let Some(sess) = s.sessions.get_mut(&input.pid) {
-                sess.coach_response_id = Some(call.response_id);
-                sess.coach_last_assessment = Some(call.text.clone());
+                sess.coach_chain = new_chain;
+                sess.coach_last_assessment = Some(text.clone());
             }
-            s.log(input.pid, "Observer", "noted", Some(call.text));
+            s.log(input.pid, "Observer", "noted", Some(text));
             emit_update(&emitter, &s);
         }
         Err(e) => {
@@ -450,6 +490,131 @@ async fn handle_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
+// ── /api/* endpoints used by the CLI when Coach is running ──────────────
+//
+// These mirror the Tauri commands in commands.rs so the CLI never has to
+// touch ~/.coach/settings.json directly while the GUI is up. Each handler
+// mutates the in-memory state, persists to disk, and emits the same
+// `coach-state-updated` event the Tauri commands emit so the GUI refreshes.
+
+#[derive(Deserialize)]
+struct ModePayload {
+    mode: CoachMode,
+}
+
+#[derive(Deserialize)]
+struct PrioritiesPayload {
+    priorities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiTokenPayload {
+    provider: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct CoachModePayload {
+    coach_mode: EngineMode,
+}
+
+#[derive(Deserialize)]
+struct RulesPayload {
+    rules: Vec<CoachRule>,
+}
+
+async fn api_set_session_mode(
+    AxumState(state): AxumState<AppState>,
+    Path(pid): Path<u32>,
+    Json(payload): Json<ModePayload>,
+) -> Result<Json<crate::state::CoachSnapshot>, (StatusCode, String)> {
+    let mut s = state.coach.write().await;
+    if !s.sessions.contains_key(&pid) {
+        return Err((StatusCode::NOT_FOUND, format!("no session for pid {pid}")));
+    }
+    if let Some(sess) = s.sessions.get_mut(&pid) {
+        sess.mode = payload.mode;
+    }
+    let snap = s.snapshot();
+    emit_update(&state.emitter, &s);
+    Ok(Json(snap))
+}
+
+async fn api_set_all_modes(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<ModePayload>,
+) -> Json<crate::state::CoachSnapshot> {
+    let mut s = state.coach.write().await;
+    s.set_all_modes(payload.mode);
+    let snap = s.snapshot();
+    emit_update(&state.emitter, &s);
+    Json(snap)
+}
+
+async fn api_set_priorities(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<PrioritiesPayload>,
+) -> Json<crate::state::CoachSnapshot> {
+    let mut s = state.coach.write().await;
+    s.priorities = payload.priorities;
+    s.save();
+    let snap = s.snapshot();
+    emit_update(&state.emitter, &s);
+    Json(snap)
+}
+
+async fn api_set_model(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<ModelConfig>,
+) -> Json<crate::state::CoachSnapshot> {
+    let mut s = state.coach.write().await;
+    s.model = payload;
+    s.save();
+    let snap = s.snapshot();
+    emit_update(&state.emitter, &s);
+    Json(snap)
+}
+
+async fn api_set_api_token(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<ApiTokenPayload>,
+) -> Json<crate::state::CoachSnapshot> {
+    let mut s = state.coach.write().await;
+    if payload.token.is_empty() {
+        s.api_tokens.remove(&payload.provider);
+    } else {
+        s.api_tokens.insert(payload.provider, payload.token);
+    }
+    s.save();
+    let snap = s.snapshot();
+    emit_update(&state.emitter, &s);
+    Json(snap)
+}
+
+async fn api_set_coach_mode(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<CoachModePayload>,
+) -> Json<crate::state::CoachSnapshot> {
+    let mut s = state.coach.write().await;
+    s.coach_mode = payload.coach_mode;
+    s.save();
+    let snap = s.snapshot();
+    emit_update(&state.emitter, &s);
+    Json(snap)
+}
+
+async fn api_set_rules(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<RulesPayload>,
+) -> Json<crate::state::CoachSnapshot> {
+    let mut s = state.coach.write().await;
+    s.rules = payload.rules;
+    s.save();
+    let snap = s.snapshot();
+    emit_update(&state.emitter, &s);
+    Json(snap)
+}
+
 fn build_router(
     coach: SharedState,
     emitter: Option<tauri::AppHandle>,
@@ -466,8 +631,28 @@ fn build_router(
         .route("/hook/post-tool-use", post(handle_post_tool_use))
         .route("/hook/user-prompt-submit", post(handle_user_prompt_submit))
         .route("/hook/session-start", post(handle_session_start))
+        .route("/cursor/hook/session-start", post(cursor::session_start))
+        .route(
+            "/cursor/hook/before-submit-prompt",
+            post(cursor::before_submit_prompt),
+        )
+        .route("/cursor/hook/before-shell", post(cursor::before_shell))
+        .route("/cursor/hook/before-mcp", post(cursor::before_mcp))
+        .route("/cursor/hook/after-shell", post(cursor::after_shell))
+        .route("/cursor/hook/after-mcp", post(cursor::after_mcp))
+        .route("/cursor/hook/after-file-edit", post(cursor::after_file_edit))
+        .route("/cursor/hook/stop", post(cursor::stop))
         .route("/state", get(handle_get_state))
         .route("/version", get(handle_version))
+        // CLI-facing API. Mirrors Tauri commands; same in-memory state.
+        .route("/api/state", get(handle_get_state))
+        .route("/api/sessions/mode", post(api_set_all_modes))
+        .route("/api/sessions/{pid}/mode", post(api_set_session_mode))
+        .route("/api/config/priorities", post(api_set_priorities))
+        .route("/api/config/model", post(api_set_model))
+        .route("/api/config/api-token", post(api_set_api_token))
+        .route("/api/config/coach-mode", post(api_set_coach_mode))
+        .route("/api/config/rules", post(api_set_rules))
         .with_state(state)
 }
 

@@ -1,6 +1,7 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCoachStore } from "../store/useCoachStore";
+import { TopBar } from "./TopBar";
 
 interface SavedSession {
   id: string;
@@ -184,7 +185,7 @@ function ReplayView({
   if (loading) {
     return (
       <div className="flex flex-col gap-4 h-full">
-        <Header
+        <TopBar
           title={`Replaying ${sessionId.slice(0, 12)}...`}
           onBack={onBack}
         />
@@ -198,7 +199,7 @@ function ReplayView({
   if (error) {
     return (
       <div className="flex flex-col gap-4 h-full">
-        <Header title="Replay Error" onBack={onBack} />
+        <TopBar title="Replay Error" onBack={onBack} />
         <p className="text-xs text-red-500 py-4 text-center">{error}</p>
       </div>
     );
@@ -210,7 +211,7 @@ function ReplayView({
 
   return (
     <div className="flex flex-col gap-3 h-full overflow-hidden">
-      <Header title="Replay" onBack={onBack} />
+      <TopBar title="Replay" onBack={onBack} />
 
       {/* Session info */}
       <section className="flex-shrink-0">
@@ -330,30 +331,6 @@ function ReplayView({
   );
 }
 
-function Header({
-  title,
-  onBack,
-}: {
-  title: string;
-  onBack: () => void;
-}) {
-  return (
-    <div className="flex items-center justify-between flex-shrink-0">
-      <div className="flex items-center gap-2 min-w-0">
-        <button
-          onClick={onBack}
-          className="text-sm text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 flex-shrink-0"
-        >
-          Back
-        </button>
-        <h1 className="text-lg font-semibold text-zinc-800 dark:text-zinc-100 truncate">
-          {title}
-        </h1>
-      </div>
-    </div>
-  );
-}
-
 export function DevPane() {
   const setView = useCoachStore((s) => s.setView);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -369,19 +346,7 @@ export function DevPane() {
 
   return (
     <div className="flex flex-col gap-3 h-full overflow-hidden">
-      <div className="flex items-center justify-between flex-shrink-0">
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setView("main")}
-            className="text-sm text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
-          >
-            Back
-          </button>
-          <h1 className="text-lg font-semibold text-zinc-800 dark:text-zinc-100">
-            Session Replay
-          </h1>
-        </div>
-      </div>
+      <TopBar title="Session Replay" onBack={() => setView("main")} />
 
       <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide flex-shrink-0">
         Saved Sessions

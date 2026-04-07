@@ -18,7 +18,11 @@ On macOS, open the `.dmg` and drag Coach to Applications. On first launch you ma
 
 ## Hook Setup
 
-Coach listens on `localhost:7700` for Claude Code HTTP hooks. Click **Hooks** in the app header to auto-install them into `~/.claude/settings.json`, or add manually:
+Coach listens on `localhost:7700` (configurable) for integrations below.
+
+### Claude Code
+
+Click **Hooks** in the app header to install HTTP hooks into `~/.claude/settings.json`, or add manually:
 
 ```json
 {
@@ -29,6 +33,10 @@ Coach listens on `localhost:7700` for Claude Code HTTP hooks. Click **Hooks** in
   }
 }
 ```
+
+### Cursor Agent (CLI)
+
+Cursor uses `~/.cursor/hooks.json` with `command` hooks that receive JSON on stdin. Coach can install `curl` forwarders to separate HTTP routes under `/cursor/hook/...` (same port). Use **Install Cursor hooks** in the Hooks pane, or `coach hooks cursor install`.
 
 ## Settings
 

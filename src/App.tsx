@@ -3,7 +3,7 @@ import { useCoachStore } from "./store/useCoachStore";
 import { useZoom } from "./hooks/useZoom";
 import { SessionList } from "./components/SessionList";
 import { PriorityList } from "./components/PriorityList";
-import { ThemeToggle } from "./components/ThemeToggle";
+import { TopBar } from "./components/TopBar";
 import { SettingsPane } from "./components/SettingsPane";
 import { HooksPane } from "./components/HooksPane";
 import { SessionDetail } from "./components/SessionDetail";
@@ -57,10 +57,8 @@ function AppInner() {
   const initialized = useCoachStore((s) => s.initialized);
   const initError = useCoachStore((s) => s.initError);
   const view = useCoachStore((s) => s.view);
-  const setView = useCoachStore((s) => s.setView);
   const port = useCoachStore((s) => s.port);
   const model = useCoachStore((s) => s.model);
-  const hookStatus = useCoachStore((s) => s.hookStatus);
 
   useZoom();
 
@@ -118,39 +116,7 @@ function AppInner() {
 
   return (
     <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 gap-4 overflow-hidden">
-      <div className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold">Coach</h1>
-        <div className="flex items-center gap-2">
-          <ThemeToggle />
-          <button
-            onClick={() => setView("hooks")}
-            className="text-xs px-2.5 py-1 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors flex items-center gap-1.5"
-          >
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                hookStatus?.installed
-                  ? "bg-emerald-500"
-                  : "bg-amber-500"
-              }`}
-            />
-            Hooks
-          </button>
-          {import.meta.env.DEV && (
-            <button
-              onClick={() => setView("dev")}
-              className="text-xs px-2.5 py-1 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
-            >
-              Replay
-            </button>
-          )}
-          <button
-            onClick={() => setView("settings")}
-            className="text-xs px-2.5 py-1 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
-          >
-            Settings
-          </button>
-        </div>
-      </div>
+      <TopBar title="Coach" />
 
       <div className="flex-1 min-h-0 overflow-y-auto">
         <SessionList />

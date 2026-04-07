@@ -1,3 +1,4 @@
+use crate::path_install::{self, PathStatus};
 use crate::replay;
 use crate::settings::{self, CoachRule, EngineMode, HookStatus, ModelConfig};
 use crate::state::{CoachMode, CoachSnapshot, CoachState, SharedState, Theme, EVENT_STATE_UPDATED, EVENT_THEME_CHANGED};
@@ -212,6 +213,32 @@ pub async fn uninstall_hooks(state: tauri::State<'_, SharedState>) -> Result<Hoo
 }
 
 #[tauri::command]
+pub async fn get_cursor_hook_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<HookStatus, String> {
+    let s = state.read().await;
+    Ok(settings::check_cursor_hook_status(s.port))
+}
+
+#[tauri::command]
+pub async fn install_cursor_hooks(
+    state: tauri::State<'_, SharedState>,
+) -> Result<HookStatus, String> {
+    let port = state.read().await.port;
+    settings::install_cursor_hooks(port)?;
+    Ok(settings::check_cursor_hook_status(port))
+}
+
+#[tauri::command]
+pub async fn uninstall_cursor_hooks(
+    state: tauri::State<'_, SharedState>,
+) -> Result<HookStatus, String> {
+    let port = state.read().await.port;
+    settings::uninstall_cursor_hooks(port)?;
+    Ok(settings::check_cursor_hook_status(port))
+}
+
+#[tauri::command]
 pub async fn list_saved_sessions(limit: Option<usize>) -> Result<Vec<replay::SavedSession>, String> {
     let limit = limit.unwrap_or(50);
     Ok(replay::list_sessions(limit))
@@ -254,4 +281,21 @@ pub async fn set_rules(
     s.save();
     emit_snapshot(&app, &s)?;
     Ok(())
+}
+
+// ── PATH shim management ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_path_status() -> Result<PathStatus, String> {
+    path_install::status()
+}
+
+#[tauri::command]
+pub async fn install_path() -> Result<PathStatus, String> {
+    path_install::install()
+}
+
+#[tauri::command]
+pub async fn uninstall_path() -> Result<PathStatus, String> {
+    path_install::uninstall()
 }

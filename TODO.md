@@ -2,28 +2,35 @@
 
 State of play after wiring the LLM observer + chained stop evaluator (April 2026).
 
+## Status
+
+- ✅ **Anthropic chain verified end-to-end** against the live API. All four `live_chain_anthropic_*` / `live_observe_event_chain_anthropic` / `live_evaluate_stop_chained_anthropic` tests pass with a real key. `claude-haiku-4-5-20251001` works (rig's `calculate_max_tokens` doesn't recognize the new naming so we set max_tokens explicitly via `CompletionRequestBuilder::max_tokens()`). Context preservation across turns confirmed: model recalled `PURPLE-OWL-42` from a prior turn over the client-side history with prompt caching.
+- ⚠️ **OpenAI chain plumbing verified mechanically but the live tests cannot pass** — the OpenAI key in `secrets/llm-providers.md` now returns HTTP 401 (`invalid_api_key`), one step worse than the previous `insufficient_quota` (HTTP 429). The request shape is correct (we got past 400 / structural validation), it's purely an account issue.
+
 ## Blockers / immediate
 
-- [ ] **OpenAI account is out of quota.** All `live_*` tests in `src-tauri/src/llm.rs` reach OpenAI but fail with `insufficient_quota`. Top up the key in `secrets/llm-providers.md`, or swap in a working one, then run:
+- [ ] **Replace or top up the OpenAI key.** All 6 `live_*` OpenAI tests in `src-tauri/src/llm.rs` fail with `invalid_api_key` against the secrets-file key. Once a working key is in place, run:
   ```sh
   OPENAI_API_KEY=sk-... cargo test --manifest-path src-tauri/Cargo.toml --lib live_ -- --ignored --nocapture
   ```
-  Six tests cover: basic round-trip, `previous_response_id` chaining, `json_object` mode, observer chain accumulation, `evaluate_stop_chained` (with and without prior context). All assertions are mechanical (response_id format, JSON parseability) — none depend on stochastic model output.
+  to flip them green.
 
-- [ ] **Verify observer + Stop end-to-end against a real Claude Code session.** Install hooks, put a session in Away, watch one full edit→bash→stop cycle. Things most likely to surface:
-  - `response_format: json_object` in `additional_params` may or may not be honored by rig 0.34's Responses API path. If it isn't, `evaluate_stop_chained` will panic on `serde_json::from_str`. Falls back to fixed message via the existing fallback path.
-  - Free-form observer responses might be longer than `max_output_tokens=80`. Cheap to fix by lowering the cap or asking the system prompt for "one short sentence."
+- [ ] **Verify observer + Stop end-to-end against a real Claude Code session** (with Anthropic, since that's the working path now). Install hooks, set provider to anthropic + `claude-haiku-4-5-20251001`, put a session in Away, watch one full edit→bash→stop cycle. Things most likely to surface:
+  - Free-form observer responses might be longer than `max_tokens=80`. Cheap to fix by lowering the cap or asking the system prompt for "one short sentence."
+  - Anthropic JSON output for the stop decision occasionally comes back code-fenced. `parse_stop_decision` already handles that via `strip_code_fence`, but real-world variations may need more tolerance.
 
 ## Frontend
 
-- [ ] **Model picker: mark observer-incapable providers.** `CoachSnapshot` now exposes `observer_capable_providers: Vec<String>`. The settings page should grey out / badge any provider not in that list (currently only `openai` is in). Without this, a user can pick Gemini and silently lose the observer.
+- [ ] **Model picker: mark observer-incapable providers.** `CoachSnapshot` now exposes `observer_capable_providers: Vec<String>` — currently `["openai", "anthropic"]`. The settings page should grey out / badge any provider not in that list (google, openrouter). Without this, a user can pick Gemini and silently lose the observer.
 - [ ] **Show `coach_last_assessment` in session detail.** `SessionSnapshot` carries it now; surface it as the coach's "what I think is happening" panel. This is the user-facing payoff for the LLM cost.
 - [ ] **Activity log entries**: `Observer/noted` and `Observer/error` are emitted by the observer worker. Make sure they render in the timeline view (might need a small icon/color tweak).
 
 ## Persistence
 
-- [ ] **Persist `coach_response_id` and `coach_last_assessment` per session.** Currently in-memory only — app restart drops the chain handle, and the next observer call starts fresh (re-paying the system-prompt setup cost and losing accumulated context). Suggested: `~/.coach/sessions/<session_id>.json` written on every observer/stop update, loaded on startup.
-- [ ] **Define chain expiry behavior.** OpenAI Responses API retains state for ~30 days (verify in docs). If a `previous_response_id` is stale, the API returns an error — we should detect and start a fresh chain instead of bubbling the error.
+- [ ] **Persist `coach_chain` and `coach_last_assessment` per session.** Currently in-memory only — app restart drops the chain handle (whether OpenAI `response_id` or Anthropic message history), and the next observer call starts fresh (re-paying setup cost). `CoachChain` derives `Serialize`/`Deserialize` already, so this is mostly file IO. Suggested: `~/.coach/sessions/<pid>.json` written on every observer/stop update, loaded on startup. Note: for Anthropic, the history Vec can grow large — consider bounding or rotating.
+- [ ] **Define chain expiry / cache invalidation behavior.**
+  - OpenAI: Responses API retains state for ~30 days. If `previous_response_id` is stale we should detect the error and start a fresh chain.
+  - Anthropic: prompt cache TTL is 5 minutes by default. If observer events are sparse, the cache cools and the next call pays full input rate. We could detect this from `usage.cache_read_input_tokens` (rig surfaces it) and consider extending TTL via `with_automatic_caching_1h()` for slow sessions.
 
 ## Design follow-up: `intervene_reasons` dict
 
@@ -56,8 +63,9 @@ This lets the same LLM analysis serve different mode toggles without re-promptin
 
 ## Provider parity
 
-- [ ] **Anthropic-backed observer** (no OpenAI dependency). Anthropic doesn't have `previous_response_id` but has first-class prompt caching. With `model.with_automatic_caching()` and a client-side `Vec<Message>`, you get the same economics (cached prefix is ~10% cost). Add Anthropic to `OBSERVER_CAPABLE_PROVIDERS` and route through a separate `chain_anthropic` function. This unblocks users who already have an Anthropic key but not OpenAI.
-- [ ] **Gemini context caching is missing in rig 0.34** (TODO comment in `providers/gemini/completion.rs:1945`). Either contribute upstream or accept that Gemini stays observer-incapable.
+- ✅ **Anthropic-backed observer** — done. `chain_anthropic` uses rig's `with_automatic_caching()` + client-side `Vec<CoachMessage>` history. `OBSERVER_CAPABLE_PROVIDERS` is `["openai", "anthropic"]`. Verified end-to-end against the live API including context preservation across turns.
+- [ ] **Gemini support is structurally limited** (verified, see commit message). Google offers no `previous_response_id` analog. `cachedContent` is an immutable static prefix cache — useless for an observer that accumulates new events because every event would force `caches.create`. Even if rig added it, we'd be doing cache thrashing OR resending the full history each call. Reasoning models on Gemini lose `thoughtSignatures` if not round-tripped, so plain history resend re-thinks every turn. Honest answer: Gemini observer is an O(N²) cost path with weaker continuity than the OpenAI/Anthropic options. Park unless someone really wants it.
+- [ ] **OpenRouter as a passthrough**: a user with an OpenRouter key but no direct OpenAI/Anthropic key could be routed through OpenRouter's chat completions, but they'd lose stateful chains entirely (OpenRouter is a chat-completions proxy, not Responses API). Probably not worth it.
 
 ## Test coverage gaps
 

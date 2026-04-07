@@ -1,5 +1,7 @@
+pub mod cli;
 mod commands;
 pub mod llm;
+pub mod path_install;
 pub mod pid_resolver;
 pub mod replay;
 pub mod rules;
@@ -52,6 +54,13 @@ pub fn run() {
                 Ok(_) => {}
                 Err(e) => eprintln!("[coach] setup: hook top-up failed: {e}"),
             }
+            match settings::topup_managed_cursor_hooks(port) {
+                Ok(added) if !added.is_empty() => {
+                    eprintln!("[coach] setup: topped up Cursor managed hooks: {added:?}");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[coach] setup: Cursor hook top-up failed: {e}"),
+            }
 
             app.manage(state.clone());
 
@@ -90,10 +99,16 @@ pub fn run() {
             commands::get_hook_status,
             commands::install_hooks,
             commands::uninstall_hooks,
+            commands::get_cursor_hook_status,
+            commands::install_cursor_hooks,
+            commands::uninstall_cursor_hooks,
             commands::list_saved_sessions,
             commands::replay_session,
             commands::set_coach_mode,
             commands::set_rules,
+            commands::get_path_status,
+            commands::install_path,
+            commands::uninstall_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Coach");
