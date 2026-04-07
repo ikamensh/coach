@@ -62,6 +62,20 @@ pub struct StopContext {
     pub stop_reason: Option<String>,
 }
 
+/// Per-call constraints for `session_send`. Everything is optional /
+/// defaulted so callers who don't care can pass `CallConstraints::default()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallConstraints {
+    /// Hard cap on the model's output length. OpenAI maps this to
+    /// `max_output_tokens`; Anthropic maps it to `max_tokens`.
+    pub max_output_tokens: Option<u32>,
+    /// Force JSON output where the provider supports it (OpenAI's
+    /// `response_format: json_object`). On providers without an
+    /// equivalent flag, the caller is expected to prompt for JSON in
+    /// the message itself.
+    pub require_json: bool,
+}
+
 // ── Provider dispatch ───────────────────────────────────────────────────
 
 fn fmt_err(provider: &str, e: impl std::fmt::Display) -> String {
@@ -524,19 +538,35 @@ async fn read_provider(state: &SharedState) -> String {
     state.read().await.model.provider.clone()
 }
 
-/// Fire one observer call. Dispatches on the active provider:
-///   • OpenAI Responses API: chains via `previous_response_id`. System
-///     prompt is sent only on the first call.
-///   • Anthropic messages API: maintains client-side history. System
-///     prompt is sent every call (free with prompt caching).
+/// Append a single message to a coach session and get back the model's
+/// reply. This is the one primitive every caller should use — specific
+/// use cases (observer, stop evaluation, future features) are thin
+/// wrappers that just build the right message and constraints.
 ///
-/// Returns the assistant text and the updated chain handle. If the
-/// active provider doesn't support stateful coach sessions, returns Err.
-pub async fn observe_event(
+/// The session is represented by the opaque `CoachChain` handle that
+/// callers thread through: `Empty` on the first call, provider-specific
+/// afterward. The caller always supplies the system prompt; this
+/// function decides whether to pass it downstream based on whether the
+/// provider's server already remembers it (OpenAI Responses does after
+/// the first call; everyone else needs it every time but gets it cached
+/// cheap where supported).
+///
+/// Support matrix (rig 0.34):
+///
+/// | Provider | Mode | Mechanism |
+/// |----------|------|-----------|
+/// | `openai` | **native** | Responses API `previous_response_id`, O(1) per call. |
+/// | `anthropic` | emulated | Client-side `Vec<CoachMessage>` + `with_automatic_caching()`. Cached prefix ~10% of full input rate. |
+/// | others | unsupported | Returns `Err`. |
+///
+/// Emulated providers emit a once-per-process stderr warning on first
+/// use so the developer knows the cost model differs from native.
+pub async fn session_send(
     state: &SharedState,
-    priorities: &[String],
     chain: &crate::state::CoachChain,
-    event: &str,
+    system_prompt: &str,
+    message: &str,
+    constraints: CallConstraints,
 ) -> Result<(String, crate::state::CoachChain), String> {
     use crate::state::CoachChain;
 
@@ -546,91 +576,112 @@ pub async fn observe_event(
                 CoachChain::OpenAi { response_id } => Some(response_id.as_str()),
                 _ => None,
             };
-            let system = if prev_id.is_none() {
-                Some(coach_system_prompt(priorities))
-            } else {
-                None
-            };
-            let call =
-                chain_openai(state, event, system.as_deref(), prev_id, false, Some(80)).await?;
+            // Responses API remembers the system prompt once it's been
+            // sent — resending on every call would duplicate it.
+            let system_for_call = if prev_id.is_none() { Some(system_prompt) } else { None };
+            let call = chain_openai(
+                state,
+                message,
+                system_for_call,
+                prev_id,
+                constraints.require_json,
+                constraints.max_output_tokens,
+            )
+            .await?;
             Ok((
                 call.text,
-                CoachChain::OpenAi {
-                    response_id: call.response_id,
-                },
+                CoachChain::OpenAi { response_id: call.response_id },
             ))
         }
         "anthropic" => {
+            warn_emulation_once("anthropic", "client-side history with prompt caching");
             let history = match chain {
                 CoachChain::Anthropic { history } => history.clone(),
                 _ => Vec::new(),
             };
-            // Anthropic resends system every call — caching makes it cheap.
-            let system = coach_system_prompt(priorities);
-            let (text, new_history) =
-                chain_anthropic(state, Some(&system), &history, event, Some(80)).await?;
+            let (text, new_history) = chain_anthropic(
+                state,
+                Some(system_prompt),
+                &history,
+                message,
+                constraints.max_output_tokens,
+            )
+            .await?;
             Ok((text, CoachChain::Anthropic { history: new_history }))
         }
         other => Err(format!(
-            "stateful coach not supported for provider: {other}"
+            "session_send: provider {other} has no session support (native or emulated)"
         )),
     }
 }
 
+/// Emit a one-time stderr warning the first time a given provider is
+/// used under emulation. Idempotent across the process — subsequent
+/// calls for the same provider are silent.
+fn warn_emulation_once(provider: &str, mechanism: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut guard = WARNED.lock().unwrap();
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.insert(provider.to_string()) {
+        eprintln!(
+            "[coach] {provider}: no native session API; emulating via {mechanism}. \
+             Cost scales with conversation length — see TODO.md."
+        );
+    }
+}
+
+/// Fire one observer call. Thin wrapper around `session_send` — builds
+/// the system prompt from priorities and caps output at 80 tokens.
+pub async fn observe_event(
+    state: &SharedState,
+    priorities: &[String],
+    chain: &crate::state::CoachChain,
+    event: &str,
+) -> Result<(String, crate::state::CoachChain), String> {
+    let system = coach_system_prompt(priorities);
+    session_send(
+        state,
+        chain,
+        &system,
+        event,
+        CallConstraints {
+            max_output_tokens: Some(80),
+            require_json: false,
+        },
+    )
+    .await
+}
+
 /// Synchronous stop evaluation that continues the observer's chain.
-/// Returns the parsed decision and the new chain handle (the caller may
-/// keep it for UI/debugging even though the chain ends here).
+/// Returns the parsed decision and the new chain handle.
 pub async fn evaluate_stop_chained(
     state: &SharedState,
     priorities: &[String],
     chain: &crate::state::CoachChain,
     stop_reason: Option<&str>,
 ) -> Result<(StopDecision, crate::state::CoachChain), String> {
-    use crate::state::CoachChain;
-
     let reason = stop_reason.unwrap_or("not specified");
     let prompt = format!(
         "The agent is requesting to stop. Stop reason from Claude: {reason}.\n\n\
          Decide whether to allow or block. Respond with ONLY a JSON object:\n\
          {{\"allow\": true|false, \"message\": \"directive if blocking, null if allowing\"}}"
     );
-
-    match read_provider(state).await.as_str() {
-        "openai" => {
-            let prev_id = match chain {
-                CoachChain::OpenAi { response_id } => Some(response_id.as_str()),
-                _ => None,
-            };
-            let system = if prev_id.is_none() {
-                Some(coach_system_prompt(priorities))
-            } else {
-                None
-            };
-            let call =
-                chain_openai(state, &prompt, system.as_deref(), prev_id, true, Some(200)).await?;
-            let decision = parse_stop_decision(&call.text)?;
-            Ok((
-                decision,
-                CoachChain::OpenAi {
-                    response_id: call.response_id,
-                },
-            ))
-        }
-        "anthropic" => {
-            let history = match chain {
-                CoachChain::Anthropic { history } => history.clone(),
-                _ => Vec::new(),
-            };
-            let system = coach_system_prompt(priorities);
-            let (text, new_history) =
-                chain_anthropic(state, Some(&system), &history, &prompt, Some(200)).await?;
-            let decision = parse_stop_decision(&text)?;
-            Ok((decision, CoachChain::Anthropic { history: new_history }))
-        }
-        other => Err(format!(
-            "stateful coach not supported for provider: {other}"
-        )),
-    }
+    let system = coach_system_prompt(priorities);
+    let (text, new_chain) = session_send(
+        state,
+        chain,
+        &system,
+        &prompt,
+        CallConstraints {
+            max_output_tokens: Some(200),
+            require_json: true,
+        },
+    )
+    .await?;
+    let decision = parse_stop_decision(&text)?;
+    Ok((decision, new_chain))
 }
 
 /// Parse a StopDecision from a model response, tolerating models that
@@ -783,6 +834,74 @@ mod tests {
         let event = build_observer_event("NoInput", &serde_json::Value::Null);
         assert!(event.contains("NoInput"));
         assert!(event.contains("null"));
+    }
+
+    // ── Session abstraction ─────────────────────────────────────────────
+
+    /// CallConstraints::default() should give the cheapest possible call:
+    /// no cap, no structured-output flag. Callers opt into stronger
+    /// constraints explicitly.
+    #[test]
+    fn call_constraints_default_is_minimal() {
+        let c = CallConstraints::default();
+        assert!(c.max_output_tokens.is_none());
+        assert!(!c.require_json);
+    }
+
+    /// parse_stop_decision must accept raw JSON, JSON wrapped in a
+    /// ```json fence, and JSON wrapped in a bare triple-backtick fence.
+    /// All three shapes come out of Anthropic in the wild.
+    #[test]
+    fn parse_stop_decision_accepts_fenced_and_plain_json() {
+        let plain = r#"{"allow": true, "message": null}"#;
+        let fenced_json = "```json\n{\"allow\": false, \"message\": \"keep going\"}\n```";
+        let fenced_plain = "```\n{\"allow\": true, \"message\": null}\n```";
+
+        let d = parse_stop_decision(plain).unwrap();
+        assert!(d.allow);
+
+        let d = parse_stop_decision(fenced_json).unwrap();
+        assert!(!d.allow);
+        assert_eq!(d.message.unwrap(), "keep going");
+
+        let d = parse_stop_decision(fenced_plain).unwrap();
+        assert!(d.allow);
+    }
+
+    /// Malformed JSON must surface the raw text in the error so callers
+    /// can see what the model actually said.
+    #[test]
+    fn parse_stop_decision_error_includes_raw_text() {
+        let garbage = "not json at all";
+        let err = parse_stop_decision(garbage).unwrap_err();
+        assert!(err.contains("not json at all"));
+    }
+
+    /// strip_code_fence is purely syntactic — the content-type tag after
+    /// ``` is ignored and the trailing fence must close the block.
+    #[test]
+    fn strip_code_fence_variants() {
+        assert_eq!(strip_code_fence("```json\nx\n```"), Some("x"));
+        assert_eq!(strip_code_fence("```\nx\n```"), Some("x"));
+        // Not a fence at all → None, caller falls back to raw text.
+        assert_eq!(strip_code_fence("x"), None);
+        // Missing closing fence → None (caller can still try to parse as-is).
+        assert_eq!(strip_code_fence("```json\nx"), None);
+    }
+
+    /// warn_emulation_once must only fire once per provider per process.
+    /// We can't easily assert on stderr, but we can verify the function
+    /// itself doesn't panic on repeat calls and that HashSet insertion
+    /// is idempotent. This is a smoke test, not a strict assertion.
+    #[test]
+    fn warn_emulation_once_is_idempotent() {
+        // Fire multiple times — shouldn't panic or deadlock.
+        for _ in 0..5 {
+            warn_emulation_once("anthropic", "test mechanism");
+        }
+        // Different providers should coexist.
+        warn_emulation_once("google", "test mechanism");
+        warn_emulation_once("anthropic", "test mechanism");
     }
 }
 
