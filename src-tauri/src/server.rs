@@ -2,6 +2,7 @@ use axum::{extract::State as AxumState, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::settings::EngineMode;
 use crate::state::{CoachMode, SharedState};
 
 #[derive(Deserialize)]
@@ -11,6 +12,8 @@ struct HookPayload {
     hook_event_name: Option<String>,
     tool_name: Option<String>,
     tool_input: Option<serde_json::Value>,
+    /// Set by Claude Code on Stop hooks when available.
+    stop_reason: Option<String>,
     cwd: Option<String>,
 }
 
@@ -82,39 +85,120 @@ async fn handle_stop(
     Json(payload): Json<HookPayload>,
 ) -> Json<serde_json::Value> {
     let sid = session_id(&payload);
-    let mut coach = state.coach.write().await;
 
-    // Extract session state we need for decisions, then release the borrow.
-    let session = coach.session(&sid, payload.cwd.as_deref());
-    let mode = session.mode.clone();
-    let on_cooldown = session
-        .last_stop_blocked
-        .map_or(false, |last| last.elapsed() < STOP_COOLDOWN);
+    // Phase 1: read context, increment stop_count, release the lock
+    // before we make any (potentially slow) LLM call.
+    let (coach_mode, provider_capable, prev_response_id, ctx) = {
+        let mut coach = state.coach.write().await;
+        let priorities = coach.priorities.clone();
+        let provider_capable = crate::settings::OBSERVER_CAPABLE_PROVIDERS
+            .contains(&coach.model.provider.as_str());
+        let coach_mode = coach.coach_mode.clone();
+        let session = coach.session(&sid, payload.cwd.as_deref());
+        session.stop_count += 1;
 
-    if mode != CoachMode::Away {
-        coach.sessions.get_mut(&sid).unwrap().stop_count += 1;
-        coach.log(&sid, "Stop", "passed through", None);
-        emit_update(&state.emitter, &coach);
-        return Json(serde_json::json!({}));
+        if session.mode != CoachMode::Away {
+            coach.log(&sid, "Stop", "passed through", None);
+            emit_update(&state.emitter, &coach);
+            return Json(serde_json::json!({}));
+        }
+
+        let prev = session.coach_response_id.clone();
+        let ctx = crate::llm::StopContext {
+            priorities,
+            cwd: session.cwd.clone(),
+            tool_counts: session.tool_counts.clone(),
+            stop_count: session.stop_count,
+            stop_blocked_count: session.stop_blocked_count,
+            stop_reason: payload.stop_reason.clone(),
+        };
+        (coach_mode, provider_capable, prev, ctx)
+    };
+
+    // Phase 2: LLM mode. Two paths:
+    //   • Chained (OpenAI Responses API): continues the observer's chain
+    //     so the model uses everything it's already seen this session.
+    //   • One-shot fallback: any other provider — sends only the digest.
+    if coach_mode == EngineMode::Llm {
+        let chained = if provider_capable {
+            match crate::llm::evaluate_stop_chained(
+                &state.coach,
+                &ctx.priorities,
+                prev_response_id.as_deref(),
+                ctx.stop_reason.as_deref(),
+            )
+            .await
+            {
+                Ok((decision, new_id)) => Some(Ok((decision, Some(new_id)))),
+                Err(e) => Some(Err(e)),
+            }
+        } else {
+            None
+        };
+
+        let result = match chained {
+            Some(r) => r,
+            None => crate::llm::evaluate_stop(&state.coach, &ctx)
+                .await
+                .map(|d| (d, None)),
+        };
+
+        match result {
+            Ok((decision, new_response_id)) if decision.allow => {
+                let mut coach = state.coach.write().await;
+                if let (Some(s), Some(id)) = (coach.sessions.get_mut(&sid), new_response_id) {
+                    s.coach_response_id = Some(id);
+                }
+                coach.log(&sid, "Stop", "allowed (LLM)", None);
+                emit_update(&state.emitter, &coach);
+                return Json(serde_json::json!({}));
+            }
+            Ok((decision, new_response_id)) => {
+                let mut coach = state.coach.write().await;
+                let message = decision
+                    .message
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| crate::state::away_message(&coach.priorities));
+                if let Some(s) = coach.sessions.get_mut(&sid) {
+                    s.last_stop_blocked = Some(std::time::Instant::now());
+                    s.stop_blocked_count += 1;
+                    if let Some(id) = new_response_id {
+                        s.coach_response_id = Some(id);
+                    }
+                }
+                coach.log(&sid, "Stop", "blocked (LLM)", Some(message.clone()));
+                emit_update(&state.emitter, &coach);
+                return Json(serde_json::json!({
+                    "decision": "block",
+                    "reason": message
+                }));
+            }
+            Err(e) => {
+                eprintln!("[coach] LLM evaluate_stop failed, falling back: {e}");
+                // Fall through to rules/cooldown behavior.
+            }
+        }
     }
 
+    // Phase 3: rules mode (or LLM fallback) — fixed message with cooldown escape.
+    let mut coach = state.coach.write().await;
+    let on_cooldown = coach
+        .sessions
+        .get(&sid)
+        .and_then(|s| s.last_stop_blocked)
+        .is_some_and(|last| last.elapsed() < STOP_COOLDOWN);
+
     if on_cooldown {
-        coach.sessions.get_mut(&sid).unwrap().stop_count += 1;
         coach.log(&sid, "Stop", "allowed (cooldown)", None);
         emit_update(&state.emitter, &coach);
         return Json(serde_json::json!({}));
     }
 
-    // Block the stop — update session fields
-    {
-        let session = coach.sessions.get_mut(&sid).unwrap();
-        session.last_stop_blocked = Some(std::time::Instant::now());
-        session.stop_count += 1;
-        session.stop_blocked_count += 1;
+    if let Some(s) = coach.sessions.get_mut(&sid) {
+        s.last_stop_blocked = Some(std::time::Instant::now());
+        s.stop_blocked_count += 1;
     }
-
     let message = crate::state::away_message(&coach.priorities);
-
     coach.log(&sid, "Stop", "blocked — user away", Some(message.clone()));
     emit_update(&state.emitter, &coach);
 
@@ -132,20 +216,58 @@ async fn handle_post_tool_use(
     let sid = session_id(&payload);
     let tool = payload.tool_name.unwrap_or_default();
     let tool_input = payload.tool_input.unwrap_or(serde_json::Value::Null);
-    let mut coach = state.coach.write().await;
-    let session = coach.session(&sid, payload.cwd.as_deref());
-    *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
 
-    // Run enabled rules against tool input
-    let rule_message = check_rules(&coach.rules, &tool, &tool_input);
+    let observer_input;
+    let rule_message;
+    {
+        let mut coach = state.coach.write().await;
+        let prev_response_id = {
+            let session = coach.session(&sid, payload.cwd.as_deref());
+            *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
+            session.coach_response_id.clone()
+        };
 
-    if let Some(ref msg) = rule_message {
-        coach.log(&sid, "PostToolUse", "rule triggered", Some(format!("{}: {}", tool, msg)));
-    } else {
-        coach.log(&sid, "PostToolUse", "observed", Some(tool));
+        rule_message = check_rules(&coach.rules, &tool, &tool_input);
+
+        if let Some(ref msg) = rule_message {
+            coach.log(
+                &sid,
+                "PostToolUse",
+                "rule triggered",
+                Some(format!("{}: {}", tool, msg)),
+            );
+        } else {
+            coach.log(&sid, "PostToolUse", "observed", Some(tool.clone()));
+        }
+
+        // Decide if we should fire the observer. Requires LLM mode + a
+        // provider that can chain response_ids (rig only does this for OpenAI).
+        observer_input = if coach.coach_mode == EngineMode::Llm
+            && crate::settings::OBSERVER_CAPABLE_PROVIDERS
+                .contains(&coach.model.provider.as_str())
+        {
+            Some(ObserverInput {
+                sid: sid.clone(),
+                priorities: coach.priorities.clone(),
+                previous_response_id: prev_response_id,
+                event: crate::llm::build_observer_event(&tool, &tool_input),
+            })
+        } else {
+            None
+        };
+
+        emit_update(&state.emitter, &coach);
+    } // lock released
+
+    // Fire-and-forget: the observer call may take seconds, but the agent
+    // shouldn't wait. PostToolUse always returns immediately.
+    if let Some(input) = observer_input {
+        let coach_state = state.coach.clone();
+        let emitter = state.emitter.clone();
+        tokio::spawn(async move {
+            run_observer(coach_state, emitter, input).await;
+        });
     }
-
-    emit_update(&state.emitter, &coach);
 
     match rule_message {
         Some(msg) => Json(HookResponse {
@@ -154,6 +276,44 @@ async fn handle_post_tool_use(
             })),
         }),
         None => Json(HookResponse::passthrough()),
+    }
+}
+
+struct ObserverInput {
+    sid: String,
+    priorities: Vec<String>,
+    previous_response_id: Option<String>,
+    event: String,
+}
+
+async fn run_observer(
+    coach: SharedState,
+    emitter: Option<tauri::AppHandle>,
+    input: ObserverInput,
+) {
+    match crate::llm::observe_event(
+        &coach,
+        &input.priorities,
+        input.previous_response_id.as_deref(),
+        &input.event,
+    )
+    .await
+    {
+        Ok(call) => {
+            let mut s = coach.write().await;
+            if let Some(sess) = s.sessions.get_mut(&input.sid) {
+                sess.coach_response_id = Some(call.response_id);
+                sess.coach_last_assessment = Some(call.text.clone());
+            }
+            s.log(&input.sid, "Observer", "noted", Some(call.text));
+            emit_update(&emitter, &s);
+        }
+        Err(e) => {
+            eprintln!("[coach] observer call failed: {e}");
+            let mut s = coach.write().await;
+            s.log(&input.sid, "Observer", "error", Some(e));
+            emit_update(&emitter, &s);
+        }
     }
 }
 

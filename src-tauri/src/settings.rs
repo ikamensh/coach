@@ -245,10 +245,16 @@ pub struct Settings {
 
 fn default_model() -> ModelConfig {
     ModelConfig {
-        provider: "google".into(),
-        model: "gemini-2.5-flash".into(),
+        provider: "openai".into(),
+        model: "gpt-5.4-mini".into(),
     }
 }
+
+/// Providers that support stateful coach sessions (response-id chaining
+/// or equivalent server-side conversation state). Currently only OpenAI's
+/// Responses API in rig 0.34. Other providers can still serve the rules
+/// engine and one-shot stop evaluation.
+pub const OBSERVER_CAPABLE_PROVIDERS: &[&str] = &["openai"];
 
 fn default_priorities() -> Vec<String> {
     vec![
@@ -332,13 +338,20 @@ mod tests {
 
     // ── Default values ──────────────────────────────────────────────────
 
-    /// Default model should be google/gemini-2.5-flash — the cheapest
-    /// capable model that works out of the box.
+    /// Default model should be OpenAI gpt-5.4-mini — observer requires
+    /// OpenAI's Responses API for stateful coach sessions.
     #[test]
-    fn default_model_is_gemini_flash() {
+    fn default_model_is_openai_mini() {
         let s = Settings::default();
-        assert_eq!(s.model.provider, "google");
-        assert_eq!(s.model.model, "gemini-2.5-flash");
+        assert_eq!(s.model.provider, "openai");
+        assert_eq!(s.model.model, "gpt-5.4-mini");
+    }
+
+    /// OpenAI must be in the observer-capable list (it's the one provider
+    /// rig 0.34 lets us chain via previous_response_id).
+    #[test]
+    fn openai_is_observer_capable() {
+        assert!(OBSERVER_CAPABLE_PROVIDERS.contains(&"openai"));
     }
 
     /// Priorities should ship with sensible non-empty defaults so the
