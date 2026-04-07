@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useCoachStore } from "../store/useCoachStore";
-import type { TokenSource } from "../store/useCoachStore";
+import type { TokenSource, TokenStatus } from "../store/useCoachStore";
 import { TopBar } from "./TopBar";
 
 export const PROVIDERS = [
@@ -51,12 +51,10 @@ const SOURCE_BADGE: Record<TokenSource, { label: string; className: string }> =
 
 function TokenInput({
   provider,
-  source,
-  envVar,
+  status,
 }: {
   provider: (typeof PROVIDERS)[number];
-  source: TokenSource;
-  envVar?: string;
+  status: TokenStatus | undefined;
 }) {
   const setApiToken = useCoachStore((s) => s.setApiToken);
   const [editing, setEditing] = useState(false);
@@ -72,6 +70,7 @@ function TokenInput({
     setApiToken(provider.id, "");
   };
 
+  const source: TokenSource = status?.source ?? "none";
   const badge = SOURCE_BADGE[source];
 
   if (editing) {
@@ -115,7 +114,7 @@ function TokenInput({
       </span>
       {source === "env" && (
         <span className="text-xs text-zinc-400 dark:text-zinc-500 font-mono">
-          {"$"}{envVar ?? provider.envVar}
+          {"$"}{status?.env_var ?? provider.envVar}
         </span>
       )}
       <div className="flex-1" />
@@ -129,11 +128,7 @@ function TokenInput({
         <button
           onClick={handleClear}
           className="text-xs text-zinc-500 hover:text-red-500"
-          title={
-            source === "user"
-              ? "Remove override, fall back to env if available"
-              : undefined
-          }
+          title="Remove override, fall back to env if available"
         >
           Clear
         </button>
@@ -310,18 +305,14 @@ export function SettingsPane() {
           are detected automatically.
         </p>
         <div className="space-y-3">
-          {PROVIDERS.map((provider) => {
-            const status = tokenStatus[provider.id];
-            const source: TokenSource = status?.source ?? "none";
-            return (
-              <div key={provider.id}>
-                <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                  {provider.label}
-                </div>
-                <TokenInput provider={provider} source={source} envVar={status?.env_var} />
+          {PROVIDERS.map((provider) => (
+            <div key={provider.id}>
+              <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                {provider.label}
               </div>
-            );
-          })}
+              <TokenInput provider={provider} status={tokenStatus[provider.id]} />
+            </div>
+          ))}
         </div>
       </section>
     </div>

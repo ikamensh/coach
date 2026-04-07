@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCoachStore } from "../store/useCoachStore";
 import { TopBar } from "./TopBar";
@@ -84,10 +84,9 @@ function SessionBrowser({
     }
   }, []);
 
-  // Load on first render
-  if (sessions === null && !loading) {
+  useEffect(() => {
     load();
-  }
+  }, [load]);
 
   if (loading) {
     return (
@@ -167,7 +166,6 @@ function ReplayView({
         sessionId,
       });
       setResult(r);
-      // Auto-expand first intervention
       if (r.first_intervention_index !== null) {
         setExpandedEvent(r.first_intervention_index);
       }
@@ -178,9 +176,9 @@ function ReplayView({
     }
   }, [sessionId]);
 
-  if (!result && !loading && !error) {
+  useEffect(() => {
     run();
-  }
+  }, [run]);
 
   if (loading) {
     return (

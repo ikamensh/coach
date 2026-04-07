@@ -1,25 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { timeAgo, projectName, topTools, formatDuration } from "./SessionList";
-
-describe("projectName", () => {
-  /** Extracts the last path segment as the project name. */
-  it("returns last path component from a unix path", () => {
-    expect(projectName("/home/user/projects/coach")).toBe("coach");
-  });
-
-  it("handles single-segment path", () => {
-    expect(projectName("coach")).toBe("coach");
-  });
-
-  it("returns 'unknown' for null input", () => {
-    expect(projectName(null)).toBe("unknown");
-  });
-
-  /** A trailing slash produces an empty last segment; should fall back to full path. */
-  it("falls back to full path when last segment is empty", () => {
-    expect(projectName("/home/user/")).toBe("/home/user/");
-  });
-});
+import { topTools } from "./SessionList";
+import { timeAgo, formatDuration } from "../utils/time";
 
 describe("timeAgo", () => {
   /**

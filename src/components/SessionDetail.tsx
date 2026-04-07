@@ -1,17 +1,13 @@
 import { useMemo } from "react";
 import { useCoachStore } from "../store/useCoachStore";
-import { formatDuration, timeAgo } from "./SessionList";
+import { formatDuration, formatTime, timeAgo } from "../utils/time";
 import { TopBar } from "./TopBar";
-
-function formatTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
 
 export function SessionDetail() {
   const sessions = useCoachStore((s) => s.sessions);
   const selectedPid = useCoachStore((s) => s.selectedPid);
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
-  const selectSession = useCoachStore((s) => s.selectSession);
+  const setView = useCoachStore((s) => s.setView);
 
   const session = sessions.find((s) => s.pid === selectedPid);
 
@@ -24,7 +20,7 @@ export function SessionDetail() {
   if (!session) {
     return (
       <div className="flex flex-col gap-4 h-full">
-        <TopBar title="Session" onBack={() => selectSession(null)} />
+        <TopBar title="Session" onBack={() => setView("main")} />
         <p className="text-sm text-zinc-400 dark:text-zinc-500 italic text-center py-8">
           Session no longer active.
         </p>
@@ -42,7 +38,7 @@ export function SessionDetail() {
     <div className="flex flex-col gap-4 h-full overflow-y-auto">
       <TopBar
         title={session.display_name}
-        onBack={() => selectSession(null)}
+        onBack={() => setView("main")}
         rightSlot={
           <button
             onClick={() =>

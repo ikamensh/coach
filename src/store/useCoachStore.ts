@@ -6,6 +6,7 @@ type CoachMode = "present" | "away";
 type Theme = "light" | "dark" | "system";
 type TokenSource = "user" | "env" | "none";
 type EngineMode = "rules" | "llm";
+type CoachView = "main" | "settings" | "hooks" | "session" | "dev";
 
 interface CoachRule {
   id: string;
@@ -22,9 +23,9 @@ interface ActivityEntry {
 type SessionClient = "claude" | "cursor";
 
 interface SessionSnapshot {
-  /// OS PID — stable across /clear, the canonical identity for a window.
+  /** OS PID — stable across /clear, the canonical identity for a window. */
   pid: number;
-  /// Current conversation id — changes on /clear.
+  /** Current conversation id — changes on /clear. */
   session_id: string;
   mode: CoachMode;
   cwd: string | null;
@@ -98,7 +99,7 @@ interface CoachState {
   modelValidating: boolean;
   initialized: boolean;
   initError: string | null;
-  view: "main" | "settings" | "hooks" | "session" | "dev";
+  view: CoachView;
   selectedPid: number | null;
 }
 
@@ -113,8 +114,8 @@ interface CoachActions {
   setTheme: (theme: Theme) => Promise<void>;
   setApiToken: (provider: string, token: string) => Promise<void>;
   setModel: (model: ModelConfig) => Promise<void>;
-  setView: (view: "main" | "settings" | "hooks" | "session" | "dev") => void;
-  selectSession: (pid: number | null) => void;
+  setView: (view: CoachView) => void;
+  openSession: (pid: number) => void;
   setEngineMode: (mode: EngineMode) => Promise<void>;
   setRules: (rules: CoachRule[]) => Promise<void>;
   toggleRule: (id: string) => Promise<void>;
@@ -145,7 +146,7 @@ function applyThemeClass(theme: Theme) {
   }
 }
 
-export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, SessionClient, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule };
+export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, SessionClient, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule, CoachView };
 
 export const useCoachStore = create<CoachStore>((set, get) => ({
   sessions: [],
@@ -155,7 +156,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   model: { provider: "google", model: "gemini-2.5-flash" },
   tokenStatus: {},
   engineMode: "rules",
-  rules: [{ id: "outdated_models", enabled: true }],
+  rules: [],
   hookStatus: null,
   cursorHookStatus: null,
   pathStatus: null,
@@ -282,7 +283,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
 
   setView: (view) => set({ view }),
 
-  selectSession: (pid) => set({ selectedPid: pid, view: pid !== null ? "session" : "main" }),
+  openSession: (pid) => set({ selectedPid: pid, view: "session" }),
 
   setEngineMode: async (coachMode) => {
     await invoke("set_coach_mode", { coachMode });
@@ -332,12 +333,8 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   },
 
   refreshPathStatus: async () => {
-    try {
-      const pathStatus = await invoke<PathStatus>("get_path_status");
-      set({ pathStatus });
-    } catch {
-      set({ pathStatus: null });
-    }
+    const pathStatus = await invoke<PathStatus>("get_path_status");
+    set({ pathStatus });
   },
 
   installPath: async () => {

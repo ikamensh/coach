@@ -1,5 +1,5 @@
-import { Component, useEffect, type ReactNode } from "react";
-import { useCoachStore } from "./store/useCoachStore";
+import { Component, useEffect, type ComponentType, type ReactNode } from "react";
+import { useCoachStore, type CoachView } from "./store/useCoachStore";
 import { useZoom } from "./hooks/useZoom";
 import { SessionList } from "./components/SessionList";
 import { PriorityList } from "./components/PriorityList";
@@ -52,6 +52,22 @@ function VersionFooter() {
   );
 }
 
+function PaneShell({ children }: { children: ReactNode }) {
+  return (
+    <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
+      {children}
+      <VersionFooter />
+    </div>
+  );
+}
+
+const PANES: Record<Exclude<CoachView, "main">, ComponentType> = {
+  settings: SettingsPane,
+  session: SessionDetail,
+  hooks: HooksPane,
+  dev: DevPane,
+};
+
 function AppInner() {
   const init = useCoachStore((s) => s.init);
   const initialized = useCoachStore((s) => s.initialized);
@@ -78,39 +94,12 @@ function AppInner() {
     );
   }
 
-  if (view === "settings") {
+  if (view !== "main") {
+    const Pane = PANES[view];
     return (
-      <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
-        <SettingsPane />
-        <VersionFooter />
-      </div>
-    );
-  }
-
-  if (view === "session") {
-    return (
-      <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
-        <SessionDetail />
-        <VersionFooter />
-      </div>
-    );
-  }
-
-  if (view === "hooks") {
-    return (
-      <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
-        <HooksPane />
-        <VersionFooter />
-      </div>
-    );
-  }
-
-  if (view === "dev") {
-    return (
-      <div className="h-screen flex flex-col bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 p-4 overflow-hidden">
-        <DevPane />
-        <VersionFooter />
-      </div>
+      <PaneShell>
+        <Pane />
+      </PaneShell>
     );
   }
 

@@ -1,24 +1,8 @@
 import { useCoachStore } from "../store/useCoachStore";
+import { formatDuration } from "../utils/time";
 import { OwlIcon } from "./OwlIcon";
 import { CursorIcon } from "./CursorIcon";
 import { ActivityBar } from "./ActivityBar";
-
-export function projectName(cwd: string | null): string {
-  if (!cwd) return "unknown";
-  const parts = cwd.split("/");
-  return parts[parts.length - 1] || cwd;
-}
-
-export function timeAgo(iso: string): string {
-  const seconds = Math.floor(
-    (Date.now() - new Date(iso).getTime()) / 1000,
-  );
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ago`;
-}
 
 /** Top N tools by count, formatted like "Write: 14, Bash: 8". */
 export function topTools(toolCounts: Record<string, number>, n = 3): string {
@@ -27,17 +11,6 @@ export function topTools(toolCounts: Record<string, number>, n = 3): string {
     .slice(0, n)
     .map(([name, count]) => `${name}: ${count}`)
     .join(", ");
-}
-
-/** Compact duration: "23m", "1h 15m", "2h". */
-export function formatDuration(secs: number): string {
-  if (secs < 60) return `${secs}s`;
-  const minutes = Math.floor(secs / 60);
-  const hours = Math.floor(minutes / 60);
-  const remainMinutes = minutes % 60;
-  if (hours === 0) return `${minutes}m`;
-  if (remainMinutes === 0) return `${hours}h`;
-  return `${hours}h ${remainMinutes}m`;
 }
 
 function abbreviateCwd(cwd: string | null): string {
@@ -56,7 +29,7 @@ export function SessionList() {
   const sessions = useCoachStore((s) => s.sessions);
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
   const setAllMode = useCoachStore((s) => s.setAllMode);
-  const selectSession = useCoachStore((s) => s.selectSession);
+  const openSession = useCoachStore((s) => s.openSession);
 
   const allAway = sessions.length > 0 && sessions.every((s) => s.mode === "away");
   const allPresent = sessions.length > 0 && sessions.every((s) => s.mode === "present");
@@ -105,7 +78,7 @@ export function SessionList() {
             return (
             <li
               key={session.pid}
-              onClick={() => selectSession(session.pid)}
+              onClick={() => openSession(session.pid)}
               className="flex items-start gap-3 bg-zinc-100 dark:bg-zinc-800/50 rounded-lg px-3 py-2 cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors"
             >
               {session.client === "cursor" ? (

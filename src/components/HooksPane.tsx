@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useCoachStore } from "../store/useCoachStore";
+import type { HookStatus } from "../store/useCoachStore";
 import { TopBar } from "./TopBar";
 
 const HOOK_DESCRIPTIONS: Record<string, string> = {
@@ -20,6 +21,81 @@ const CURSOR_HOOK_DESCRIPTIONS: Record<string, string> = {
   afterFileEdit: "Tracks edits (rules + observer)",
   stop: "When away, stop / continue with your priorities",
 };
+
+function HookSection({
+  label,
+  status,
+  descriptions,
+  onInstall,
+  onUninstall,
+}: {
+  label: string;
+  status: HookStatus;
+  descriptions: Record<string, string>;
+  onInstall: () => void;
+  onUninstall: () => void;
+}) {
+  return (
+    <div className="space-y-3">
+      <section>
+        <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
+          {label} — file
+        </h2>
+        <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-3 py-2 rounded">
+          {status.path}
+        </p>
+      </section>
+
+      <section>
+        <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
+          {label} — hooks
+        </h2>
+        <div className="space-y-3">
+          {status.hooks.map((hook) => (
+            <div key={hook.event} className="flex flex-col gap-0.5">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                    hook.installed
+                      ? "bg-emerald-500"
+                      : "bg-zinc-300 dark:bg-zinc-600"
+                  }`}
+                />
+                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                  {hook.event}
+                </span>
+              </div>
+              <p className="text-xs text-zinc-400 dark:text-zinc-500 ml-4 break-all">
+                {descriptions[hook.event] ?? hook.url}
+              </p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {status.installed ? (
+        <div className="flex items-center justify-between">
+          <p className="text-sm text-emerald-600 dark:text-emerald-400">
+            All {label} hooks installed.
+          </p>
+          <button
+            onClick={onUninstall}
+            className="px-3 py-1.5 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg hover:bg-red-500/10 transition-colors"
+          >
+            Uninstall
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={onInstall}
+          className="px-4 py-2 text-sm font-medium bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/30 transition-colors"
+        >
+          Install {label} hooks
+        </button>
+      )}
+    </div>
+  );
+}
 
 export function HooksPane() {
   const hookStatus = useCoachStore((s) => s.hookStatus);
@@ -73,128 +149,24 @@ export function HooksPane() {
       </p>
 
       {hookStatus && (
-        <>
-          <section>
-            <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
-              Claude Code — file
-            </h2>
-            <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-3 py-2 rounded">
-              {hookStatus.path}
-            </p>
-          </section>
-
-          <section>
-            <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
-              Claude Code — hooks
-            </h2>
-            <div className="space-y-3">
-              {hookStatus.hooks.map((hook) => (
-                <div key={hook.event} className="flex flex-col gap-0.5">
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                        hook.installed
-                          ? "bg-emerald-500"
-                          : "bg-zinc-300 dark:bg-zinc-600"
-                      }`}
-                    />
-                    <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                      {hook.event}
-                    </span>
-                  </div>
-                  <p className="text-xs text-zinc-400 dark:text-zinc-500 ml-4">
-                    {HOOK_DESCRIPTIONS[hook.event] ?? hook.url}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          {!hookStatus.installed && (
-            <button
-              onClick={installHooks}
-              className="px-4 py-2 text-sm font-medium bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/30 transition-colors"
-            >
-              Install Claude hooks
-            </button>
-          )}
-
-          {hookStatus.installed && (
-            <div className="flex items-center justify-between">
-              <p className="text-sm text-emerald-600 dark:text-emerald-400">
-                All Claude hooks installed.
-              </p>
-              <button
-                onClick={uninstallHooks}
-                className="px-3 py-1.5 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg hover:bg-red-500/10 transition-colors"
-              >
-                Uninstall
-              </button>
-            </div>
-          )}
-        </>
+        <HookSection
+          label="Claude Code"
+          status={hookStatus}
+          descriptions={HOOK_DESCRIPTIONS}
+          onInstall={installHooks}
+          onUninstall={uninstallHooks}
+        />
       )}
 
       {cursorHookStatus && (
         <div className="border-t border-zinc-200 dark:border-zinc-800 pt-4 mt-2">
-          <section>
-            <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
-              Cursor Agent — file
-            </h2>
-            <p className="text-xs font-mono text-zinc-500 dark:text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-3 py-2 rounded">
-              {cursorHookStatus.path}
-            </p>
-          </section>
-
-          <section className="mt-3">
-            <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
-              Cursor Agent — hooks
-            </h2>
-            <div className="space-y-3">
-              {cursorHookStatus.hooks.map((hook) => (
-                <div key={hook.event} className="flex flex-col gap-0.5">
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                        hook.installed
-                          ? "bg-emerald-500"
-                          : "bg-zinc-300 dark:bg-zinc-600"
-                      }`}
-                    />
-                    <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                      {hook.event}
-                    </span>
-                  </div>
-                  <p className="text-xs text-zinc-400 dark:text-zinc-500 ml-4 break-all">
-                    {CURSOR_HOOK_DESCRIPTIONS[hook.event] ?? hook.url}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          {!cursorHookStatus.installed && (
-            <button
-              onClick={installCursorHooks}
-              className="mt-3 px-4 py-2 text-sm font-medium bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/30 transition-colors"
-            >
-              Install Cursor hooks
-            </button>
-          )}
-
-          {cursorHookStatus.installed && (
-            <div className="flex items-center justify-between mt-3">
-              <p className="text-sm text-emerald-600 dark:text-emerald-400">
-                All Cursor hooks installed.
-              </p>
-              <button
-                onClick={uninstallCursorHooks}
-                className="px-3 py-1.5 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg hover:bg-red-500/10 transition-colors"
-              >
-                Uninstall
-              </button>
-            </div>
-          )}
+          <HookSection
+            label="Cursor Agent"
+            status={cursorHookStatus}
+            descriptions={CURSOR_HOOK_DESCRIPTIONS}
+            onInstall={installCursorHooks}
+            onUninstall={uninstallCursorHooks}
+          />
         </div>
       )}
 
