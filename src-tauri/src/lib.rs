@@ -4,6 +4,9 @@ pub mod llm;
 pub mod logging;
 pub mod path_install;
 pub mod pid_resolver;
+pub mod prompts;
+#[cfg(feature = "pycoach")]
+pub mod pycoach;
 pub mod replay;
 pub mod rules;
 pub mod scanner;
@@ -45,32 +48,40 @@ pub fn run() {
         })
         .setup(|app| {
             eprintln!("[coach] setup: loading settings");
-            let settings = Settings::load();
+            let mut settings = Settings::load();
             let port = settings.port;
             eprintln!("[coach] setup: port={port}, priorities={:?}", settings.priorities);
+
+            // Reconcile managed hooks with the user's recorded intent.
+            // - First-time users: no-op (intent flag false, nothing on disk).
+            // - Returning users (clean exit auto-cleanup): re-installs.
+            // - Legacy users (hooks on disk, no flag yet): one-shot migration
+            //   that flips the flag and tops up any newly-managed hooks.
+            // Persist any flag changes back to disk before handing settings
+            // off to CoachState — otherwise the migration would be lost on
+            // the next restart.
+            match settings::sync_managed_hooks(port, &mut settings.hooks_user_enabled) {
+                Ok(added) if !added.is_empty() => {
+                    eprintln!("[coach] setup: synced Claude hooks: {added:?}");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[coach] setup: Claude hook sync failed: {e}"),
+            }
+            match settings::sync_managed_cursor_hooks(port, &mut settings.cursor_hooks_user_enabled)
+            {
+                Ok(added) if !added.is_empty() => {
+                    eprintln!("[coach] setup: synced Cursor hooks: {added:?}");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[coach] setup: Cursor hook sync failed: {e}"),
+            }
+            settings.save();
+
             let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(settings)));
 
-            // Top up Coach's managed hooks if the user has previously
-            // opted in. Adds anything we've added to the managed set
-            // since they last installed without making them click
-            // "Install Hooks" again. No-op on unconfigured machines —
-            // first install stays explicit.
-            match settings::topup_managed_hooks(port) {
-                Ok(added) if !added.is_empty() => {
-                    eprintln!("[coach] setup: topped up managed hooks: {added:?}");
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("[coach] setup: hook top-up failed: {e}"),
-            }
-            match settings::topup_managed_cursor_hooks(port) {
-                Ok(added) if !added.is_empty() => {
-                    eprintln!("[coach] setup: topped up Cursor managed hooks: {added:?}");
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("[coach] setup: Cursor hook top-up failed: {e}"),
-            }
-
             app.manage(state.clone());
+
+            spawn_pycoach_if_configured(state.clone());
 
             let server_state = state.clone();
             let app_handle = app.handle().clone();
@@ -110,6 +121,7 @@ pub fn run() {
             commands::get_cursor_hook_status,
             commands::install_cursor_hooks,
             commands::uninstall_cursor_hooks,
+            commands::set_auto_uninstall_hooks_on_exit,
             commands::list_saved_sessions,
             commands::replay_session,
             commands::set_coach_mode,
@@ -118,8 +130,19 @@ pub fn run() {
             commands::install_path,
             commands::uninstall_path,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Coach");
+        .build(tauri::generate_context!())
+        .expect("error while building Coach")
+        .run(|_app_handle, event| {
+            // Run hook cleanup once when the event loop is exiting. We
+            // re-read settings from disk rather than locking the in-memory
+            // state from this sync callback — every command that mutates
+            // the relevant flags also calls `Settings::save()` immediately,
+            // so disk and memory agree.
+            if matches!(event, tauri::RunEvent::Exit) {
+                eprintln!("[coach] exiting, running hook cleanup");
+                settings::cleanup_hooks_on_exit();
+            }
+        });
 }
 
 /// Headless daemon mode: start the HTTP hook server and the session
@@ -154,20 +177,25 @@ pub async fn serve(port_override: Option<u16>) -> Result<(), String> {
 
     eprintln!("[coach serve] listening on {addr}, priorities={:?}", settings.priorities);
 
+    // Reconcile managed hooks the same way the GUI path does so headless
+    // and GUI behave identically. No-op on a fresh tempdir HOME.
+    if let Ok(added) = settings::sync_managed_hooks(port, &mut settings.hooks_user_enabled) {
+        if !added.is_empty() {
+            eprintln!("[coach serve] synced Claude hooks: {added:?}");
+        }
+    }
+    if let Ok(added) =
+        settings::sync_managed_cursor_hooks(port, &mut settings.cursor_hooks_user_enabled)
+    {
+        if !added.is_empty() {
+            eprintln!("[coach serve] synced Cursor hooks: {added:?}");
+        }
+    }
+    settings.save();
+
     let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(settings)));
 
-    // Top up managed hooks the same way the GUI path does, so headless
-    // and GUI behave identically. No-op on a fresh tempdir HOME.
-    if let Ok(added) = settings::topup_managed_hooks(port) {
-        if !added.is_empty() {
-            eprintln!("[coach serve] topped up managed hooks: {added:?}");
-        }
-    }
-    if let Ok(added) = settings::topup_managed_cursor_hooks(port) {
-        if !added.is_empty() {
-            eprintln!("[coach serve] topped up Cursor managed hooks: {added:?}");
-        }
-    }
+    spawn_pycoach_if_configured(state.clone());
 
     let server_task = tokio::spawn({
         let s = state.clone();
@@ -178,7 +206,7 @@ pub async fn serve(port_override: Option<u16>) -> Result<(), String> {
         async move { scanner::run_session_scanner(s, None).await }
     });
 
-    tokio::select! {
+    let result = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             eprintln!("[coach serve] received Ctrl-C, shutting down");
             Ok(())
@@ -189,5 +217,40 @@ pub async fn serve(port_override: Option<u16>) -> Result<(), String> {
         r = scanner_task => {
             Err(format!("scanner task exited unexpectedly: {r:?}"))
         }
-    }
+    };
+
+    // Run hook cleanup on every shutdown path, not just clean Ctrl-C —
+    // a worker panic on the way out is still a "Coach is gone" event for
+    // the other live agent windows, and we want their hooks gone too.
+    settings::cleanup_hooks_on_exit();
+
+    result
 }
+
+/// Try to spawn the pycoach Python sidecar in the background.
+///
+/// No-op when the `pycoach` Cargo feature is disabled, or when no
+/// `COACH_PYCOACH_*` env var is set. The sidecar is opt-in while its HTTP
+/// contract is still moving. Failures are logged and swallowed: a missing
+/// or broken sidecar must never block Coach startup, since the Rust LLM
+/// backend keeps working without it.
+#[cfg(feature = "pycoach")]
+fn spawn_pycoach_if_configured(state: SharedState) {
+    let Some(launcher) = pycoach::Pycoach::launcher_from_env() else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        match pycoach::Pycoach::launch(launcher).await {
+            Ok(py) => {
+                eprintln!("[coach] pycoach sidecar ready at {}", py.base_url);
+                state.write().await.pycoach = Some(Arc::new(py));
+            }
+            Err(e) => {
+                eprintln!("[coach] pycoach sidecar failed to start: {e}");
+            }
+        }
+    });
+}
+
+#[cfg(not(feature = "pycoach"))]
+fn spawn_pycoach_if_configured(_state: SharedState) {}

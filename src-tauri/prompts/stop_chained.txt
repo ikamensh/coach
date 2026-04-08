@@ -1,0 +1,4 @@
+The agent is requesting to stop. Stop reason from Claude: {stop_reason}.
+
+Decide whether to allow or block. Respond with ONLY a JSON object:
+{"allow": true|false, "message": "directive if blocking, null if allowing"}

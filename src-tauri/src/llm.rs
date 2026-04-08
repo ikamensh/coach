@@ -285,7 +285,7 @@ where
 
 // ── Stop evaluation ────────────────────────────────────────────────────
 
-fn build_stop_prompt(ctx: &StopContext) -> String {
+fn build_stop_prompt(ctx: &StopContext) -> Result<String, String> {
     let priorities = if ctx.priorities.is_empty() {
         "none set".to_string()
     } else {
@@ -311,20 +311,21 @@ fn build_stop_prompt(ctx: &StopContext) -> String {
 
     let reason = ctx.stop_reason.as_deref().unwrap_or("not specified");
     let dir = ctx.cwd.as_deref().unwrap_or("unknown");
+    let stop_count = ctx.stop_count.to_string();
+    let stop_blocked_count = ctx.stop_blocked_count.to_string();
 
-    format!(
-        "An autonomous coding agent wants to stop. The user is away.\n\
-         Directory: {dir}\n\
-         Tools used this session: {tools}\n\
-         Stop attempts: {stop_count} ({blocked} previously blocked by coach)\n\
-         Agent's stop reason: {reason}\n\n\
-         User priorities (highest first):\n{priorities}\n\n\
-         Allow stopping if the agent completed meaningful work or is stuck with no clear next step.\n\
-         Block if it is pausing to ask a question or stopping prematurely — it should proceed autonomously.\n\
-         When blocking, write a brief directive (1-2 sentences) about what to focus on next, referencing the priorities.",
-        stop_count = ctx.stop_count,
-        blocked = ctx.stop_blocked_count,
-    )
+    let template = crate::prompts::load("stop_oneshot")?;
+    Ok(crate::prompts::render(
+        &template,
+        &[
+            ("dir", dir),
+            ("tools", &tools),
+            ("stop_count", &stop_count),
+            ("stop_blocked_count", &stop_blocked_count),
+            ("stop_reason", reason),
+            ("priorities", &priorities),
+        ],
+    ))
 }
 
 /// Ask the coach LLM whether to allow or block a stop request.
@@ -334,7 +335,7 @@ pub async fn evaluate_stop(
     state: &SharedState,
     ctx: &StopContext,
 ) -> Result<StopDecision, String> {
-    let prompt = build_stop_prompt(ctx);
+    let prompt = build_stop_prompt(ctx)?;
     let resp = extract::<StopDecision>(&prompt, state).await?;
     Ok(resp.data)
 }
@@ -602,7 +603,7 @@ pub async fn chain_gemini(
 /// System message established on the first call in a coach session.
 /// On subsequent calls (with `previous_response_id`), the model already
 /// remembers it, but resending is harmless.
-pub fn coach_system_prompt(priorities: &[String]) -> String {
+pub fn coach_system_prompt(priorities: &[String]) -> Result<String, String> {
     let ptext = if priorities.is_empty() {
         "(none set)".to_string()
     } else {
@@ -613,23 +614,22 @@ pub fn coach_system_prompt(priorities: &[String]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    format!(
-        "You are Coach, an observer watching an autonomous coding agent work for an away user.\n\
-         After each tool the agent uses, I will send you a brief description of what just happened. \
-         Your job is to maintain context. A one-line acknowledgment is enough — don't write essays.\n\n\
-         When I later ask you to evaluate a stop request, use everything you've observed to decide:\n\
-         • Allow the stop if the agent has completed meaningful work or is genuinely stuck.\n\
-         • Block it if the agent is pausing for confirmation or stopping prematurely. \
-         When blocking, write a brief directive (1-2 sentences) about what to focus on next, anchored to the priorities.\n\n\
-         User priorities (highest first):\n{ptext}"
-    )
+    let template = crate::prompts::load("coach_system")?;
+    Ok(crate::prompts::render(&template, &[("priorities", &ptext)]))
 }
 
 /// Build the per-event message we send to the observer.
 /// Tool input is included verbatim so the observer "sees what Claude saw."
-pub fn build_observer_event(tool_name: &str, tool_input: &serde_json::Value) -> String {
+pub fn build_observer_event(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Result<String, String> {
     let input_pretty = serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".into());
-    format!("Tool: {tool_name}\nInput: {input_pretty}")
+    let template = crate::prompts::load("observer_event")?;
+    Ok(crate::prompts::render(
+        &template,
+        &[("tool_name", tool_name), ("tool_input", &input_pretty)],
+    ))
 }
 
 /// Read the active provider from state, releasing the lock immediately.
@@ -757,7 +757,7 @@ pub async fn observe_event(
     chain: &crate::state::CoachChain,
     event: &str,
 ) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
-    let system = coach_system_prompt(priorities);
+    let system = coach_system_prompt(priorities)?;
     session_send(
         state,
         chain,
@@ -780,12 +780,9 @@ pub async fn evaluate_stop_chained(
     stop_reason: Option<&str>,
 ) -> Result<(StopDecision, crate::state::CoachChain, crate::state::CoachUsage), String> {
     let reason = stop_reason.unwrap_or("not specified");
-    let prompt = format!(
-        "The agent is requesting to stop. Stop reason from Claude: {reason}.\n\n\
-         Decide whether to allow or block. Respond with ONLY a JSON object:\n\
-         {{\"allow\": true|false, \"message\": \"directive if blocking, null if allowing\"}}"
-    );
-    let system = coach_system_prompt(priorities);
+    let stop_chained_template = crate::prompts::load("stop_chained")?;
+    let prompt = crate::prompts::render(&stop_chained_template, &[("stop_reason", reason)]);
+    let system = coach_system_prompt(priorities)?;
     let (text, new_chain, usage) = session_send(
         state,
         chain,
@@ -819,7 +816,7 @@ pub struct NameSessionInput {
 
 /// Build the prompt for `name_session`. Pure function so the test can
 /// pin its shape without making a real LLM call.
-pub fn build_name_session_prompt(input: &NameSessionInput) -> String {
+pub fn build_name_session_prompt(input: &NameSessionInput) -> Result<String, String> {
     let cwd = input.cwd.as_deref().unwrap_or("unknown");
     let priorities = if input.priorities.is_empty() {
         "(none set)".to_string()
@@ -842,14 +839,16 @@ pub fn build_name_session_prompt(input: &NameSessionInput) -> String {
         .last_assessment
         .as_deref()
         .unwrap_or("(no assessment yet)");
-    format!(
-        "Summarize the primary topic of this coding session as a title of AT MOST 4 words.\n\
-         Reply with the title only — no quotes, no punctuation, no explanation.\n\n\
-         cwd: {cwd}\n\
-         priorities: {priorities}\n\
-         tools used: {tools}\n\
-         latest observer note: {assessment}"
-    )
+    let template = crate::prompts::load("name_session_user")?;
+    Ok(crate::prompts::render(
+        &template,
+        &[
+            ("cwd", cwd),
+            ("priorities", &priorities),
+            ("tools", &tools),
+            ("assessment", assessment),
+        ],
+    ))
 }
 
 /// Post-process the model's reply into a clean title: trim whitespace,
@@ -895,13 +894,13 @@ pub async fn name_session(
     state: &SharedState,
     input: &NameSessionInput,
 ) -> Result<(String, crate::state::CoachUsage), String> {
-    let prompt = build_name_session_prompt(input);
+    let prompt = build_name_session_prompt(input)?;
     // Tiny system prompt — the namer doesn't need the full coach preamble.
-    let system = "You name coding sessions. Respond with at most four words.";
+    let system = crate::prompts::load("name_session_system")?;
     let (text, _chain, usage) = session_send(
         state,
         &crate::state::CoachChain::Empty,
-        system,
+        &system,
         &prompt,
         CallConstraints {
             max_output_tokens: Some(20),
@@ -981,7 +980,7 @@ mod tests {
     #[test]
     fn build_stop_prompt_includes_context() {
         let ctx = ctx_with(vec!["Speed", "Quality"]);
-        let p = build_stop_prompt(&ctx);
+        let p = build_stop_prompt(&ctx).unwrap();
         for needle in [
             "Speed", "Quality", "/projects/foo", "Read: 5", "Edit: 2",
             "2", "1", "end_turn",
@@ -1002,7 +1001,7 @@ mod tests {
             stop_blocked_count: 0,
             stop_reason: None,
         };
-        let p = build_stop_prompt(&ctx);
+        let p = build_stop_prompt(&ctx).unwrap();
         assert!(p.contains("none set"));
         assert!(p.contains("none yet"));
         assert!(p.contains("unknown"));
@@ -1031,7 +1030,7 @@ mod tests {
     /// the right value frame from the very first call in the chain.
     #[test]
     fn coach_system_prompt_includes_priorities() {
-        let p = coach_system_prompt(&["Speed".into(), "Quality".into()]);
+        let p = coach_system_prompt(&["Speed".into(), "Quality".into()]).unwrap();
         assert!(p.contains("Speed"));
         assert!(p.contains("Quality"));
         assert!(p.contains("1. Speed"));
@@ -1042,7 +1041,7 @@ mod tests {
     /// awkward "highest first:\n\n" with nothing under it.
     #[test]
     fn coach_system_prompt_handles_no_priorities() {
-        let p = coach_system_prompt(&[]);
+        let p = coach_system_prompt(&[]).unwrap();
         assert!(p.contains("none set"));
     }
 
@@ -1051,7 +1050,7 @@ mod tests {
     #[test]
     fn build_observer_event_includes_tool_and_input() {
         let input = serde_json::json!({"file_path": "/a.py", "content": "print(1)"});
-        let event = build_observer_event("Write", &input);
+        let event = build_observer_event("Write", &input).unwrap();
         assert!(event.contains("Write"));
         assert!(event.contains("/a.py"));
         assert!(event.contains("print(1)"));
@@ -1061,7 +1060,7 @@ mod tests {
     /// (some tools have no input or send a literal null).
     #[test]
     fn build_observer_event_handles_null_input() {
-        let event = build_observer_event("NoInput", &serde_json::Value::Null);
+        let event = build_observer_event("NoInput", &serde_json::Value::Null).unwrap();
         assert!(event.contains("NoInput"));
         assert!(event.contains("null"));
     }
@@ -1146,7 +1145,7 @@ mod tests {
             &[("Edit", 12), ("Read", 5)],
             Some("investigating the auth bug"),
         );
-        let p = build_name_session_prompt(&input);
+        let p = build_name_session_prompt(&input).unwrap();
         for needle in [
             "/projects/coach",
             "Simplicity",
@@ -1165,7 +1164,7 @@ mod tests {
     #[test]
     fn build_name_session_prompt_handles_empty_input() {
         let input = name_input(vec![], None, &[], None);
-        let p = build_name_session_prompt(&input);
+        let p = build_name_session_prompt(&input).unwrap();
         assert!(p.contains("none set"));
         assert!(p.contains("none yet"));
         assert!(p.contains("unknown"));
@@ -1276,6 +1275,11 @@ mod live_tests {
             http_client: reqwest::Client::new(),
             coach_mode: EngineMode::Llm,
             rules: vec![],
+            auto_uninstall_hooks_on_exit: true,
+            hooks_user_enabled: false,
+            cursor_hooks_user_enabled: false,
+            #[cfg(feature = "pycoach")]
+            pycoach: None,
         };
         Some(Arc::new(RwLock::new(state)))
     }
@@ -1378,7 +1382,8 @@ mod live_tests {
                 "old_string": "",
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
-        );
+        )
+        .unwrap();
         let (_text1, chain1, _u1) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
                 .await
@@ -1392,7 +1397,8 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
-        );
+        )
+        .unwrap();
         let (_text2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
             .await
             .expect("second observe_event failed");
@@ -1417,7 +1423,8 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
-        );
+        )
+        .unwrap();
         let (_text, observed_chain, _u) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
                 .await
@@ -1487,6 +1494,11 @@ mod live_tests {
             http_client: reqwest::Client::new(),
             coach_mode: EngineMode::Llm,
             rules: vec![],
+            auto_uninstall_hooks_on_exit: true,
+            hooks_user_enabled: false,
+            cursor_hooks_user_enabled: false,
+            #[cfg(feature = "pycoach")]
+            pycoach: None,
         };
         Some(Arc::new(RwLock::new(state)))
     }
@@ -1566,7 +1578,8 @@ mod live_tests {
                 "file_path": "/tmp/x.py",
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
-        );
+        )
+        .unwrap();
         let (_t1, chain1, _u1) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
                 .await
@@ -1580,7 +1593,8 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
-        );
+        )
+        .unwrap();
         let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
             .await
             .expect("second observe_event failed");
@@ -1603,7 +1617,8 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
-        );
+        )
+        .unwrap();
         let (_t, observed_chain, _u_obs) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
                 .await
@@ -1657,6 +1672,11 @@ mod live_tests {
             http_client: reqwest::Client::new(),
             coach_mode: EngineMode::Llm,
             rules: vec![],
+            auto_uninstall_hooks_on_exit: true,
+            hooks_user_enabled: false,
+            cursor_hooks_user_enabled: false,
+            #[cfg(feature = "pycoach")]
+            pycoach: None,
         };
         Some(Arc::new(RwLock::new(state)))
     }
@@ -1732,7 +1752,8 @@ mod live_tests {
                 "file_path": "/tmp/x.py",
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
-        );
+        )
+        .unwrap();
         let (_t1, chain1, _u1) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
                 .await
@@ -1746,7 +1767,8 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
-        );
+        )
+        .unwrap();
         let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
             .await
             .expect("second observe_event failed");
@@ -1769,7 +1791,8 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
-        );
+        )
+        .unwrap();
         let (_t, observed_chain, _u_obs) =
             observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
                 .await

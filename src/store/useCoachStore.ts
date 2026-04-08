@@ -83,6 +83,7 @@ interface CoachSnapshot {
   token_status: Record<string, TokenStatus>;
   coach_mode: EngineMode;
   rules: CoachRule[];
+  auto_uninstall_hooks_on_exit: boolean;
 }
 
 interface HookEntryStatus {
@@ -117,6 +118,7 @@ interface CoachState {
   hookStatus: HookStatus | null;
   cursorHookStatus: HookStatus | null;
   pathStatus: PathStatus | null;
+  autoUninstallHooksOnExit: boolean;
   modelError: string | null;
   modelValidating: boolean;
   initialized: boolean;
@@ -150,6 +152,7 @@ interface CoachActions {
   refreshPathStatus: () => Promise<void>;
   installPath: () => Promise<void>;
   uninstallPath: () => Promise<void>;
+  setAutoUninstallHooksOnExit: (enabled: boolean) => Promise<void>;
 }
 
 type CoachStore = CoachState & CoachActions;
@@ -182,6 +185,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   hookStatus: null,
   cursorHookStatus: null,
   pathStatus: null,
+  autoUninstallHooksOnExit: true,
   modelError: null,
   modelValidating: false,
   initialized: false,
@@ -205,6 +209,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         tokenStatus: snapshot.token_status,
         engineMode: snapshot.coach_mode,
         rules: snapshot.rules,
+        autoUninstallHooksOnExit: snapshot.auto_uninstall_hooks_on_exit,
         initialized: true,
       });
     } catch (e) {
@@ -225,6 +230,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         tokenStatus: s.token_status,
         engineMode: s.coach_mode,
         rules: s.rules,
+        autoUninstallHooksOnExit: s.auto_uninstall_hooks_on_exit,
       });
     });
 
@@ -367,5 +373,10 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   uninstallPath: async () => {
     const pathStatus = await invoke<PathStatus>("uninstall_path");
     set({ pathStatus });
+  },
+
+  setAutoUninstallHooksOnExit: async (enabled) => {
+    await invoke("set_auto_uninstall_hooks_on_exit", { enabled });
+    set({ autoUninstallHooksOnExit: enabled });
   },
 }));

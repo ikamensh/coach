@@ -199,17 +199,29 @@ pub async fn get_hook_status(state: tauri::State<'_, SharedState>) -> Result<Hoo
 }
 
 #[tauri::command]
-pub async fn install_hooks(state: tauri::State<'_, SharedState>) -> Result<HookStatus, String> {
-    let port = state.read().await.port;
-    settings::install_hooks(port)?;
-    Ok(settings::check_hook_status(port))
+pub async fn install_hooks(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+) -> Result<HookStatus, String> {
+    let mut s = state.write().await;
+    s.hooks_user_enabled = true;
+    s.save();
+    settings::install_hooks(s.port)?;
+    emit_snapshot(&app, &s)?;
+    Ok(settings::check_hook_status(s.port))
 }
 
 #[tauri::command]
-pub async fn uninstall_hooks(state: tauri::State<'_, SharedState>) -> Result<HookStatus, String> {
-    let port = state.read().await.port;
-    settings::uninstall_hooks(port)?;
-    Ok(settings::check_hook_status(port))
+pub async fn uninstall_hooks(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+) -> Result<HookStatus, String> {
+    let mut s = state.write().await;
+    s.hooks_user_enabled = false;
+    s.save();
+    settings::uninstall_hooks(s.port)?;
+    emit_snapshot(&app, &s)?;
+    Ok(settings::check_hook_status(s.port))
 }
 
 #[tauri::command]
@@ -222,17 +234,26 @@ pub async fn get_cursor_hook_status(
 #[tauri::command]
 pub async fn install_cursor_hooks(
     state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<HookStatus, String> {
-    let port = state.read().await.port;
-    settings::install_cursor_hooks(port)?;
+    let mut s = state.write().await;
+    s.cursor_hooks_user_enabled = true;
+    s.save();
+    settings::install_cursor_hooks(s.port)?;
+    emit_snapshot(&app, &s)?;
     Ok(settings::check_cursor_hook_status())
 }
 
 #[tauri::command]
 pub async fn uninstall_cursor_hooks(
-    _state: tauri::State<'_, SharedState>,
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<HookStatus, String> {
+    let mut s = state.write().await;
+    s.cursor_hooks_user_enabled = false;
+    s.save();
     settings::uninstall_cursor_hooks()?;
+    emit_snapshot(&app, &s)?;
     Ok(settings::check_cursor_hook_status())
 }
 
@@ -273,6 +294,19 @@ pub async fn set_rules(
 ) -> Result<(), String> {
     let mut s = state.write().await;
     s.rules = rules;
+    s.save();
+    emit_snapshot(&app, &s)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_auto_uninstall_hooks_on_exit(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = state.write().await;
+    s.auto_uninstall_hooks_on_exit = enabled;
     s.save();
     emit_snapshot(&app, &s)?;
     Ok(())

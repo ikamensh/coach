@@ -1,0 +1,12 @@
+An autonomous coding agent wants to stop. The user is away.
+Directory: {dir}
+Tools used this session: {tools}
+Stop attempts: {stop_count} ({stop_blocked_count} previously blocked by coach)
+Agent's stop reason: {stop_reason}
+
+User priorities (highest first):
+{priorities}
+
+Allow stopping if the agent completed meaningful work or is stuck with no clear next step.
+Block if it is pausing to ask a question or stopping prematurely — it should proceed autonomously.
+When blocking, write a brief directive (1-2 sentences) about what to focus on next, referencing the priorities.

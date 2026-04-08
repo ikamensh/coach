@@ -1,0 +1,7 @@
+Summarize the primary topic of this coding session as a title of AT MOST 4 words.
+Reply with the title only — no quotes, no punctuation, no explanation.
+
+cwd: {cwd}
+priorities: {priorities}
+tools used: {tools}
+latest observer note: {assessment}

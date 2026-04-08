@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
+#[cfg(feature = "pycoach")]
+use crate::pycoach::Pycoach;
 use crate::settings::{CoachRule, EngineMode, ModelConfig, Settings};
 
 pub const EVENT_STATE_UPDATED: &str = "coach-state-updated";
@@ -199,6 +201,9 @@ pub struct CoachSnapshot {
     /// Providers that support stateful coach sessions. Frontend uses this
     /// to mark unsupported choices in the model picker.
     pub observer_capable_providers: Vec<String>,
+    /// User toggle: when Coach exits cleanly, remove its hooks so other
+    /// live Claude/Cursor sessions don't fail with "HTTP undefined".
+    pub auto_uninstall_hooks_on_exit: bool,
 }
 
 /// Per-window state. The owning `CoachState.sessions` map is keyed by
@@ -270,6 +275,19 @@ pub struct CoachState {
     pub http_client: reqwest::Client,
     pub coach_mode: EngineMode,
     pub rules: Vec<CoachRule>,
+    /// On clean exit, uninstall managed hooks. See `Settings`.
+    pub auto_uninstall_hooks_on_exit: bool,
+    /// Persistent record of "user opted in to Claude Code hooks". Survives
+    /// auto-cleanup on exit so the next startup re-installs.
+    pub hooks_user_enabled: bool,
+    /// Same, for Cursor Agent hooks.
+    pub cursor_hooks_user_enabled: bool,
+    /// Optional Python sidecar (`pycoach serve`). `None` until/unless the
+    /// user opts in via `COACH_PYCOACH_BIN` / `COACH_PYCOACH_CMD`. The Arc
+    /// owns a child process with `kill_on_drop`, so dropping `CoachState`
+    /// at app exit also stops the sidecar.
+    #[cfg(feature = "pycoach")]
+    pub pycoach: Option<Arc<Pycoach>>,
 }
 
 impl CoachState {
@@ -357,6 +375,11 @@ impl CoachState {
             http_client: reqwest::Client::new(),
             coach_mode: settings.coach_mode,
             rules: settings.rules,
+            auto_uninstall_hooks_on_exit: settings.auto_uninstall_hooks_on_exit,
+            hooks_user_enabled: settings.hooks_user_enabled,
+            cursor_hooks_user_enabled: settings.cursor_hooks_user_enabled,
+            #[cfg(feature = "pycoach")]
+            pycoach: None,
         }
     }
 
@@ -376,6 +399,9 @@ impl CoachState {
             port: self.port,
             coach_mode: self.coach_mode.clone(),
             rules: self.rules.clone(),
+            auto_uninstall_hooks_on_exit: self.auto_uninstall_hooks_on_exit,
+            hooks_user_enabled: self.hooks_user_enabled,
+            cursor_hooks_user_enabled: self.cursor_hooks_user_enabled,
         }
     }
 
@@ -580,6 +606,7 @@ impl CoachState {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            auto_uninstall_hooks_on_exit: self.auto_uninstall_hooks_on_exit,
         }
     }
 
@@ -727,6 +754,11 @@ pub(crate) fn test_state() -> CoachState {
         http_client: reqwest::Client::new(),
         coach_mode: crate::settings::EngineMode::Rules,
         rules: vec![],
+        auto_uninstall_hooks_on_exit: true,
+        hooks_user_enabled: false,
+        cursor_hooks_user_enabled: false,
+        #[cfg(feature = "pycoach")]
+        pycoach: None,
     }
 }
 
@@ -1172,24 +1204,15 @@ mod tests {
             port: 8080,
             coach_mode: EngineMode::Rules,
             rules: vec![],
+            auto_uninstall_hooks_on_exit: false,
+            hooks_user_enabled: true,
+            cursor_hooks_user_enabled: true,
         };
 
-        let state = CoachState {
-            sessions: HashMap::new(),
-            session_id_to_pid: HashMap::new(),
-            priorities: original.priorities.clone(),
-            port: original.port,
-            theme: original.theme.clone(),
-            default_mode: CoachMode::Present,
-            model: original.model.clone(),
-            api_tokens: original.api_tokens.clone(),
-            env_tokens: HashMap::new(),
-            http_client: reqwest::Client::new(),
-            coach_mode: original.coach_mode.clone(),
-            rules: original.rules.clone(),
-        };
-
-        let restored = state.to_settings();
+        // Round-trip via from_settings/to_settings — exercises the full
+        // pair instead of constructing CoachState by hand and silently
+        // forgetting new fields.
+        let restored = CoachState::from_settings(original.clone()).to_settings();
 
         assert_eq!(restored.api_tokens, original.api_tokens);
         assert_eq!(restored.model.provider, original.model.provider);
@@ -1199,6 +1222,15 @@ mod tests {
         assert_eq!(restored.port, original.port);
         assert_eq!(restored.coach_mode, original.coach_mode);
         assert_eq!(restored.rules, original.rules);
+        assert_eq!(
+            restored.auto_uninstall_hooks_on_exit,
+            original.auto_uninstall_hooks_on_exit
+        );
+        assert_eq!(restored.hooks_user_enabled, original.hooks_user_enabled);
+        assert_eq!(
+            restored.cursor_hooks_user_enabled,
+            original.cursor_hooks_user_enabled
+        );
     }
 
     #[test]

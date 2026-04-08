@@ -1,0 +1,4 @@
+# Built sidecar binaries land here. They're large platform-specific
+# artifacts produced by scripts/build_pycoach_sidecar.sh — not source.
+*
+!.gitignore

@@ -108,28 +108,46 @@ pub fn install_hooks(port: u16) -> Result<(), String> {
     install_hooks_at(port, &claude_settings_path())
 }
 
-/// Top up Coach's managed hooks if at least one is already installed —
-/// i.e. the user has previously opted in, and Coach has since gained a
-/// new managed hook (like SessionStart) that needs to be added.
+/// Reconcile Coach-managed Claude Code hooks on startup.
 ///
-/// Returns the names of any hooks that were newly added so the caller
-/// can log them.
+/// Drives behaviour from the persistent intent flag (`hooks_user_enabled`),
+/// not the on-disk presence of hooks. This matters because
+/// `auto_uninstall_hooks_on_exit` deletes the on-disk entries on every clean
+/// shutdown — without a separate intent flag we'd lose the "user opted in"
+/// signal between sessions.
 ///
-/// **Does nothing** if no Coach hooks are installed yet — first-time
-/// install stays explicit, gated on the user clicking "Install Hooks".
-pub fn topup_managed_hooks(port: u16) -> Result<Vec<String>, String> {
-    topup_managed_hooks_at(port, &claude_settings_path())
+/// Behaviour:
+///   * If `*user_enabled` is true: install any missing managed hooks.
+///   * If `*user_enabled` is false but managed hooks already exist on disk
+///     (legacy install or pre-flag user): flip the flag to true and install
+///     any missing ones. This is a one-shot migration so existing users keep
+///     working without re-clicking Install.
+///   * Otherwise: no-op. First-time install stays explicit.
+///
+/// Returns the names of any newly-added hooks so the caller can log them.
+pub fn sync_managed_hooks(port: u16, user_enabled: &mut bool) -> Result<Vec<String>, String> {
+    sync_managed_hooks_at(port, &claude_settings_path(), user_enabled)
 }
 
-pub fn topup_managed_hooks_at(
+pub fn sync_managed_hooks_at(
     port: u16,
     path: &std::path::Path,
+    user_enabled: &mut bool,
 ) -> Result<Vec<String>, String> {
     let status = check_hook_status_at(port, path);
     let any_installed = status.hooks.iter().any(|h| h.installed);
-    if !any_installed {
+
+    // Legacy migration: hooks on disk but no recorded intent → adopt as
+    // opted-in. Preserves behaviour for users who installed before the
+    // intent flag existed.
+    if !*user_enabled && any_installed {
+        *user_enabled = true;
+    }
+
+    if !*user_enabled {
         return Ok(vec![]);
     }
+
     let missing: Vec<String> = status
         .hooks
         .iter()
@@ -477,20 +495,31 @@ pub fn uninstall_cursor_hooks_at(
     Ok(())
 }
 
-pub fn topup_managed_cursor_hooks(port: u16) -> Result<Vec<String>, String> {
-    topup_managed_cursor_hooks_at(port, &cursor_hooks_path(), &cursor_shim_path())
+/// Cursor twin of `sync_managed_hooks`. See that function for the rationale
+/// behind the `user_enabled` flag and the legacy migration.
+pub fn sync_managed_cursor_hooks(
+    port: u16,
+    user_enabled: &mut bool,
+) -> Result<Vec<String>, String> {
+    sync_managed_cursor_hooks_at(port, &cursor_hooks_path(), &cursor_shim_path(), user_enabled)
 }
 
-pub fn topup_managed_cursor_hooks_at(
+pub fn sync_managed_cursor_hooks_at(
     port: u16,
     hooks_path: &std::path::Path,
     shim_path: &std::path::Path,
+    user_enabled: &mut bool,
 ) -> Result<Vec<String>, String> {
     let status = check_cursor_hook_status_at(hooks_path, shim_path);
     let any_installed = status.hooks.iter().any(|h| h.installed);
-    if !any_installed {
+
+    if !*user_enabled && any_installed {
+        *user_enabled = true;
+    }
+    if !*user_enabled {
         return Ok(vec![]);
     }
+
     let missing: Vec<String> = status
         .hooks
         .iter()
@@ -502,6 +531,48 @@ pub fn topup_managed_cursor_hooks_at(
     }
     install_cursor_hooks_at(port, hooks_path, shim_path)?;
     Ok(missing)
+}
+
+// ── Exit-time cleanup ────────────────────────────────────────────────────
+
+/// Best-effort hook cleanup on Coach shutdown. Reads `~/.coach/settings.json`
+/// from disk so the call site can be a sync shutdown callback that has no
+/// access to (or shouldn't be locking) the in-memory `CoachState`.
+///
+/// No-op if `auto_uninstall_hooks_on_exit` is false. Removes Claude and/or
+/// Cursor managed hooks based on the persistent intent flags. Errors are
+/// logged but never panic — shutdown must always make progress.
+pub fn cleanup_hooks_on_exit() {
+    cleanup_hooks_on_exit_at(
+        &Settings::load(),
+        &claude_settings_path(),
+        &cursor_hooks_path(),
+        &cursor_shim_path(),
+    );
+}
+
+/// Path-injectable variant for unit tests.
+pub fn cleanup_hooks_on_exit_at(
+    settings: &Settings,
+    claude_path: &std::path::Path,
+    cursor_path: &std::path::Path,
+    cursor_shim: &std::path::Path,
+) {
+    if !settings.auto_uninstall_hooks_on_exit {
+        return;
+    }
+    if settings.hooks_user_enabled && claude_path.exists() {
+        match uninstall_hooks_at(settings.port, claude_path) {
+            Ok(()) => eprintln!("[coach] cleanup: removed Claude Code hooks"),
+            Err(e) => eprintln!("[coach] cleanup: Claude hook removal failed: {e}"),
+        }
+    }
+    if settings.cursor_hooks_user_enabled && cursor_path.exists() {
+        match uninstall_cursor_hooks_at(cursor_path, cursor_shim) {
+            Ok(()) => eprintln!("[coach] cleanup: removed Cursor hooks"),
+            Err(e) => eprintln!("[coach] cleanup: Cursor hook removal failed: {e}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +633,24 @@ pub struct Settings {
     pub coach_mode: EngineMode,
     #[serde(default = "default_rules")]
     pub rules: Vec<CoachRule>,
+    /// On clean exit, uninstall Coach's hooks from `~/.claude/settings.json`
+    /// and `~/.cursor/hooks.json` so that other live Claude/Cursor sessions
+    /// don't fail with "HTTP undefined" when they try to call the now-stopped
+    /// hook server. Default true; users can opt out if they'd rather see
+    /// the failures as a signal that Coach isn't running. Re-installation
+    /// happens automatically on next startup based on `hooks_user_enabled` /
+    /// `cursor_hooks_user_enabled`.
+    #[serde(default = "default_true")]
+    pub auto_uninstall_hooks_on_exit: bool,
+    /// Persistent record of the user's intent to use Claude Code hooks. Set
+    /// when the user clicks Install, cleared when they click Uninstall. Survives
+    /// auto-cleanup-on-exit so the next startup knows to reinstall. Migrated
+    /// to `true` on first run if hooks are already on disk.
+    #[serde(default)]
+    pub hooks_user_enabled: bool,
+    /// Same idea, for Cursor Agent hooks.
+    #[serde(default)]
+    pub cursor_hooks_user_enabled: bool,
 }
 
 fn default_model() -> ModelConfig {
@@ -612,6 +701,10 @@ fn default_rules() -> Vec<CoachRule> {
     }]
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -622,6 +715,9 @@ impl Default for Settings {
             port: default_port(),
             coach_mode: default_coach_mode(),
             rules: default_rules(),
+            auto_uninstall_hooks_on_exit: default_true(),
+            hooks_user_enabled: false,
+            cursor_hooks_user_enabled: false,
         }
     }
 }
@@ -764,6 +860,9 @@ mod tests {
             rules: vec![
                 CoachRule { id: "outdated_models".into(), enabled: false },
             ],
+            auto_uninstall_hooks_on_exit: false,
+            hooks_user_enabled: true,
+            cursor_hooks_user_enabled: true,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -777,6 +876,15 @@ mod tests {
         assert_eq!(restored.port, original.port);
         assert_eq!(restored.coach_mode, original.coach_mode);
         assert_eq!(restored.rules, original.rules);
+        assert_eq!(
+            restored.auto_uninstall_hooks_on_exit,
+            original.auto_uninstall_hooks_on_exit
+        );
+        assert_eq!(restored.hooks_user_enabled, original.hooks_user_enabled);
+        assert_eq!(
+            restored.cursor_hooks_user_enabled,
+            original.cursor_hooks_user_enabled
+        );
     }
 
     /// Deserializing an empty JSON object `{}` should produce the same
@@ -793,6 +901,12 @@ mod tests {
         assert_eq!(from_json.theme, defaults.theme);
         assert_eq!(from_json.port, defaults.port);
         assert!(from_json.api_tokens.is_empty());
+        // New hook-cleanup fields default sensibly: opt-in to cleanup,
+        // opt-out of any auto-install. Users upgrading from older Coach
+        // versions get these defaults silently.
+        assert!(from_json.auto_uninstall_hooks_on_exit);
+        assert!(!from_json.hooks_user_enabled);
+        assert!(!from_json.cursor_hooks_user_enabled);
     }
 
     // ── has_http_hook helper ────────────────────────────────────────────
@@ -969,34 +1083,34 @@ mod tests {
         assert!(hooks.is_empty(), "all coach-only events should be cleaned up");
     }
 
-    // ── topup_managed_hooks ─────────────────────────────────────────────
+    // ── sync_managed_hooks ──────────────────────────────────────────────
 
-    /// On a clean settings file with no Coach hooks, top-up does nothing —
-    /// first install must be explicit.
+    /// On a clean settings file with no Coach hooks AND no recorded
+    /// intent, sync does nothing — first install must be explicit.
     #[test]
-    fn topup_does_nothing_when_no_hooks_installed() {
+    fn sync_does_nothing_when_unenabled_and_no_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{}").unwrap();
 
-        let added = topup_managed_hooks_at(7700, &path).unwrap();
+        let mut user_enabled = false;
+        let added = sync_managed_hooks_at(7700, &path, &mut user_enabled).unwrap();
         assert!(added.is_empty());
+        assert!(!user_enabled, "no migration when nothing on disk");
 
         let status = check_hook_status_at(7700, &path);
         assert!(!status.installed);
-        assert!(status.hooks.iter().all(|h| !h.installed));
     }
 
-    /// When Coach hooks are partially installed (e.g. user upgraded and
-    /// Coach gained a new managed hook), top-up adds only the missing
-    /// ones and reports them.
+    /// Legacy migration: hooks were installed by an older Coach (or by a
+    /// previous session before the intent flag existed). Sync adopts them
+    /// — flips the flag, fills in any missing managed hooks, and reports
+    /// the additions.
     #[test]
-    fn topup_fills_in_missing_hooks_when_some_already_installed() {
+    fn sync_migrates_legacy_install_and_fills_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
-        // Pre-install one Coach hook (simulating an older Coach version
-        // that only managed PostToolUse).
         let partial = serde_json::json!({
             "hooks": {
                 "PostToolUse": [{
@@ -1006,10 +1120,10 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string_pretty(&partial).unwrap()).unwrap();
 
-        let added = topup_managed_hooks_at(7700, &path).unwrap();
+        let mut user_enabled = false;
+        let added = sync_managed_hooks_at(7700, &path, &mut user_enabled).unwrap();
 
-        // The other three managed hooks should be reported as added.
-        // (Was four including SessionStart — see expected_hook_urls.)
+        assert!(user_enabled, "legacy install flips intent flag on");
         let mut sorted = added.clone();
         sorted.sort();
         assert_eq!(
@@ -1022,27 +1136,46 @@ mod tests {
         );
 
         let status = check_hook_status_at(7700, &path);
-        assert!(status.installed, "all four managed hooks should now be installed");
+        assert!(status.installed);
     }
 
-    /// Idempotent: running top-up again right after returns no additions.
+    /// User clicked Install previously (intent=true). After auto-cleanup
+    /// on exit, settings.json has no hooks. Next startup sync must
+    /// reinstall them — this is the round-trip the whole feature is
+    /// designed around.
     #[test]
-    fn topup_is_idempotent() {
+    fn sync_reinstalls_after_cleanup_when_intent_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // settings.json doesn't even exist — like after a clean uninstall
+        // that removed all coach entries (or after the file was never
+        // created).
+        let mut user_enabled = true;
+        let added = sync_managed_hooks_at(7700, &path, &mut user_enabled).unwrap();
+        assert!(!added.is_empty());
+
+        let status = check_hook_status_at(7700, &path);
+        assert!(status.installed);
+    }
+
+    /// Idempotent: running sync twice returns no additions on the second call.
+    #[test]
+    fn sync_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
-        install_hooks_at(7700, &path).unwrap();
-        let added = topup_managed_hooks_at(7700, &path).unwrap();
-        assert!(added.is_empty(), "fully-installed state requires no top-up");
+        let mut user_enabled = true;
+        sync_managed_hooks_at(7700, &path, &mut user_enabled).unwrap();
+        let added = sync_managed_hooks_at(7700, &path, &mut user_enabled).unwrap();
+        assert!(added.is_empty(), "fully-installed state requires no sync");
     }
 
-    /// User's pre-existing non-Coach hooks must survive a top-up.
+    /// User's pre-existing non-Coach hooks must survive a sync.
     #[test]
-    fn topup_preserves_non_coach_hooks() {
+    fn sync_preserves_non_coach_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
-        // Pre-install one Coach hook + one user command hook.
         let mixed = serde_json::json!({
             "hooks": {
                 "Stop": [
@@ -1053,12 +1186,12 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string_pretty(&mixed).unwrap()).unwrap();
 
-        topup_managed_hooks_at(7700, &path).unwrap();
+        let mut user_enabled = false;
+        sync_managed_hooks_at(7700, &path, &mut user_enabled).unwrap();
 
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let stop_entries = content["hooks"]["Stop"].as_array().unwrap();
-        // Both the user's command hook and Coach's http hook should still be present.
         assert_eq!(stop_entries.len(), 2);
         let kinds: Vec<&str> = stop_entries
             .iter()
@@ -1066,5 +1199,104 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"command"));
         assert!(kinds.contains(&"http"));
+    }
+
+    // ── cleanup_hooks_on_exit_at ────────────────────────────────────────
+
+    /// The whole-cycle property test: install hooks, run the cleanup
+    /// (mimicking app shutdown), then sync (mimicking next startup) — the
+    /// final on-disk state should match the original install. This is the
+    /// regression guard for the "stop hook → HTTP undefined" bug that
+    /// motivated the feature.
+    #[test]
+    fn install_cleanup_sync_roundtrip_matches_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude_settings.json");
+        let cursor_hooks = dir.path().join("cursor_hooks.json");
+        let cursor_shim = dir.path().join("coach-cursor-hook.sh");
+
+        // User opts in to both surfaces.
+        install_hooks_at(7700, &claude).unwrap();
+        install_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim).unwrap();
+        let original_claude = std::fs::read_to_string(&claude).unwrap();
+        let original_cursor = std::fs::read_to_string(&cursor_hooks).unwrap();
+
+        // Simulate app shutdown with auto-uninstall enabled.
+        let settings = Settings {
+            auto_uninstall_hooks_on_exit: true,
+            hooks_user_enabled: true,
+            cursor_hooks_user_enabled: true,
+            port: 7700,
+            ..Settings::default()
+        };
+        cleanup_hooks_on_exit_at(&settings, &claude, &cursor_hooks, &cursor_shim);
+
+        // After cleanup, neither file should still contain managed hooks.
+        assert!(!check_hook_status_at(7700, &claude).installed);
+        assert!(!check_cursor_hook_status_at(&cursor_hooks, &cursor_shim).installed);
+
+        // Simulate next startup: sync re-installs based on intent flags.
+        let mut hooks_intent = true;
+        let mut cursor_intent = true;
+        sync_managed_hooks_at(7700, &claude, &mut hooks_intent).unwrap();
+        sync_managed_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim, &mut cursor_intent)
+            .unwrap();
+
+        // The end state should be byte-equivalent to the original install.
+        // (Well — order-equivalent. Both are written by the same install_*_at
+        // path, so the JSON should match exactly.)
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), original_claude);
+        assert_eq!(std::fs::read_to_string(&cursor_hooks).unwrap(), original_cursor);
+    }
+
+    /// When auto-uninstall is disabled, cleanup is a no-op even with
+    /// intent flags set. This is the opt-out path the user requested.
+    #[test]
+    fn cleanup_is_noop_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude_settings.json");
+        let cursor_hooks = dir.path().join("cursor_hooks.json");
+        let cursor_shim = dir.path().join("coach-cursor-hook.sh");
+
+        install_hooks_at(7700, &claude).unwrap();
+        install_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim).unwrap();
+
+        let settings = Settings {
+            auto_uninstall_hooks_on_exit: false,
+            hooks_user_enabled: true,
+            cursor_hooks_user_enabled: true,
+            port: 7700,
+            ..Settings::default()
+        };
+        cleanup_hooks_on_exit_at(&settings, &claude, &cursor_hooks, &cursor_shim);
+
+        assert!(check_hook_status_at(7700, &claude).installed);
+        assert!(check_cursor_hook_status_at(&cursor_hooks, &cursor_shim).installed);
+    }
+
+    /// Cleanup ignores surfaces the user never opted in to. If only Claude
+    /// hooks are managed, Cursor hooks.json must not be touched.
+    #[test]
+    fn cleanup_only_touches_enabled_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude_settings.json");
+        let cursor_hooks = dir.path().join("cursor_hooks.json");
+        let cursor_shim = dir.path().join("coach-cursor-hook.sh");
+
+        install_hooks_at(7700, &claude).unwrap();
+        install_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim).unwrap();
+        let cursor_before = std::fs::read_to_string(&cursor_hooks).unwrap();
+
+        let settings = Settings {
+            auto_uninstall_hooks_on_exit: true,
+            hooks_user_enabled: true,
+            cursor_hooks_user_enabled: false,
+            port: 7700,
+            ..Settings::default()
+        };
+        cleanup_hooks_on_exit_at(&settings, &claude, &cursor_hooks, &cursor_shim);
+
+        assert!(!check_hook_status_at(7700, &claude).installed);
+        assert_eq!(std::fs::read_to_string(&cursor_hooks).unwrap(), cursor_before);
     }
 }

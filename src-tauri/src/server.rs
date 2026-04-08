@@ -431,12 +431,22 @@ pub(crate) async fn run_post_tool_use(
                 .contains(&coach.model.provider.as_str());
 
         observer_input = if llm_active {
-            Some(ObserverInput {
-                pid,
-                priorities: coach.priorities.clone(),
-                prev_chain,
-                event: crate::llm::build_observer_event(&tool, &tool_input),
-            })
+            match crate::llm::build_observer_event(&tool, &tool_input) {
+                Ok(event) => Some(ObserverInput {
+                    pid,
+                    priorities: coach.priorities.clone(),
+                    prev_chain,
+                    event,
+                }),
+                Err(e) => {
+                    eprintln!("[coach] observer event prompt failed: {e}");
+                    if let Some(s) = coach.sessions.get_mut(&pid) {
+                        s.coach_errors += 1;
+                        s.coach_last_error = Some(e);
+                    }
+                    None
+                }
+            }
         } else {
             None
         };

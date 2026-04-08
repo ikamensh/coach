@@ -1,0 +1,2 @@
+Tool: {tool_name}
+Input: {tool_input}

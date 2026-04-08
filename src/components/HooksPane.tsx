@@ -108,6 +108,10 @@ export function HooksPane() {
   const uninstallCursorHooks = useCoachStore((s) => s.uninstallCursorHooks);
   const installPath = useCoachStore((s) => s.installPath);
   const uninstallPath = useCoachStore((s) => s.uninstallPath);
+  const autoUninstallHooksOnExit = useCoachStore((s) => s.autoUninstallHooksOnExit);
+  const setAutoUninstallHooksOnExit = useCoachStore(
+    (s) => s.setAutoUninstallHooksOnExit,
+  );
   const [pathError, setPathError] = useState<string | null>(null);
 
   const handleInstallPath = async () => {
@@ -147,6 +151,24 @@ export function HooksPane() {
         Cursor's hook runner blocks raw <code className="font-mono text-xs">curl</code>{" "}
         commands). Existing entries are preserved.
       </p>
+
+      <label className="flex items-start gap-2 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={autoUninstallHooksOnExit}
+          onChange={(e) => setAutoUninstallHooksOnExit(e.target.checked)}
+          className="mt-0.5 h-4 w-4 accent-emerald-500"
+        />
+        <span className="text-sm text-zinc-700 dark:text-zinc-300">
+          Remove hooks when Coach exits
+          <span className="block text-xs text-zinc-500 dark:text-zinc-400">
+            Avoids "HTTP undefined" errors in other live Claude/Cursor sessions
+            after you quit Coach. Reinstalled automatically next time Coach
+            starts. Turn off if you'd rather see the failures as a sign that
+            Coach isn't running.
+          </span>
+        </span>
+      </label>
 
       {hookStatus && (
         <HookSection
