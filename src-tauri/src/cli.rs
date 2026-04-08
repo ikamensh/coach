@@ -667,7 +667,7 @@ fn http_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Val
         }
         resp.json::<serde_json::Value>()
             .await
-            .or_else(|_| Ok(serde_json::Value::Null))
+            .or(Ok(serde_json::Value::Null))
     })
 }
 

@@ -871,7 +871,7 @@ pub fn clean_session_title(raw: &str) -> Option<String> {
     // Trim surrounding quotes / brackets, then trailing punctuation.
     let trimmed = after_label
         .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '*')
-        .trim_end_matches(|c: char| c == '.' || c == ',' || c == ';' || c == ':')
+        .trim_end_matches(['.', ',', ';', ':'])
         .trim();
 
     if trimmed.is_empty() {

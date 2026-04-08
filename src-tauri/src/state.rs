@@ -384,9 +384,9 @@ impl CoachState {
     }
 
     pub fn set_all_modes(&mut self, mode: CoachMode) {
-        self.default_mode = mode.clone();
+        self.default_mode = mode;
         for session in self.sessions.values_mut() {
-            session.mode = mode.clone();
+            session.mode = mode;
         }
     }
 
@@ -433,7 +433,7 @@ impl CoachState {
         // between PIDs.
         self.session_id_to_pid.insert(session_id.to_string(), pid);
 
-        let default_mode = self.default_mode.clone();
+        let default_mode = self.default_mode;
         let now = Utc::now();
 
         match self.sessions.get_mut(&pid) {
@@ -524,7 +524,7 @@ impl CoachState {
             .map(|s| SessionSnapshot {
                 pid: s.pid,
                 session_id: s.current_session_id.clone(),
-                mode: s.mode.clone(),
+                mode: s.mode,
                 cwd: s.cwd.clone(),
                 last_event: s.last_event_time,
                 event_count: s.event_count,
@@ -656,7 +656,7 @@ impl CoachState {
                 pid,
                 // No current conversation yet — first hook will fill this in.
                 current_session_id: String::new(),
-                mode: self.default_mode.clone(),
+                mode: self.default_mode,
                 cwd: cwd.map(String::from),
                 last_event: Instant::now(),
                 last_event_time: started_at,

@@ -289,7 +289,7 @@ pub async fn replay_session(
 
     let topic = messages.iter()
         .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("user"))
-        .map(|m| extract_topic_from_entry(m))
+        .map(extract_topic_from_entry)
         .unwrap_or_default();
 
     let cwd = messages.iter()
@@ -370,9 +370,7 @@ pub async fn replay_session(
             stop_count += 1;
         }
 
-        let (action, message) = if mode == "present" {
-            (None, None)
-        } else if ev.kind != "Stop" {
+        let (action, message) = if mode == "present" || ev.kind != "Stop" {
             (None, None)
         } else if mode == "llm" {
             let ctx = crate::llm::StopContext {

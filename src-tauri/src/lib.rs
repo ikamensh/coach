@@ -99,7 +99,7 @@ pub fn run() {
 
             if std::env::args().any(|a| a == "--devtools") {
                 if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.open_devtools();
+                    w.open_devtools();
                 }
             }
 

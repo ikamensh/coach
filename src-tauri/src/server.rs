@@ -109,7 +109,7 @@ pub(crate) async fn run_permission_request(
     let mut coach = state.coach.write().await;
     let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
     *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
-    let mode = session.mode.clone();
+    let mode = session.mode;
 
     if mode == CoachMode::Away {
         coach.log(pid, "PermissionRequest", "auto-approved", Some(tool));
@@ -387,7 +387,7 @@ pub(crate) const TITLE_INTERVAL_EVENTS: usize = 15;
 
 pub(crate) fn should_request_title(event_count: usize) -> bool {
     event_count == TITLE_FIRST_EVENT
-        || (event_count > TITLE_FIRST_EVENT && event_count % TITLE_INTERVAL_EVENTS == 0)
+        || (event_count > TITLE_FIRST_EVENT && event_count.is_multiple_of(TITLE_INTERVAL_EVENTS))
 }
 
 pub(crate) async fn run_post_tool_use(
