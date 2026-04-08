@@ -2,8 +2,10 @@
 
 ## Verify
 
-- `cd src-tauri && cargo test` — default build has no `pycoach` feature.
-- Optional sidecar smoke: `cargo test --features pycoach --test pycoach_sidecar` (needs `uv` on PATH and sibling checkout `ilya/pycoach`).
+- Strict clippy gate: `cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings`.
+- `cd src-tauri && cargo test` — default build has no `pycoach` feature (28 passed, 2 ignored in main test binary).
+- With all features: `cargo test --all-features` adds **2** `pycoach_sidecar` tests (needs `uv` + sibling `ilya/pycoach`).
+- Optional sidecar only: `cargo test --features pycoach --test pycoach_sidecar`.
 - Stage 2 gate (2026): `src-tauri` `cargo test`, frontend tests, production build — all pass.
 
 ## Frontend / integration (Stage 2 review)

@@ -1458,7 +1458,7 @@ async fn api_set_api_token_inserts_and_clears() {
         .await
         .unwrap();
     let s = state.read().await;
-    assert!(s.api_tokens.get("openai").is_none());
+    assert!(!s.api_tokens.contains_key("openai"));
 }
 
 #[tokio::test]
