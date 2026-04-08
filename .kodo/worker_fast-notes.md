@@ -2,11 +2,11 @@
 
 ## Verify
 
-- Strict clippy gate: `cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings`.
-- `cd src-tauri && cargo test` — default build has no `pycoach` feature (28 passed, 2 ignored in main test binary).
-- With all features: `cargo test --all-features` adds **2** `pycoach_sidecar` tests (needs `uv` + sibling `ilya/pycoach`).
+- Strict clippy: `cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings`.
+- Rust tests: `cargo test` ~184 passed, 17 ignored (default); `cargo test --all-features` ~186 passed, 17 ignored (adds `pycoach_sidecar` when `uv` + sibling `ilya/pycoach` available).
 - Optional sidecar only: `cargo test --features pycoach --test pycoach_sidecar`.
-- Stage 2 gate (2026): `src-tauri` `cargo test`, frontend tests, production build — all pass.
+- Frontend: repo root `npm test`, `npm run build`.
+- **Kodo improve (Stage 3):** auto-fixes land as `chore: auto-fix issues found by kodo improve`; triage report is `improve-report.md` under `~/.kodo/runs/<run_id>/` (ensure Rust/npm counts in the report match actual `cargo test` / `npm test` output).
 
 ## Frontend / integration (Stage 2 review)
 
