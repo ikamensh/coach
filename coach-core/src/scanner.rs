@@ -159,7 +159,12 @@ pub async fn sync_sessions_with(
                 match bootstrap_from_jsonl(&jsonl_path) {
                     Ok(boot) => {
                         if let Some(sess) = coach.sessions.get_mut(&session.pid) {
-                            sess.current_session_id = session.session_id.clone();
+                            // Only adopt the session file's id if the hook
+                            // hasn't already set one — otherwise we'd mismatch
+                            // and the next hook would trigger the /clear path.
+                            if sess.current_session_id.is_empty() {
+                                sess.current_session_id = session.session_id.clone();
+                            }
                             sess.tool_counts = boot.tool_counts;
                             sess.active_agents = boot.active_agents;
                             sess.event_count = boot.total_tools;
@@ -589,5 +594,59 @@ mod tests {
         assert_eq!(sess.tool_counts.get("Edit"), Some(&2));
         assert_eq!(sess.event_count, 2);
         assert_eq!(sess.active_agents, 0);
+    }
+
+    /// Regression: when the hook's session_id differs from the session
+    /// file's (stale after /clear), bootstrap must NOT overwrite the
+    /// hook's session_id — otherwise the next hook triggers the /clear
+    /// reset path and wipes tool_counts.
+    #[tokio::test]
+    async fn bootstrap_does_not_overwrite_hook_session_id() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let my_pid = std::process::id();
+        let hook_sid = "current-conversation";
+        let file_sid = "stale-from-session-file";
+        let cwd = "/tmp/stale-test";
+
+        // Session file has the STALE id.
+        write_session_file_full(sessions_dir.path(), my_pid, file_sid, cwd);
+        // JSONL exists for the stale id (has some history).
+        write_jsonl(projects_dir.path(), cwd, file_sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        ]);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        // Hook arrives first with the CURRENT conversation id.
+        {
+            let mut coach = state.write().await;
+            coach.apply_hook_event(my_pid, hook_sid, Some(cwd));
+        }
+
+        // Scanner bootstraps — must NOT replace hook_sid with file_sid.
+        let live = scan_live_sessions_in(sessions_dir.path());
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+
+        let coach = state.read().await;
+        let sess = coach.sessions.get(&my_pid).unwrap();
+        assert_eq!(sess.current_session_id, hook_sid,
+            "bootstrap must not overwrite the hook's session_id");
+        assert!(sess.bootstrapped);
+
+        // Now simulate the next hook — same hook_sid, should NOT reset.
+        drop(coach);
+        {
+            let mut coach = state.write().await;
+            let sess = coach.apply_hook_event(my_pid, hook_sid, Some(cwd));
+            // If the bug were present, this would be 1 (reset). Should be 2+.
+            assert!(sess.event_count > 1,
+                "next hook should increment, not reset; got event_count={}",
+                sess.event_count);
+        }
     }
 }
