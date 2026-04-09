@@ -573,8 +573,8 @@ async fn observer_consumer(
 
 /// Periodic session-title generation. Stateless LLM call (fresh chain),
 /// fire-and-forget like the observer. On success, writes the cleaned
-/// title to `coach_session_title`. On failure, surfaces the error in
-/// `coach_last_error` and increments `coach_errors` so the existing
+/// title to `telemetry.session_title`. On failure, surfaces the error in
+/// `telemetry.last_error` and increments `telemetry.errors` so the
 /// telemetry panel reflects it — same shape as `run_observer`.
 async fn run_session_namer(
     coach: SharedState,
