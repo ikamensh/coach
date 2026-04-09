@@ -127,8 +127,7 @@ impl Harness {
         if let Some(ref t) = sess.coach_session_title { eprintln!("  title: {t}"); }
         eprintln!("  events: {}  coach_calls: {}  errors: {}", sess.event_count, sess.coach_calls, sess.coach_errors);
         eprintln!("  chain: {} ({} msgs)", sess.coach_chain.kind(), match &sess.coach_chain {
-            coach_lib::state::CoachChain::Anthropic { history } => history.len(),
-            coach_lib::state::CoachChain::Google { history } => history.len(),
+            coach_lib::state::CoachChain::History { messages } => messages.len(),
             _ => 0,
         });
         if let Some(ref err) = sess.coach_last_error { eprintln!("  error: {err}"); }

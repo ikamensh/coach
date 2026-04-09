@@ -21,16 +21,12 @@ pub enum CoachMode {
 
 // ── Coach LLM chain (per-session conversation handle) ─────────────────
 //
-// Different providers preserve conversation state in different ways:
-//   • OpenAI Responses API: server-side, indexed by response_id. We just
-//     store the latest id and pass it as previous_response_id next call.
-//   • Anthropic: no server state. We keep the message history client-side
-//     (cached cheap via prompt caching).
-//   • Google Gemini: no server state, no usable prefix caching for a
-//     growing conversation. Pure client-side history, full input charged
-//     on every call.
-// `CoachChain` lets one SessionState field cover all three — and stays
-// `Empty` until the first observer call.
+// Two data shapes cover all providers:
+//   • ServerId: server retains conversation state, we just store an
+//     opaque id (OpenAI Responses API `previous_response_id`).
+//   • History: client-side turn list resent every call (Anthropic with
+//     prompt caching, Google Gemini with full resend, mocks).
+// `CoachChain` stays `Empty` until the first observer call.
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -50,14 +46,11 @@ pub struct CoachMessage {
 pub enum CoachChain {
     #[default]
     Empty,
-    OpenAi {
-        response_id: String,
+    ServerId {
+        id: String,
     },
-    Anthropic {
-        history: Vec<CoachMessage>,
-    },
-    Google {
-        history: Vec<CoachMessage>,
+    History {
+        messages: Vec<CoachMessage>,
     },
 }
 
@@ -66,9 +59,8 @@ impl CoachChain {
     pub fn kind(&self) -> &'static str {
         match self {
             CoachChain::Empty => "empty",
-            CoachChain::OpenAi { .. } => "openai",
-            CoachChain::Anthropic { .. } => "anthropic",
-            CoachChain::Google { .. } => "google",
+            CoachChain::ServerId { .. } => "server_id",
+            CoachChain::History { .. } => "history",
         }
     }
 }
@@ -565,14 +557,11 @@ impl CoachState {
                 coach_session_title: s.coach_session_title.clone(),
                 coach_chain_kind: s.coach_chain.kind().to_string(),
                 coach_chain_messages: match &s.coach_chain {
-                    // Anthropic + Google both store the literal turn list —
-                    // len is exact.
-                    CoachChain::Anthropic { history } => history.len(),
-                    CoachChain::Google { history } => history.len(),
-                    // OpenAI Responses API gives us only an opaque id, so the
+                    CoachChain::History { messages } => messages.len(),
+                    // Server-side state gives us only an opaque id, so the
                     // visible "messages held" count == successful calls. Each
                     // call appends one user + one assistant message server-side.
-                    CoachChain::OpenAi { .. } => s.coach_calls * 2,
+                    CoachChain::ServerId { .. } => s.coach_calls * 2,
                     CoachChain::Empty => 0,
                 },
                 coach_calls: s.coach_calls,
@@ -882,7 +871,7 @@ mod tests {
             s.tool_counts.insert("Bash".into(), 9);
             s.stop_count = 3;
             s.stop_blocked_count = 2;
-            s.coach_chain = CoachChain::OpenAi { response_id: "resp_old".into() };
+            s.coach_chain = CoachChain::ServerId { id: "resp_old".into() };
             s.activity.push_back(ActivityEntry {
                 timestamp: Utc::now(),
                 hook_event: "x".into(),
@@ -1120,8 +1109,8 @@ mod tests {
         let now = Utc::now();
         {
             let s = state.sessions.get_mut(&7).unwrap();
-            s.coach_chain = CoachChain::Anthropic {
-                history: vec![
+            s.coach_chain = CoachChain::History {
+                messages: vec![
                     CoachMessage { role: CoachRole::User, content: "u1".into() },
                     CoachMessage { role: CoachRole::Assistant, content: "a1".into() },
                     CoachMessage { role: CoachRole::User, content: "u2".into() },
@@ -1143,8 +1132,8 @@ mod tests {
         }
         let snap = state.snapshot();
         let sess = &snap.sessions[0];
-        assert_eq!(sess.coach_chain_kind, "anthropic");
-        assert_eq!(sess.coach_chain_messages, 4, "anthropic count == history.len()");
+        assert_eq!(sess.coach_chain_kind, "history");
+        assert_eq!(sess.coach_chain_messages, 4, "history count == messages.len()");
         assert_eq!(sess.coach_calls, 2);
         assert_eq!(sess.coach_errors, 1);
         assert_eq!(sess.coach_last_called_at, Some(now));
@@ -1157,23 +1146,23 @@ mod tests {
         // Round-trip through JSON: catches any serde-incompatible field
         // shapes we might introduce later.
         let json = serde_json::to_string(&snap).expect("snapshot must serialize");
-        assert!(json.contains("\"coach_chain_kind\":\"anthropic\""));
+        assert!(json.contains("\"coach_chain_kind\":\"history\""));
         assert!(json.contains("\"coach_chain_messages\":4"));
     }
 
-    /// OpenAI chains have no client-side message list, so we approximate
+    /// ServerId chains have no client-side message list, so we approximate
     /// the held-message count as `calls * 2` (one user + one assistant per call).
     #[test]
-    fn snapshot_openai_chain_messages_derived_from_calls() {
+    fn snapshot_server_id_chain_messages_derived_from_calls() {
         let mut state = test_state();
         state.apply_hook_event(8, "s", Some("/p"));
         {
             let s = state.sessions.get_mut(&8).unwrap();
-            s.coach_chain = CoachChain::OpenAi { response_id: "resp_xyz".into() };
+            s.coach_chain = CoachChain::ServerId { id: "resp_xyz".into() };
             s.coach_calls = 5;
         }
         let snap = state.snapshot();
-        assert_eq!(snap.sessions[0].coach_chain_kind, "openai");
+        assert_eq!(snap.sessions[0].coach_chain_kind, "server_id");
         assert_eq!(snap.sessions[0].coach_chain_messages, 10);
     }
 
@@ -1186,7 +1175,7 @@ mod tests {
         state.apply_hook_event(9, "old", Some("/p"));
         {
             let s = state.sessions.get_mut(&9).unwrap();
-            s.coach_chain = CoachChain::OpenAi { response_id: "resp_old".into() };
+            s.coach_chain = CoachChain::ServerId { id: "resp_old".into() };
             s.coach_session_title = Some("old topic".into());
             s.coach_calls = 7;
             s.coach_errors = 2;

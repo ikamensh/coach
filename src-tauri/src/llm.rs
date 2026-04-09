@@ -662,7 +662,7 @@ async fn read_provider(state: &SharedState) -> String {
 /// Emulated providers emit a once-per-process stderr warning on first
 /// use so the developer knows the cost model differs from native.
 
-/// Build an Anthropic-style chain from a mock response, so tests see
+/// Build a History chain from a mock response, so tests see
 /// conversation growth in the session state.
 fn grow_mock_chain(
     chain: &crate::state::CoachChain,
@@ -670,13 +670,13 @@ fn grow_mock_chain(
     asst_msg: &str,
 ) -> crate::state::CoachChain {
     use crate::state::{CoachChain, CoachMessage, CoachRole};
-    let mut history = match chain {
-        CoachChain::Anthropic { history } => history.clone(),
+    let mut messages = match chain {
+        CoachChain::History { messages } => messages.clone(),
         _ => Vec::new(),
     };
-    history.push(CoachMessage { role: CoachRole::User, content: user_msg.to_string() });
-    history.push(CoachMessage { role: CoachRole::Assistant, content: asst_msg.to_string() });
-    CoachChain::Anthropic { history }
+    messages.push(CoachMessage { role: CoachRole::User, content: user_msg.to_string() });
+    messages.push(CoachMessage { role: CoachRole::Assistant, content: asst_msg.to_string() });
+    CoachChain::History { messages }
 }
 
 pub async fn session_send(
@@ -707,7 +707,7 @@ pub async fn session_send(
     match read_provider(state).await.as_str() {
         "openai" => {
             let prev_id = match chain {
-                CoachChain::OpenAi { response_id } => Some(response_id.as_str()),
+                CoachChain::ServerId { id } => Some(id.as_str()),
                 _ => None,
             };
             // Responses API remembers the system prompt once it's been
@@ -724,14 +724,14 @@ pub async fn session_send(
             .await?;
             Ok((
                 call.text,
-                CoachChain::OpenAi { response_id: call.response_id },
+                CoachChain::ServerId { id: call.response_id },
                 call.usage,
             ))
         }
         "anthropic" => {
             warn_emulation_once("anthropic", "client-side history with prompt caching");
             let history = match chain {
-                CoachChain::Anthropic { history } => history.clone(),
+                CoachChain::History { messages } => messages.clone(),
                 _ => Vec::new(),
             };
             let (text, new_history, usage) = chain_anthropic(
@@ -742,12 +742,12 @@ pub async fn session_send(
                 constraints.max_output_tokens,
             )
             .await?;
-            Ok((text, CoachChain::Anthropic { history: new_history }, usage))
+            Ok((text, CoachChain::History { messages: new_history }, usage))
         }
         "google" => {
             warn_emulation_once("google", "client-side history, no prefix caching");
             let history = match chain {
-                CoachChain::Google { history } => history.clone(),
+                CoachChain::History { messages } => messages.clone(),
                 _ => Vec::new(),
             };
             let (text, new_history, usage) = chain_gemini(
@@ -758,7 +758,7 @@ pub async fn session_send(
                 constraints.max_output_tokens,
             )
             .await?;
-            Ok((text, CoachChain::Google { history: new_history }, usage))
+            Ok((text, CoachChain::History { messages: new_history }, usage))
         }
         other => Err(format!(
             "session_send: provider {other} has no session support (native or emulated)"
@@ -1424,8 +1424,8 @@ mod live_tests {
                 .await
                 .expect("first observe_event failed");
         let id1 = match &chain1 {
-            crate::state::CoachChain::OpenAi { response_id } => response_id.clone(),
-            other => panic!("expected OpenAi chain, got {other:?}"),
+            crate::state::CoachChain::ServerId { id: response_id } => response_id.clone(),
+            other => panic!("expected ServerId chain, got {other:?}"),
         };
         assert!(id1.starts_with("resp_"));
 
@@ -1438,8 +1438,8 @@ mod live_tests {
             .await
             .expect("second observe_event failed");
         let id2 = match &chain2 {
-            crate::state::CoachChain::OpenAi { response_id } => response_id.clone(),
-            other => panic!("expected OpenAi chain, got {other:?}"),
+            crate::state::CoachChain::ServerId { id: response_id } => response_id.clone(),
+            other => panic!("expected ServerId chain, got {other:?}"),
         };
         assert!(id2.starts_with("resp_"));
         assert_ne!(id1, id2);
@@ -1482,7 +1482,7 @@ mod live_tests {
                 "blocking decision should carry a message"
             );
         }
-        assert!(matches!(new_chain, crate::state::CoachChain::OpenAi { .. }));
+        assert!(matches!(new_chain, crate::state::CoachChain::ServerId { .. }));
     }
 
     /// First-call evaluate_stop_chained (no prior chain) should also work,
@@ -1500,7 +1500,7 @@ mod live_tests {
         )
         .await
         .expect("first-turn evaluate_stop_chained failed");
-        assert!(matches!(new_chain, crate::state::CoachChain::OpenAi { .. }));
+        assert!(matches!(new_chain, crate::state::CoachChain::ServerId { .. }));
     }
 
     // ── Anthropic live tests ────────────────────────────────────────────
@@ -1621,8 +1621,8 @@ mod live_tests {
                 .await
                 .expect("first observe_event failed");
         let h1 = match &chain1 {
-            crate::state::CoachChain::Anthropic { history } => history.clone(),
-            other => panic!("expected Anthropic chain, got {other:?}"),
+            crate::state::CoachChain::History { messages: history } => history.clone(),
+            other => panic!("expected History chain, got {other:?}"),
         };
         assert_eq!(h1.len(), 2, "first call should produce user+assistant pair");
 
@@ -1635,8 +1635,8 @@ mod live_tests {
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
-            crate::state::CoachChain::Anthropic { history } => history.clone(),
-            other => panic!("expected Anthropic chain, got {other:?}"),
+            crate::state::CoachChain::History { messages: history } => history.clone(),
+            other => panic!("expected History chain, got {other:?}"),
         };
         assert_eq!(h2.len(), 4, "history should grow to 4 messages");
     }
@@ -1673,7 +1673,7 @@ mod live_tests {
         if !decision.allow {
             assert!(decision.message.is_some(), "block decision should carry a message");
         }
-        assert!(matches!(new_chain, crate::state::CoachChain::Anthropic { .. }));
+        assert!(matches!(new_chain, crate::state::CoachChain::History { .. }));
     }
 
     // ── Gemini live tests ───────────────────────────────────────────────
@@ -1796,8 +1796,8 @@ mod live_tests {
                 .await
                 .expect("first observe_event failed");
         let h1 = match &chain1 {
-            crate::state::CoachChain::Google { history } => history.clone(),
-            other => panic!("expected Google chain, got {other:?}"),
+            crate::state::CoachChain::History { messages: history } => history.clone(),
+            other => panic!("expected History chain, got {other:?}"),
         };
         assert_eq!(h1.len(), 2, "first call should produce user+assistant pair");
 
@@ -1810,8 +1810,8 @@ mod live_tests {
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
-            crate::state::CoachChain::Google { history } => history.clone(),
-            other => panic!("expected Google chain, got {other:?}"),
+            crate::state::CoachChain::History { messages: history } => history.clone(),
+            other => panic!("expected History chain, got {other:?}"),
         };
         assert_eq!(h2.len(), 4, "history should grow to 4 messages");
     }
@@ -1848,6 +1848,6 @@ mod live_tests {
         if !decision.allow {
             assert!(decision.message.is_some(), "block decision should carry a message");
         }
-        assert!(matches!(new_chain, crate::state::CoachChain::Google { .. }));
+        assert!(matches!(new_chain, crate::state::CoachChain::History { .. }));
     }
 }
