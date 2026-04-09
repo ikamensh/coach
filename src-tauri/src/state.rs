@@ -84,6 +84,68 @@ impl std::ops::AddAssign for CoachUsage {
     }
 }
 
+/// Groups all coach-LLM telemetry fields for a session. Encapsulates
+/// chain state, call counts, latency, usage, and the most recent
+/// assessment / error / title. `record_success` and `record_error`
+/// consolidate the repeated 4-field update blocks that used to be
+/// scattered across server.rs.
+pub struct CoachTelemetry {
+    pub chain: CoachChain,
+    pub calls: usize,
+    pub errors: usize,
+    pub last_called_at: Option<DateTime<Utc>>,
+    pub last_latency_ms: Option<u64>,
+    pub last_usage: Option<CoachUsage>,
+    pub total_usage: CoachUsage,
+    pub last_assessment: Option<String>,
+    pub last_error: Option<String>,
+    pub session_title: Option<String>,
+    pub observer_tx: Option<tokio::sync::mpsc::UnboundedSender<ObserverQueueItem>>,
+}
+
+impl CoachTelemetry {
+    pub fn new() -> Self {
+        Self {
+            chain: CoachChain::Empty,
+            calls: 0,
+            errors: 0,
+            last_called_at: None,
+            last_latency_ms: None,
+            last_usage: None,
+            total_usage: CoachUsage::default(),
+            last_assessment: None,
+            last_error: None,
+            session_title: None,
+            observer_tx: None,
+        }
+    }
+
+    /// Record a successful LLM call: bump counter, update latency and
+    /// usage. Optionally update the chain and assessment (observer calls
+    /// set both; namer calls only set title separately).
+    pub fn record_success(
+        &mut self,
+        latency_ms: u64,
+        usage: CoachUsage,
+        new_chain: Option<CoachChain>,
+    ) {
+        self.calls += 1;
+        self.last_called_at = Some(Utc::now());
+        self.last_latency_ms = Some(latency_ms);
+        self.last_usage = Some(usage);
+        self.total_usage += usage;
+        if let Some(c) = new_chain {
+            self.chain = c;
+        }
+    }
+
+    /// Record a failed LLM call.
+    pub fn record_error(&mut self, error: &str) {
+        self.errors += 1;
+        self.last_error = Some(error.to_string());
+    }
+}
+
 /// Mock override for [`crate::llm::session_send`]. When set, all LLM calls
 /// that go through `session_send` return this function's result instead of
 /// calling a real provider. Receives `(system_prompt, user_message)`.
@@ -227,39 +289,15 @@ pub struct SessionState {
     pub tool_counts: HashMap<String, usize>,
     pub stop_count: usize,
     pub stop_blocked_count: usize,
-    /// Coach LLM chain handle (provider-specific). Reset to `Empty` on
-    /// `/clear` since the new conversation has no shared context with
-    /// the previous one.
-    pub coach_chain: CoachChain,
-    pub coach_last_assessment: Option<String>,
-    /// Most recent failure message from the LLM coach. Lives alongside
-    /// `coach_last_assessment` rather than replacing it — a stale successful
-    /// assessment plus a fresh error is a valid state worth seeing.
-    pub coach_last_error: Option<String>,
-    /// 4-words-or-fewer topic for the current conversation, produced by
-    /// a periodic stateless LLM call. `None` until the first successful
-    /// title call. The frontend prefers this over the path-derived
-    /// `display_name` when set. Reset on `/clear`.
-    pub coach_session_title: Option<String>,
-    /// Counts every successful coach LLM call on this session — observer
-    /// events plus chained stop evaluations. Reset on `/clear`.
-    pub coach_calls: usize,
-    pub coach_errors: usize,
-    pub coach_last_called_at: Option<DateTime<Utc>>,
-    pub coach_last_latency_ms: Option<u64>,
-    pub coach_last_usage: Option<CoachUsage>,
-    pub coach_total_usage: CoachUsage,
+    /// Coach LLM telemetry: chain, call counts, usage, assessments.
+    /// Reset on `/clear` since the new conversation has no shared context.
+    pub telemetry: CoachTelemetry,
     pub activity: VecDeque<ActivityEntry>,
     /// Which agent CLI / IDE this session belongs to. Set once on
     /// creation (Claude by default) and only updated by `mark_client`,
     /// which the cursor handlers call after the shared `run_*` path
     /// creates the session.
     pub client: SessionClient,
-    /// Per-session observer queue. Events are enqueued instantly from
-    /// PostToolUse; a single consumer processes them in order so the
-    /// chain builds up sequentially. `None` until the first observer
-    /// event. Dropped on `/clear` (consumer exits, new queue on next event).
-    pub observer_tx: Option<tokio::sync::mpsc::UnboundedSender<ObserverQueueItem>>,
 }
 
 /// Item enqueued for the per-session observer consumer.
@@ -479,20 +517,8 @@ impl CoachState {
                 sess.stop_count = 0;
                 sess.stop_blocked_count = 0;
                 sess.last_stop_blocked = None;
-                sess.coach_chain = CoachChain::Empty;
-                sess.coach_last_assessment = None;
-                sess.coach_last_error = None;
-                sess.coach_session_title = None;
-                sess.coach_calls = 0;
-                sess.coach_errors = 0;
-                sess.coach_last_called_at = None;
-                sess.coach_last_latency_ms = None;
-                sess.coach_last_usage = None;
-                sess.coach_total_usage = CoachUsage::default();
+                sess.telemetry = CoachTelemetry::new();
                 sess.activity.clear();
-                // Drop old observer queue — consumer exits, fresh queue
-                // on the next observer event.
-                sess.observer_tx = None;
                 adopt_cwd_if_unset(sess, cwd);
             }
             None => {
@@ -513,19 +539,9 @@ impl CoachState {
                         tool_counts: HashMap::new(),
                         stop_count: 0,
                         stop_blocked_count: 0,
-                        coach_chain: CoachChain::Empty,
-                        coach_last_assessment: None,
-                        coach_last_error: None,
-                        coach_session_title: None,
-                        coach_calls: 0,
-                        coach_errors: 0,
-                        coach_last_called_at: None,
-                        coach_last_latency_ms: None,
-                        coach_last_usage: None,
-                        coach_total_usage: CoachUsage::default(),
+                        telemetry: CoachTelemetry::new(),
                         activity: VecDeque::new(),
                         client: SessionClient::default(),
-                        observer_tx: None,
                     },
                 );
             }
@@ -552,24 +568,21 @@ impl CoachState {
                 tool_counts: s.tool_counts.clone(),
                 stop_count: s.stop_count,
                 stop_blocked_count: s.stop_blocked_count,
-                coach_last_assessment: s.coach_last_assessment.clone(),
-                coach_last_error: s.coach_last_error.clone(),
-                coach_session_title: s.coach_session_title.clone(),
-                coach_chain_kind: s.coach_chain.kind().to_string(),
-                coach_chain_messages: match &s.coach_chain {
+                coach_last_assessment: s.telemetry.last_assessment.clone(),
+                coach_last_error: s.telemetry.last_error.clone(),
+                coach_session_title: s.telemetry.session_title.clone(),
+                coach_chain_kind: s.telemetry.chain.kind().to_string(),
+                coach_chain_messages: match &s.telemetry.chain {
                     CoachChain::History { messages } => messages.len(),
-                    // Server-side state gives us only an opaque id, so the
-                    // visible "messages held" count == successful calls. Each
-                    // call appends one user + one assistant message server-side.
-                    CoachChain::ServerId { .. } => s.coach_calls * 2,
+                    CoachChain::ServerId { .. } => s.telemetry.calls * 2,
                     CoachChain::Empty => 0,
                 },
-                coach_calls: s.coach_calls,
-                coach_errors: s.coach_errors,
-                coach_last_called_at: s.coach_last_called_at,
-                coach_last_latency_ms: s.coach_last_latency_ms,
-                coach_last_usage: s.coach_last_usage,
-                coach_total_usage: s.coach_total_usage,
+                coach_calls: s.telemetry.calls,
+                coach_errors: s.telemetry.errors,
+                coach_last_called_at: s.telemetry.last_called_at,
+                coach_last_latency_ms: s.telemetry.last_latency_ms,
+                coach_last_usage: s.telemetry.last_usage,
+                coach_total_usage: s.telemetry.total_usage,
                 activity: s.activity.iter().cloned().collect(),
                 client: s.client,
             })
@@ -682,21 +695,11 @@ impl CoachState {
                 tool_counts: HashMap::new(),
                 stop_count: 0,
                 stop_blocked_count: 0,
-                coach_chain: CoachChain::Empty,
-                coach_last_assessment: None,
-                coach_last_error: None,
-                coach_session_title: None,
-                coach_calls: 0,
-                coach_errors: 0,
-                coach_last_called_at: None,
-                coach_last_latency_ms: None,
-                coach_last_usage: None,
-                coach_total_usage: CoachUsage::default(),
+                telemetry: CoachTelemetry::new(),
                 activity: VecDeque::new(),
                 // The file scanner only walks `~/.claude/projects` so any
                 // session it discovers is necessarily Claude Code.
                 client: SessionClient::Claude,
-                observer_tx: None,
             },
         );
         true
@@ -871,7 +874,7 @@ mod tests {
             s.tool_counts.insert("Bash".into(), 9);
             s.stop_count = 3;
             s.stop_blocked_count = 2;
-            s.coach_chain = CoachChain::ServerId { id: "resp_old".into() };
+            s.telemetry.chain = CoachChain::ServerId { id: "resp_old".into() };
             s.activity.push_back(ActivityEntry {
                 timestamp: Utc::now(),
                 hook_event: "x".into(),
@@ -893,7 +896,7 @@ mod tests {
         assert!(sess.tool_counts.is_empty());
         assert_eq!(sess.stop_count, 0);
         assert_eq!(sess.stop_blocked_count, 0);
-        assert_eq!(sess.coach_chain, CoachChain::Empty, "/clear must reset chain");
+        assert_eq!(sess.telemetry.chain, CoachChain::Empty, "/clear must reset chain");
         assert!(sess.activity.is_empty());
         assert!(sess.started_at > original_started);
         // Window-scoped: preserved
@@ -1109,7 +1112,7 @@ mod tests {
         let now = Utc::now();
         {
             let s = state.sessions.get_mut(&7).unwrap();
-            s.coach_chain = CoachChain::History {
+            s.telemetry.chain = CoachChain::History {
                 messages: vec![
                     CoachMessage { role: CoachRole::User, content: "u1".into() },
                     CoachMessage { role: CoachRole::Assistant, content: "a1".into() },
@@ -1117,14 +1120,14 @@ mod tests {
                     CoachMessage { role: CoachRole::Assistant, content: "a2".into() },
                 ],
             };
-            s.coach_last_assessment = Some("looks fine".into());
-            s.coach_session_title = Some("auth refactor".into());
-            s.coach_calls = 2;
-            s.coach_errors = 1;
-            s.coach_last_called_at = Some(now);
-            s.coach_last_latency_ms = Some(420);
-            s.coach_last_usage = Some(usage);
-            s.coach_total_usage = CoachUsage {
+            s.telemetry.last_assessment = Some("looks fine".into());
+            s.telemetry.session_title = Some("auth refactor".into());
+            s.telemetry.calls = 2;
+            s.telemetry.errors = 1;
+            s.telemetry.last_called_at = Some(now);
+            s.telemetry.last_latency_ms = Some(420);
+            s.telemetry.last_usage = Some(usage);
+            s.telemetry.total_usage = CoachUsage {
                 input_tokens: 200,
                 output_tokens: 40,
                 cached_input_tokens: 20,
@@ -1158,8 +1161,8 @@ mod tests {
         state.apply_hook_event(8, "s", Some("/p"));
         {
             let s = state.sessions.get_mut(&8).unwrap();
-            s.coach_chain = CoachChain::ServerId { id: "resp_xyz".into() };
-            s.coach_calls = 5;
+            s.telemetry.chain = CoachChain::ServerId { id: "resp_xyz".into() };
+            s.telemetry.calls = 5;
         }
         let snap = state.snapshot();
         assert_eq!(snap.sessions[0].coach_chain_kind, "server_id");
@@ -1175,18 +1178,18 @@ mod tests {
         state.apply_hook_event(9, "old", Some("/p"));
         {
             let s = state.sessions.get_mut(&9).unwrap();
-            s.coach_chain = CoachChain::ServerId { id: "resp_old".into() };
-            s.coach_session_title = Some("old topic".into());
-            s.coach_calls = 7;
-            s.coach_errors = 2;
-            s.coach_last_called_at = Some(Utc::now());
-            s.coach_last_latency_ms = Some(300);
-            s.coach_last_usage = Some(CoachUsage {
+            s.telemetry.chain = CoachChain::ServerId { id: "resp_old".into() };
+            s.telemetry.session_title = Some("old topic".into());
+            s.telemetry.calls = 7;
+            s.telemetry.errors = 2;
+            s.telemetry.last_called_at = Some(Utc::now());
+            s.telemetry.last_latency_ms = Some(300);
+            s.telemetry.last_usage = Some(CoachUsage {
                 input_tokens: 50,
                 output_tokens: 5,
                 cached_input_tokens: 0,
             });
-            s.coach_total_usage = CoachUsage {
+            s.telemetry.total_usage = CoachUsage {
                 input_tokens: 500,
                 output_tokens: 50,
                 cached_input_tokens: 0,
@@ -1194,14 +1197,14 @@ mod tests {
         }
         state.apply_hook_event(9, "new", Some("/p"));
         let s = state.sessions.get(&9).unwrap();
-        assert_eq!(s.coach_calls, 0);
-        assert_eq!(s.coach_errors, 0);
-        assert!(s.coach_last_called_at.is_none());
-        assert!(s.coach_last_latency_ms.is_none());
-        assert!(s.coach_last_usage.is_none());
-        assert_eq!(s.coach_total_usage, CoachUsage::default());
+        assert_eq!(s.telemetry.calls, 0);
+        assert_eq!(s.telemetry.errors, 0);
+        assert!(s.telemetry.last_called_at.is_none());
+        assert!(s.telemetry.last_latency_ms.is_none());
+        assert!(s.telemetry.last_usage.is_none());
+        assert_eq!(s.telemetry.total_usage, CoachUsage::default());
         assert!(
-            s.coach_session_title.is_none(),
+            s.telemetry.session_title.is_none(),
             "/clear must drop the previous conversation's LLM title"
         );
     }
