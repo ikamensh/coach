@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::settings::EngineMode;
 use crate::state::{CoachMode, SharedState};
+use crate::EventEmitter;
 
 mod api;
 mod cursor;
@@ -60,7 +61,7 @@ pub type ParentPidFn = Arc<dyn Fn(u32) -> Option<u32> + Send + Sync>;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) coach: SharedState,
-    pub(crate) emitter: Option<tauri::AppHandle>,
+    pub(crate) emitter: Arc<dyn EventEmitter>,
     resolver: PidResolver,
     parent_pid_fn: ParentPidFn,
 }
@@ -72,11 +73,8 @@ pub(crate) fn session_id(payload: &HookPayload) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-pub(crate) fn emit_update(emitter: &Option<tauri::AppHandle>, coach: &crate::state::CoachState) {
-    if let Some(handle) = emitter {
-        use tauri::Emitter;
-        let _ = handle.emit(crate::state::EVENT_STATE_UPDATED, coach.snapshot());
-    }
+pub(crate) fn emit_update(emitter: &dyn EventEmitter, coach: &crate::state::CoachState) {
+    emitter.emit_state_update(&coach.snapshot());
 }
 
 /// Resolve a hook to its owning PID. Cache lookup first, then the
@@ -145,7 +143,7 @@ pub(crate) async fn run_permission_request(
 
     if mode == CoachMode::Away {
         coach.log(pid, "PermissionRequest", "auto-approved", Some(tool));
-        emit_update(&state.emitter, &coach);
+        emit_update(&*state.emitter, &coach);
         Json(HookResponse {
             hook_specific_output: Some(serde_json::json!({
                 "decision": { "behavior": "allow" }
@@ -153,7 +151,7 @@ pub(crate) async fn run_permission_request(
         })
     } else {
         coach.log(pid, "PermissionRequest", "passed through", Some(tool));
-        emit_update(&state.emitter, &coach);
+        emit_update(&*state.emitter, &coach);
         Json(HookResponse::passthrough())
     }
 }
@@ -182,7 +180,7 @@ pub(crate) async fn run_session_start(state: &AppState, pid: u32, payload: HookP
     coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
     let source = payload.source.unwrap_or_else(|| "unknown".into());
     coach.log(pid, "SessionStart", &source, None);
-    emit_update(&state.emitter, &coach);
+    emit_update(&*state.emitter, &coach);
 
     Json(HookResponse::passthrough())
 }
@@ -224,7 +222,7 @@ pub(crate) async fn run_user_prompt_submit(
         }
     });
     coach.log(pid, "UserPromptSubmit", "user spoke", detail);
-    emit_update(&state.emitter, &coach);
+    emit_update(&*state.emitter, &coach);
 
     Json(HookResponse::passthrough())
 }
@@ -260,7 +258,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
 
         if session.mode != CoachMode::Away {
             coach.log(pid, "Stop", "passed through", None);
-            emit_update(&state.emitter, &coach);
+            emit_update(&*state.emitter, &coach);
             return Json(serde_json::json!({}));
         }
 
@@ -316,7 +314,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                     s.telemetry.record_success(latency_ms, u, new_chain);
                 }
                 coach.log(pid, "Stop", "allowed (LLM)", None);
-                emit_update(&state.emitter, &coach);
+                emit_update(&*state.emitter, &coach);
                 return Json(serde_json::json!({}));
             }
             Ok((decision, new_chain, usage)) => {
@@ -333,7 +331,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                     s.telemetry.record_success(latency_ms, u, new_chain);
                 }
                 coach.log(pid, "Stop", "blocked (LLM)", Some(message.clone()));
-                emit_update(&state.emitter, &coach);
+                emit_update(&*state.emitter, &coach);
                 return Json(serde_json::json!({
                     "decision": "block",
                     "reason": message
@@ -345,7 +343,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                 if let Some(s) = coach.sessions.get_mut(&pid) {
                     s.telemetry.record_error(&e);
                 }
-                emit_update(&state.emitter, &coach);
+                emit_update(&*state.emitter, &coach);
                 drop(coach);
                 // Fall through to rules/cooldown behavior.
             }
@@ -362,7 +360,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
 
     if on_cooldown {
         coach.log(pid, "Stop", "allowed (cooldown)", None);
-        emit_update(&state.emitter, &coach);
+        emit_update(&*state.emitter, &coach);
         return Json(serde_json::json!({}));
     }
 
@@ -372,7 +370,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
     }
     let message = crate::state::away_message(&coach.priorities);
     coach.log(pid, "Stop", "blocked — user away", Some(message.clone()));
-    emit_update(&state.emitter, &coach);
+    emit_update(&*state.emitter, &coach);
 
     // Stop hooks use top-level fields, NOT hookSpecificOutput.
     Json(serde_json::json!({
@@ -418,7 +416,7 @@ pub(crate) async fn run_pre_tool_use(
         let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
         session.active_agents += 1;
         coach.log(pid, "PreToolUse", "agent starting", None);
-        emit_update(&state.emitter, &coach);
+        emit_update(&*state.emitter, &coach);
     }
 
     Json(HookResponse::passthrough())
@@ -511,7 +509,7 @@ pub(crate) async fn run_post_tool_use(
             None
         };
 
-        emit_update(&state.emitter, &coach);
+        emit_update(&*state.emitter, &coach);
     } // lock released
 
     // Spawn the sequential observer consumer if we just created the queue.
@@ -560,7 +558,7 @@ async fn handle_post_tool_use(
 /// `/clear`).
 async fn observer_consumer(
     coach: SharedState,
-    emitter: Option<tauri::AppHandle>,
+    emitter: Arc<dyn EventEmitter>,
     pid: u32,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::state::ObserverQueueItem>,
 ) {
@@ -590,7 +588,7 @@ async fn observer_consumer(
                     sess.telemetry.last_assessment = Some(text.clone());
                 }
                 s.log(pid, "Observer", "noted", Some(text));
-                emit_update(&emitter, &s);
+                emit_update(&*emitter, &s);
             }
             Err(e) => {
                 eprintln!("[coach] observer call failed: {e}");
@@ -599,7 +597,7 @@ async fn observer_consumer(
                     sess.telemetry.record_error(&e);
                 }
                 s.log(pid, "Observer", "error", Some(e));
-                emit_update(&emitter, &s);
+                emit_update(&*emitter, &s);
             }
         }
     }
@@ -612,7 +610,7 @@ async fn observer_consumer(
 /// telemetry panel reflects it — same shape as `run_observer`.
 async fn run_session_namer(
     coach: SharedState,
-    emitter: Option<tauri::AppHandle>,
+    emitter: Arc<dyn EventEmitter>,
     pid: u32,
     input: crate::llm::NameSessionInput,
 ) {
@@ -626,7 +624,7 @@ async fn run_session_namer(
                 sess.telemetry.session_title = Some(title.clone());
             }
             s.log(pid, "Namer", "renamed", Some(title));
-            emit_update(&emitter, &s);
+            emit_update(&*emitter, &s);
         }
         Err(e) => {
             eprintln!("[coach] name_session failed: {e}");
@@ -635,7 +633,7 @@ async fn run_session_namer(
                 sess.telemetry.record_error(&e);
             }
             s.log(pid, "Namer", "error", Some(e));
-            emit_update(&emitter, &s);
+            emit_update(&*emitter, &s);
         }
     }
 }
@@ -721,7 +719,7 @@ async fn handle_version() -> Json<serde_json::Value> {
 
 fn build_router(
     coach: SharedState,
-    emitter: Option<tauri::AppHandle>,
+    emitter: Arc<dyn EventEmitter>,
     resolver: PidResolver,
     parent_pid_fn: ParentPidFn,
 ) -> Router {
@@ -800,7 +798,7 @@ pub fn no_parent() -> ParentPidFn {
 /// Tests inject a fake resolver via `fake_resolver_from_sid()` so the
 /// in-process client gets distinct fake PIDs per session_id.
 pub fn create_router_headless(coach: SharedState, resolver: PidResolver) -> Router {
-    build_router(coach, None, resolver, no_parent())
+    build_router(coach, Arc::new(crate::NoopEmitter), resolver, no_parent())
 }
 
 /// Router with a custom parent-PID function — for tests that exercise
@@ -810,7 +808,7 @@ pub fn create_router_headless_with_parent(
     resolver: PidResolver,
     parent_pid_fn: ParentPidFn,
 ) -> Router {
-    build_router(coach, None, resolver, parent_pid_fn)
+    build_router(coach, Arc::new(crate::NoopEmitter), resolver, parent_pid_fn)
 }
 
 /// Bind the production hook server. Pass `Some(app_handle)` from the
@@ -824,7 +822,7 @@ pub fn create_router_headless_with_parent(
 /// with a clear error, not a panic-then-exit-0.
 pub async fn start_server(
     coach: SharedState,
-    app_handle: Option<tauri::AppHandle>,
+    emitter: Arc<dyn EventEmitter>,
     port: u16,
 ) {
     let addr = format!("127.0.0.1:{}", port);
@@ -832,7 +830,7 @@ pub async fn start_server(
         .await
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
     eprintln!("Coach hook server listening on {}", addr);
-    serve_on_listener(listener, coach, app_handle, port).await;
+    serve_on_listener(listener, coach, emitter, port).await;
 }
 
 /// Serve hook traffic on an already-bound listener. Used by the
@@ -841,11 +839,11 @@ pub async fn start_server(
 pub async fn serve_on_listener(
     listener: tokio::net::TcpListener,
     coach: SharedState,
-    app_handle: Option<tauri::AppHandle>,
+    emitter: Arc<dyn EventEmitter>,
     port: u16,
 ) {
     let real_parent: ParentPidFn = Arc::new(crate::pid_resolver::parent_pid);
-    let app = build_router(coach, app_handle, lsof_resolver(port), real_parent);
+    let app = build_router(coach, emitter, lsof_resolver(port), real_parent);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

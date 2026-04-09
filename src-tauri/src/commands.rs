@@ -1,7 +1,7 @@
-use crate::path_install::{self, PathStatus};
-use crate::replay;
-use crate::settings::{self, CoachRule, EngineMode, HookStatus, ModelConfig};
-use crate::state::{CoachMode, CoachSnapshot, CoachState, SharedState, Theme, EVENT_STATE_UPDATED, EVENT_THEME_CHANGED};
+use coach_core::path_install::{self, PathStatus};
+use coach_core::replay;
+use coach_core::settings::{self, CoachRule, EngineMode, HookStatus, ModelConfig};
+use coach_core::state::{CoachMode, CoachSnapshot, CoachState, SharedState, Theme, EVENT_STATE_UPDATED, EVENT_THEME_CHANGED};
 use serde_json::json;
 use tauri::Emitter;
 

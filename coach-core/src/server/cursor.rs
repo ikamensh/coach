@@ -21,7 +21,7 @@ use crate::state::SessionClient;
 async fn mark_cursor(state: &AppState, pid: u32) {
     let mut coach = state.coach.write().await;
     coach.mark_client(pid, SessionClient::Cursor);
-    emit_update(&state.emitter, &coach);
+    emit_update(&*state.emitter, &coach);
 }
 
 /// First non-empty string under any of `keys`. Used to probe Cursor's

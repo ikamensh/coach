@@ -1,0 +1,3 @@
+[workspace]
+members = ["src-tauri", "coach-core"]
+resolver = "2"
