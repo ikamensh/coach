@@ -264,7 +264,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
             return Json(serde_json::json!({}));
         }
 
-        let prev_chain = session.coach_chain.clone();
+        let prev_chain = session.telemetry.chain.clone();
         let ctx = crate::llm::StopContext {
             priorities,
             cwd: session.cwd.clone(),
@@ -312,16 +312,8 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let mut coach = state.coach.write().await;
                 if let Some(s) = coach.sessions.get_mut(&pid) {
-                    if let Some(c) = new_chain {
-                        s.coach_chain = c;
-                    }
-                    s.coach_calls += 1;
-                    s.coach_last_called_at = Some(chrono::Utc::now());
-                    s.coach_last_latency_ms = Some(latency_ms);
-                    if let Some(u) = usage {
-                        s.coach_last_usage = Some(u);
-                        s.coach_total_usage += u;
-                    }
+                    let u = usage.unwrap_or_default();
+                    s.telemetry.record_success(latency_ms, u, new_chain);
                 }
                 coach.log(pid, "Stop", "allowed (LLM)", None);
                 emit_update(&state.emitter, &coach);
@@ -337,16 +329,8 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                 if let Some(s) = coach.sessions.get_mut(&pid) {
                     s.last_stop_blocked = Some(std::time::Instant::now());
                     s.stop_blocked_count += 1;
-                    if let Some(c) = new_chain {
-                        s.coach_chain = c;
-                    }
-                    s.coach_calls += 1;
-                    s.coach_last_called_at = Some(chrono::Utc::now());
-                    s.coach_last_latency_ms = Some(latency_ms);
-                    if let Some(u) = usage {
-                        s.coach_last_usage = Some(u);
-                        s.coach_total_usage += u;
-                    }
+                    let u = usage.unwrap_or_default();
+                    s.telemetry.record_success(latency_ms, u, new_chain);
                 }
                 coach.log(pid, "Stop", "blocked (LLM)", Some(message.clone()));
                 emit_update(&state.emitter, &coach);
@@ -359,8 +343,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                 eprintln!("[coach] LLM evaluate_stop failed, falling back: {e}");
                 let mut coach = state.coach.write().await;
                 if let Some(s) = coach.sessions.get_mut(&pid) {
-                    s.coach_errors += 1;
-                    s.coach_last_error = Some(e.clone());
+                    s.telemetry.record_error(&e);
                 }
                 emit_update(&state.emitter, &coach);
                 drop(coach);
@@ -464,20 +447,19 @@ pub(crate) async fn run_post_tool_use(
                 Ok(event) => {
                     let priorities = coach.priorities.clone();
                     let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
-                    if session.observer_tx.is_none() {
+                    if session.telemetry.observer_tx.is_none() {
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                        session.observer_tx = Some(tx);
+                        session.telemetry.observer_tx = Some(tx);
                         consumer_rx = Some(rx);
                     }
-                    let _ = session.observer_tx.as_ref().unwrap().send(
+                    let _ = session.telemetry.observer_tx.as_ref().unwrap().send(
                         crate::state::ObserverQueueItem { priorities, event },
                     );
                 }
                 Err(e) => {
                     eprintln!("[coach] observer event prompt failed: {e}");
                     if let Some(s) = coach.sessions.get_mut(&pid) {
-                        s.coach_errors += 1;
-                        s.coach_last_error = Some(e);
+                        s.telemetry.record_error(&e);
                     }
                 }
             }
@@ -489,7 +471,7 @@ pub(crate) async fn run_post_tool_use(
                 priorities: coach.priorities.clone(),
                 cwd: session.cwd.clone(),
                 tool_counts: session.tool_counts.clone(),
-                last_assessment: session.coach_last_assessment.clone(),
+                last_assessment: session.telemetry.last_assessment.clone(),
             })
         } else {
             None
@@ -553,7 +535,7 @@ async fn observer_consumer(
         let chain = {
             let s = coach.read().await;
             s.sessions.get(&pid)
-                .map(|sess| sess.coach_chain.clone())
+                .map(|sess| sess.telemetry.chain.clone())
                 .unwrap_or_default()
         };
 
@@ -570,13 +552,8 @@ async fn observer_consumer(
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let mut s = coach.write().await;
                 if let Some(sess) = s.sessions.get_mut(&pid) {
-                    sess.coach_chain = new_chain;
-                    sess.coach_last_assessment = Some(text.clone());
-                    sess.coach_calls += 1;
-                    sess.coach_last_called_at = Some(chrono::Utc::now());
-                    sess.coach_last_latency_ms = Some(latency_ms);
-                    sess.coach_last_usage = Some(usage);
-                    sess.coach_total_usage += usage;
+                    sess.telemetry.record_success(latency_ms, usage, Some(new_chain));
+                    sess.telemetry.last_assessment = Some(text.clone());
                 }
                 s.log(pid, "Observer", "noted", Some(text));
                 emit_update(&emitter, &s);
@@ -585,8 +562,7 @@ async fn observer_consumer(
                 eprintln!("[coach] observer call failed: {e}");
                 let mut s = coach.write().await;
                 if let Some(sess) = s.sessions.get_mut(&pid) {
-                    sess.coach_errors += 1;
-                    sess.coach_last_error = Some(e.clone());
+                    sess.telemetry.record_error(&e);
                 }
                 s.log(pid, "Observer", "error", Some(e));
                 emit_update(&emitter, &s);
@@ -597,8 +573,8 @@ async fn observer_consumer(
 
 /// Periodic session-title generation. Stateless LLM call (fresh chain),
 /// fire-and-forget like the observer. On success, writes the cleaned
-/// title to `coach_session_title`. On failure, surfaces the error in
-/// `coach_last_error` and increments `coach_errors` so the existing
+/// title to `telemetry.session_title`. On failure, surfaces the error in
+/// `telemetry.last_error` and increments `telemetry.errors` so the
 /// telemetry panel reflects it — same shape as `run_observer`.
 async fn run_session_namer(
     coach: SharedState,
@@ -610,11 +586,10 @@ async fn run_session_namer(
         Ok((title, usage)) => {
             let mut s = coach.write().await;
             if let Some(sess) = s.sessions.get_mut(&pid) {
-                sess.coach_session_title = Some(title.clone());
-                sess.coach_calls += 1;
-                sess.coach_last_called_at = Some(chrono::Utc::now());
-                sess.coach_last_usage = Some(usage);
-                sess.coach_total_usage += usage;
+                // Namer doesn't update the chain — pass 0 latency since
+                // it's a stateless call and latency isn't worth tracking.
+                sess.telemetry.record_success(0, usage, None);
+                sess.telemetry.session_title = Some(title.clone());
             }
             s.log(pid, "Namer", "renamed", Some(title));
             emit_update(&emitter, &s);
@@ -623,8 +598,7 @@ async fn run_session_namer(
             eprintln!("[coach] name_session failed: {e}");
             let mut s = coach.write().await;
             if let Some(sess) = s.sessions.get_mut(&pid) {
-                sess.coach_errors += 1;
-                sess.coach_last_error = Some(e.clone());
+                sess.telemetry.record_error(&e);
             }
             s.log(pid, "Namer", "error", Some(e));
             emit_update(&emitter, &s);
@@ -642,8 +616,62 @@ fn check_rules(
         return None;
     }
 
-    let text = crate::rules::extract_checkable_text(tool_name, tool_input)?;
-    crate::rules::check_outdated_models(&text)
+    let text = extract_checkable_text(tool_name, tool_input)?;
+    check_outdated_models(&text)
+}
+
+// ── Rule helpers (inlined from rules.rs) ──────────────────────────────
+
+struct ModelMapping {
+    outdated: &'static str,
+    suggestion: &'static str,
+}
+
+const OUTDATED_MODELS: &[ModelMapping] = &[
+    ModelMapping { outdated: "gemini-2.0-flash",   suggestion: "gemini-2.5-flash (stable) or gemini-3.0-flash" },
+    ModelMapping { outdated: "gemini-2-flash",      suggestion: "gemini-2.5-flash (stable) or gemini-3.0-flash" },
+    ModelMapping { outdated: "gemini-1.5-flash",    suggestion: "gemini-2.5-flash" },
+    ModelMapping { outdated: "gemini-1.5-pro",      suggestion: "gemini-2.5-pro" },
+    ModelMapping { outdated: "gemini-1.0",          suggestion: "gemini-2.5-flash" },
+    ModelMapping { outdated: "claude-3-5-sonnet",   suggestion: "claude-sonnet-4-6" },
+    ModelMapping { outdated: "claude-3.5-sonnet",   suggestion: "claude-sonnet-4-6" },
+    ModelMapping { outdated: "claude-3-opus",       suggestion: "claude-opus-4-6" },
+    ModelMapping { outdated: "claude-3-sonnet",     suggestion: "claude-sonnet-4-6" },
+    ModelMapping { outdated: "claude-3-haiku",      suggestion: "claude-haiku-4-5-20251001" },
+    ModelMapping { outdated: "gpt-4o",              suggestion: "gpt-4.1 or gpt-5.4" },
+    ModelMapping { outdated: "gpt-4-turbo",         suggestion: "gpt-4.1" },
+    ModelMapping { outdated: "gpt-3.5",             suggestion: "gpt-4.1-mini" },
+];
+
+fn check_outdated_models(content: &str) -> Option<String> {
+    let mut found: Vec<(&str, &str)> = Vec::new();
+    for m in OUTDATED_MODELS {
+        if content.contains(m.outdated) {
+            if !found.iter().any(|(_, s)| *s == m.suggestion) {
+                found.push((m.outdated, m.suggestion));
+            }
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    let details: Vec<String> = found
+        .iter()
+        .map(|(old, new)| format!("'{}' -> {}", old, new))
+        .collect();
+    Some(format!(
+        "Outdated model identifier detected: {}. Update to current versions.",
+        details.join("; ")
+    ))
+}
+
+fn extract_checkable_text(tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
+    match tool_name {
+        "Write" | "write" => tool_input.get("content").and_then(|v| v.as_str()).map(String::from),
+        "Edit" | "edit" => tool_input.get("new_string").and_then(|v| v.as_str()).map(String::from),
+        "Bash" | "bash" => tool_input.get("command").and_then(|v| v.as_str()).map(String::from),
+        _ => None,
+    }
 }
 
 async fn handle_get_state(
@@ -943,5 +971,76 @@ mod tests {
         // Off-by-one around an interval boundary stays quiet.
         assert!(!should_request_title(TITLE_INTERVAL_EVENTS - 1));
         assert!(!should_request_title(TITLE_INTERVAL_EVENTS + 1));
+    }
+
+    // ── Rule engine tests (moved from rules.rs) ──────────────────────
+
+    #[test]
+    fn detects_outdated_gemini_model() {
+        let code = r#"client = genai.Client(model="gemini-2.0-flash")"#;
+        let msg = check_outdated_models(code);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("gemini-2.0-flash"));
+    }
+
+    #[test]
+    fn detects_outdated_claude_model() {
+        let code = r#"model: "claude-3-5-sonnet-20241022""#;
+        let msg = check_outdated_models(code);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("claude-3-5-sonnet"));
+    }
+
+    #[test]
+    fn detects_outdated_gpt_model() {
+        let code = r#"model="gpt-4o""#;
+        let msg = check_outdated_models(code);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("gpt-4o"));
+    }
+
+    #[test]
+    fn passes_current_models() {
+        let code = r#"
+            model = "gemini-2.5-flash"
+            other = "claude-sonnet-4-6"
+            gpt = "gpt-4.1"
+        "#;
+        assert!(check_outdated_models(code).is_none());
+    }
+
+    #[test]
+    fn multiple_outdated_in_one_file() {
+        let code = r#"
+            primary = "gemini-2.0-flash"
+            fallback = "gpt-4o"
+        "#;
+        let msg = check_outdated_models(code).unwrap();
+        assert!(msg.contains("gemini-2.0-flash"));
+        assert!(msg.contains("gpt-4o"));
+    }
+
+    #[test]
+    fn extract_write_content() {
+        let input = serde_json::json!({"file_path": "/a.py", "content": "x = 1"});
+        assert_eq!(extract_checkable_text("Write", &input), Some("x = 1".into()));
+    }
+
+    #[test]
+    fn extract_edit_new_string() {
+        let input = serde_json::json!({"old_string": "a", "new_string": "b"});
+        assert_eq!(extract_checkable_text("Edit", &input), Some("b".into()));
+    }
+
+    #[test]
+    fn extract_bash_command() {
+        let input = serde_json::json!({"command": "echo hi"});
+        assert_eq!(extract_checkable_text("Bash", &input), Some("echo hi".into()));
+    }
+
+    #[test]
+    fn extract_unknown_tool_returns_none() {
+        let input = serde_json::json!({"query": "test"});
+        assert!(extract_checkable_text("Grep", &input).is_none());
     }
 }

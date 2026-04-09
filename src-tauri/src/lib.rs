@@ -8,7 +8,6 @@ pub mod prompts;
 #[cfg(feature = "pycoach")]
 pub mod pycoach;
 pub mod replay;
-pub mod rules;
 pub mod scanner;
 pub mod server;
 pub mod settings;

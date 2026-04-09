@@ -551,9 +551,7 @@ mod tests {
 
         // Use the shared `test_state()` builder so we don't depend on
         // the user's `~/.coach/settings.json` (which might point at a
-        // model the test environment can't reach). Inject only the
-        // Google token so `pick_verifier` finds no second provider and
-        // we make exactly one LLM call per Stop.
+        // model the test environment can't reach).
         let mut coach = crate::state::test_state();
         coach.env_tokens.insert("google".into(), google_key);
         let state: SharedState = Arc::new(RwLock::new(coach));
