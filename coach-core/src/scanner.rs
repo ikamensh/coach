@@ -115,13 +115,29 @@ pub async fn run_session_scanner(state: SharedState, emitter: std::sync::Arc<dyn
 }
 
 pub async fn sync_sessions(state: &SharedState, emitter: &dyn EventEmitter) {
-    let live = scan_live_sessions();
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let sessions_dir = home.join(".claude").join("sessions");
+    let projects_dir = home.join(".claude").join("projects");
+    let live = scan_live_sessions_in(&sessions_dir);
+    sync_sessions_with(state, emitter, &live, &projects_dir).await;
+}
+
+/// Testable core: accepts the session list and projects directory.
+pub async fn sync_sessions_with(
+    state: &SharedState,
+    emitter: &dyn EventEmitter,
+    live: &[ClaudeSessionFile],
+    projects_dir: &Path,
+) {
     let live_pids: HashSet<u32> = live.iter().map(|s| s.pid).collect();
 
     let mut coach = state.write().await;
     let mut changed = false;
 
-    for session in &live {
+    for session in live {
         let created = coach.register_discovered_pid(
             session.pid,
             session.cwd.as_deref(),
@@ -139,7 +155,7 @@ pub async fn sync_sessions(state: &SharedState, emitter: &dyn EventEmitter) {
         let needs_bootstrap = coach.sessions.get(&session.pid)
             .is_some_and(|s| !s.bootstrapped);
         if needs_bootstrap {
-            if let Some(jsonl_path) = jsonl_path_for(session) {
+            if let Some(jsonl_path) = jsonl_path_for(session, projects_dir) {
                 match bootstrap_from_jsonl(&jsonl_path) {
                     Ok(boot) => {
                         if let Some(sess) = coach.sessions.get_mut(&session.pid) {
@@ -183,12 +199,11 @@ pub async fn sync_sessions(state: &SharedState, emitter: &dyn EventEmitter) {
 
 // ── JSONL bootstrapping ─────────────────────────────────────────────────
 
-/// Derive the JSONL path: `~/.claude/projects/{mangled-cwd}/{sessionId}.jsonl`
-fn jsonl_path_for(session: &ClaudeSessionFile) -> Option<PathBuf> {
+/// Derive the JSONL path: `{projects_dir}/{mangled-cwd}/{sessionId}.jsonl`
+fn jsonl_path_for(session: &ClaudeSessionFile, projects_dir: &Path) -> Option<PathBuf> {
     let cwd = session.cwd.as_deref()?;
-    let home = dirs::home_dir()?;
     let mangled = cwd.replace('/', "-");
-    Some(home.join(".claude").join("projects").join(mangled).join(format!("{}.jsonl", session.session_id)))
+    Some(projects_dir.join(mangled).join(format!("{}.jsonl", session.session_id)))
 }
 
 /// State bootstrapped from a JSONL conversation log.
@@ -455,19 +470,124 @@ mod tests {
     /// Bootstrap against a real JSONL from the current session, if available.
     #[test]
     fn bootstrap_reads_real_session() {
-        // Find any live session JSONL to verify we can parse it without errors.
-        let sessions_dir = match dirs::home_dir() {
-            Some(h) => h.join(".claude").join("sessions"),
+        let home = match dirs::home_dir() {
+            Some(h) => h,
             None => return,
         };
+        let sessions_dir = home.join(".claude").join("sessions");
+        let projects_dir = home.join(".claude").join("projects");
         let sessions = scan_live_sessions_in(&sessions_dir);
         for session in sessions.iter().take(1) {
-            if let Some(path) = jsonl_path_for(session) {
+            if let Some(path) = jsonl_path_for(session, &projects_dir) {
                 if path.exists() {
                     let boot = bootstrap_from_jsonl(&path);
                     assert!(boot.is_ok(), "failed to parse {}: {:?}", path.display(), boot.err());
                 }
             }
         }
+    }
+
+    /// Helper: create a JSONL file at the path sync_sessions_with expects.
+    fn write_jsonl(projects_dir: &Path, cwd: &str, session_id: &str, lines: &[&str]) {
+        let mangled = cwd.replace('/', "-");
+        let dir = projects_dir.join(mangled);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{session_id}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    fn write_session_file_full(dir: &Path, pid: u32, session_id: &str, cwd: &str) {
+        let content = serde_json::json!({
+            "pid": pid,
+            "sessionId": session_id,
+            "cwd": cwd,
+            "startedAt": 1775383533697_i64,
+            "kind": "interactive",
+        });
+        fs::write(
+            dir.join(format!("{pid}.json")),
+            serde_json::to_string(&content).unwrap(),
+        ).unwrap();
+    }
+
+    /// Scanner discovers a session and bootstraps it from the JSONL.
+    #[tokio::test]
+    async fn sync_bootstraps_scanner_discovered_session() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let my_pid = std::process::id();
+        let sid = "test-session-001";
+        let cwd = "/tmp/my-project";
+
+        write_session_file_full(sessions_dir.path(), my_pid, sid, cwd);
+        write_jsonl(projects_dir.path(), cwd, sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}},{"type":"tool_use","id":"t3","name":"Agent","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+        ]);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        let live = scan_live_sessions_in(sessions_dir.path());
+        assert_eq!(live.len(), 1);
+
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+
+        let coach = state.read().await;
+        let sess = coach.sessions.get(&my_pid).expect("session should exist");
+        assert!(sess.bootstrapped);
+        assert_eq!(sess.tool_counts.get("Read"), Some(&1));
+        assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
+        assert_eq!(sess.tool_counts.get("Agent"), Some(&1));
+        assert_eq!(sess.active_agents, 1, "Agent t3 has no result yet");
+        assert_eq!(sess.event_count, 3);
+        assert_eq!(sess.current_session_id, sid);
+    }
+
+    /// A hook creates the session first (empty tool_counts), then the
+    /// scanner bootstraps it from the JSONL on its next pass.
+    #[tokio::test]
+    async fn sync_bootstraps_hook_created_session() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let my_pid = std::process::id();
+        let sid = "hook-session-002";
+        let cwd = "/tmp/hook-project";
+
+        write_session_file_full(sessions_dir.path(), my_pid, sid, cwd);
+        write_jsonl(projects_dir.path(), cwd, sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Edit","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+        ]);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        // Hook creates session first — empty tool_counts.
+        {
+            let mut coach = state.write().await;
+            coach.apply_hook_event(my_pid, sid, Some(cwd));
+            let sess = coach.sessions.get(&my_pid).unwrap();
+            assert!(sess.tool_counts.is_empty(), "hook-created session starts empty");
+            assert!(!sess.bootstrapped);
+        }
+
+        // Scanner runs and bootstraps.
+        let live = scan_live_sessions_in(sessions_dir.path());
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+
+        let coach = state.read().await;
+        let sess = coach.sessions.get(&my_pid).unwrap();
+        assert!(sess.bootstrapped);
+        assert_eq!(sess.tool_counts.get("Edit"), Some(&2));
+        assert_eq!(sess.event_count, 2);
+        assert_eq!(sess.active_agents, 0);
     }
 }
