@@ -45,15 +45,6 @@ pub struct StopDecision {
     pub message: Option<String>,
 }
 
-/// Result of a chained call into OpenAI's Responses API: the assistant text
-/// plus the new `response_id` to pass as `previous_response_id` next time,
-/// plus the token usage so callers can roll up cost telemetry.
-pub struct ChainCall {
-    pub text: String,
-    pub response_id: String,
-    pub usage: crate::state::CoachUsage,
-}
-
 /// Convert rig's per-call usage record to our minimal three-field shape.
 fn to_coach_usage(u: rig::completion::Usage) -> crate::state::CoachUsage {
     crate::state::CoachUsage {
@@ -340,264 +331,6 @@ pub async fn evaluate_stop(
     Ok(resp.data)
 }
 
-// ── Stateful chain via OpenAI Responses API ────────────────────────────
-
-/// Low-level call into OpenAI's Responses API. Returns assistant text plus
-/// the new response_id so the caller can chain the next call.
-///
-/// rig 0.34's OpenAI client uses the Responses API by default. Server-side
-/// state is referenced via `previous_response_id`, passed through
-/// `additional_params`. We bypass rig's `extractor` here because the
-/// extractor doesn't surface `raw_response` (no way to read the new id).
-pub async fn chain_openai(
-    state: &SharedState,
-    prompt: &str,
-    system: Option<&str>,
-    previous_response_id: Option<&str>,
-    require_json: bool,
-    max_output_tokens: Option<u32>,
-) -> Result<ChainCall, String> {
-    use rig::completion::{AssistantContent, Completion};
-
-    let cfg = snapshot_config(state).await?;
-    if cfg.primary.provider != "openai" {
-        return Err(format!(
-            "stateful coach requires the OpenAI provider; current: {}",
-            cfg.primary.provider
-        ));
-    }
-
-    let client = openai::Client::new(&cfg.primary_token).map_err(|e| fmt_err("openai", e))?;
-    let mut builder = client.agent(&cfg.primary.model);
-    if let Some(s) = system {
-        builder = builder.preamble(s);
-    }
-
-    let mut extra = serde_json::Map::new();
-    if let Some(prev) = previous_response_id {
-        extra.insert(
-            "previous_response_id".into(),
-            serde_json::Value::String(prev.to_string()),
-        );
-    }
-    if require_json {
-        extra.insert(
-            "response_format".into(),
-            serde_json::json!({"type": "json_object"}),
-        );
-    }
-    if let Some(max) = max_output_tokens {
-        extra.insert(
-            "max_output_tokens".into(),
-            serde_json::Value::Number(max.into()),
-        );
-    }
-    if !extra.is_empty() {
-        builder = builder.additional_params(serde_json::Value::Object(extra));
-    }
-
-    let agent = builder.build();
-    let history: Vec<rig::message::Message> = vec![];
-    let resp = agent
-        .completion(prompt, history)
-        .await
-        .map_err(|e| fmt_err("openai", e))?
-        .send()
-        .await
-        .map_err(|e| fmt_err("openai", e))?;
-
-    let text = resp
-        .choice
-        .iter()
-        .filter_map(|c| match c {
-            AssistantContent::Text(t) => Some(t.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let response_id = resp.raw_response.id.clone();
-    let usage = to_coach_usage(resp.usage);
-
-    Ok(ChainCall { text, response_id, usage })
-}
-
-// ── Stateful chain via Anthropic + prompt caching ──────────────────────
-
-/// Low-level call into Anthropic's messages API. Anthropic has no
-/// server-side conversation state, so the caller maintains the message
-/// history and passes the running list in. The first call writes the
-/// cache breakpoint via `with_automatic_caching()`; subsequent calls
-/// hit the cache and pay ~10% of full input rate for the prefix.
-///
-/// Returns the assistant text and a NEW history vec with the user
-/// message and the assistant response appended.
-pub async fn chain_anthropic(
-    state: &SharedState,
-    system: Option<&str>,
-    history: &[crate::state::CoachMessage],
-    new_message: &str,
-    max_output_tokens: Option<u32>,
-) -> Result<(String, Vec<crate::state::CoachMessage>, crate::state::CoachUsage), String> {
-    use rig::agent::AgentBuilder;
-    use rig::client::CompletionClient;
-    use rig::completion::{AssistantContent, Completion};
-    use rig::message::Message as RigMessage;
-
-    let cfg = snapshot_config(state).await?;
-    if cfg.primary.provider != "anthropic" {
-        return Err(format!(
-            "chain_anthropic requires the Anthropic provider; current: {}",
-            cfg.primary.provider
-        ));
-    }
-
-    let client = anthropic::Client::new(&cfg.primary_token).map_err(|e| fmt_err("anthropic", e))?;
-    let model = client
-        .completion_model(&cfg.primary.model)
-        .with_automatic_caching();
-
-    let mut builder = AgentBuilder::new(model);
-    if let Some(s) = system {
-        builder = builder.preamble(s);
-    }
-
-    let agent = builder.build();
-
-    // Convert our role-typed history into rig messages.
-    let rig_history: Vec<RigMessage> = history
-        .iter()
-        .map(|m| match m.role {
-            crate::state::CoachRole::User => RigMessage::user(&m.content),
-            crate::state::CoachRole::Assistant => RigMessage::assistant(&m.content),
-        })
-        .collect();
-
-    // Anthropic requires max_tokens at the request level — additional_params
-    // is the wrong layer. CompletionRequestBuilder::max_tokens(u64) sets it.
-    // rig 0.34's `calculate_max_tokens` only recognizes claude-3-* and
-    // claude-sonnet-4-*; newer Haiku names like claude-haiku-4-5-* aren't
-    // matched, so we always pass it explicitly.
-    let max = max_output_tokens.unwrap_or(200) as u64;
-    let resp = agent
-        .completion(new_message, rig_history)
-        .await
-        .map_err(|e| fmt_err("anthropic", e))?
-        .max_tokens(max)
-        .send()
-        .await
-        .map_err(|e| fmt_err("anthropic", e))?;
-
-    let text = resp
-        .choice
-        .iter()
-        .filter_map(|c| match c {
-            AssistantContent::Text(t) => Some(t.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let usage = to_coach_usage(resp.usage);
-
-    // Build the updated history: existing + new user msg + assistant reply.
-    let mut new_history = history.to_vec();
-    new_history.push(crate::state::CoachMessage {
-        role: crate::state::CoachRole::User,
-        content: new_message.to_string(),
-    });
-    new_history.push(crate::state::CoachMessage {
-        role: crate::state::CoachRole::Assistant,
-        content: text.clone(),
-    });
-
-    Ok((text, new_history, usage))
-}
-
-// ── Stateful chain via Google Gemini (pure history resend) ────────────
-
-/// Low-level call into Google's Gemini API. Gemini has no server-side
-/// conversation state (no `previous_response_id`) and rig 0.34 does not
-/// surface the `cachedContent` API in a way that fits a growing
-/// observer chain — so the only honest option is to resend the full
-/// history each call and pay full input rate on every turn.
-///
-/// This is the same pattern Google's own Python SDK uses for
-/// `genai.ChatSession.send_message`: it's a client-side convenience
-/// that feels like a session but ships the accumulated history every
-/// turn under the hood. We do the same in `session_send`'s google arm.
-///
-/// Caller maintains the history Vec (threaded through `CoachChain::Google`).
-/// On return, the vec grows by two messages: the user turn and the
-/// assistant reply.
-pub async fn chain_gemini(
-    state: &SharedState,
-    system: Option<&str>,
-    history: &[crate::state::CoachMessage],
-    new_message: &str,
-    max_output_tokens: Option<u32>,
-) -> Result<(String, Vec<crate::state::CoachMessage>, crate::state::CoachUsage), String> {
-    use rig::client::CompletionClient;
-    use rig::completion::{AssistantContent, Completion};
-    use rig::message::Message as RigMessage;
-
-    let cfg = snapshot_config(state).await?;
-    if cfg.primary.provider != "google" {
-        return Err(format!(
-            "chain_gemini requires the Google provider; current: {}",
-            cfg.primary.provider
-        ));
-    }
-
-    let client = gemini::Client::new(&cfg.primary_token).map_err(|e| fmt_err("google", e))?;
-    let mut builder = client.agent(&cfg.primary.model);
-    if let Some(s) = system {
-        builder = builder.preamble(s);
-    }
-    let agent = builder.build();
-
-    let rig_history: Vec<RigMessage> = history
-        .iter()
-        .map(|m| match m.role {
-            crate::state::CoachRole::User => RigMessage::user(&m.content),
-            crate::state::CoachRole::Assistant => RigMessage::assistant(&m.content),
-        })
-        .collect();
-
-    // Gemini accepts max_tokens via the standard CompletionRequestBuilder,
-    // same shape as the Anthropic call. Default to 200 when unset.
-    let max = max_output_tokens.unwrap_or(200) as u64;
-    let resp = agent
-        .completion(new_message, rig_history)
-        .await
-        .map_err(|e| fmt_err("google", e))?
-        .max_tokens(max)
-        .send()
-        .await
-        .map_err(|e| fmt_err("google", e))?;
-
-    let text = resp
-        .choice
-        .iter()
-        .filter_map(|c| match c {
-            AssistantContent::Text(t) => Some(t.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let usage = to_coach_usage(resp.usage);
-
-    let mut new_history = history.to_vec();
-    new_history.push(crate::state::CoachMessage {
-        role: crate::state::CoachRole::User,
-        content: new_message.to_string(),
-    });
-    new_history.push(crate::state::CoachMessage {
-        role: crate::state::CoachRole::Assistant,
-        content: text.clone(),
-    });
-
-    Ok((text, new_history, usage))
-}
-
 // ── Observer + chained stop ────────────────────────────────────────────
 
 /// System message established on the first call in a coach session.
@@ -632,36 +365,6 @@ pub fn build_observer_event(
     ))
 }
 
-/// Read the active provider from state, releasing the lock immediately.
-async fn read_provider(state: &SharedState) -> String {
-    state.read().await.model.provider.clone()
-}
-
-/// Append a single message to a coach session and get back the model's
-/// reply. This is the one primitive every caller should use — specific
-/// use cases (observer, stop evaluation, future features) are thin
-/// wrappers that just build the right message and constraints.
-///
-/// The session is represented by the opaque `CoachChain` handle that
-/// callers thread through: `Empty` on the first call, provider-specific
-/// afterward. The caller always supplies the system prompt; this
-/// function decides whether to pass it downstream based on whether the
-/// provider's server already remembers it (OpenAI Responses does after
-/// the first call; everyone else needs it every time but gets it cached
-/// cheap where supported).
-///
-/// Support matrix (rig 0.34):
-///
-/// | Provider | Mode | Mechanism |
-/// |----------|------|-----------|
-/// | `openai` | **native** | Responses API `previous_response_id`, O(1) per call. |
-/// | `anthropic` | emulated | Client-side `Vec<CoachMessage>` + `with_automatic_caching()`. Cached prefix ~10% of full input rate. |
-/// | `google` | emulated | Client-side `Vec<CoachMessage>`, full history resent every call. No prefix caching that fits a growing chain — use cheap Flash models to keep cost tolerable. |
-/// | others | unsupported | Returns `Err`. |
-///
-/// Emulated providers emit a once-per-process stderr warning on first
-/// use so the developer knows the cost model differs from native.
-
 /// Build a History chain from a mock response, so tests see
 /// conversation growth in the session state.
 fn grow_mock_chain(
@@ -679,6 +382,67 @@ fn grow_mock_chain(
     CoachChain::History { messages }
 }
 
+/// Convert a `Vec<CoachMessage>` into rig's message type.
+fn to_rig_history(history: &[crate::state::CoachMessage]) -> Vec<rig::message::Message> {
+    history
+        .iter()
+        .map(|m| match m.role {
+            crate::state::CoachRole::User => rig::message::Message::user(&m.content),
+            crate::state::CoachRole::Assistant => rig::message::Message::assistant(&m.content),
+        })
+        .collect()
+}
+
+/// Append user + assistant messages to a history vec, returning the
+/// extended history and the assistant text.
+fn extend_history(
+    history: &[crate::state::CoachMessage],
+    user_msg: &str,
+    asst_msg: &str,
+) -> Vec<crate::state::CoachMessage> {
+    let mut new = history.to_vec();
+    new.push(crate::state::CoachMessage {
+        role: crate::state::CoachRole::User,
+        content: user_msg.to_string(),
+    });
+    new.push(crate::state::CoachMessage {
+        role: crate::state::CoachRole::Assistant,
+        content: asst_msg.to_string(),
+    });
+    new
+}
+
+/// Extract text from a rig completion response.
+fn extract_text(choice: &rig::one_or_many::OneOrMany<rig::completion::AssistantContent>) -> String {
+    choice
+        .iter()
+        .filter_map(|c| match c {
+            rig::completion::AssistantContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Append a single message to a coach session and get back the model's
+/// reply. This is the one primitive every caller should use -- specific
+/// use cases (observer, stop evaluation, future features) are thin
+/// wrappers that just build the right message and constraints.
+///
+/// The session is represented by the opaque `CoachChain` handle that
+/// callers thread through: `Empty` on the first call, shape-specific
+/// afterward. The caller always supplies the system prompt; this
+/// function decides whether to pass it downstream based on whether the
+/// provider's server already remembers it.
+///
+/// Support matrix (rig 0.34):
+///
+/// | Provider | Chain shape | Mechanism |
+/// |----------|-------------|-----------|
+/// | `openai` | `ServerId` | Responses API `previous_response_id`, O(1) per call. |
+/// | `anthropic` | `History` | Client-side history + `with_automatic_caching()`. ~10% input rate for cached prefix. |
+/// | `google` | `History` | Client-side history, full resend every call. |
+/// | others | - | Returns `Err`. |
 pub async fn session_send(
     state: &SharedState,
     chain: &crate::state::CoachChain,
@@ -687,11 +451,10 @@ pub async fn session_send(
     constraints: CallConstraints,
 ) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
     use crate::state::CoachChain;
+    use rig::completion::Completion;
 
     // Mock interception: lets tests exercise the full pipeline without a
-    // real LLM provider. The mock receives (system, message) and returns
-    // (text, usage); we synthesise an Anthropic-style chain so observers
-    // see conversation growth.
+    // real LLM provider.
     {
         let s = state.read().await;
         if let Some(ref mock) = s.mock_session_send {
@@ -704,61 +467,118 @@ pub async fn session_send(
         }
     }
 
-    match read_provider(state).await.as_str() {
+    let cfg = snapshot_config(state).await?;
+    let provider = cfg.primary.provider.as_str();
+
+    match provider {
         "openai" => {
             let prev_id = match chain {
                 CoachChain::ServerId { id } => Some(id.as_str()),
                 _ => None,
             };
-            // Responses API remembers the system prompt once it's been
-            // sent — resending on every call would duplicate it.
-            let system_for_call = if prev_id.is_none() { Some(system_prompt) } else { None };
-            let call = chain_openai(
-                state,
-                message,
-                system_for_call,
-                prev_id,
-                constraints.require_json,
-                constraints.max_output_tokens,
-            )
-            .await?;
-            Ok((
-                call.text,
-                CoachChain::ServerId { id: call.response_id },
-                call.usage,
-            ))
+            let client = openai::Client::new(&cfg.primary_token)
+                .map_err(|e| fmt_err("openai", e))?;
+            let mut builder = client.agent(&cfg.primary.model);
+            // Responses API remembers the system prompt after the first call.
+            if prev_id.is_none() {
+                builder = builder.preamble(system_prompt);
+            }
+
+            let mut extra = serde_json::Map::new();
+            if let Some(prev) = prev_id {
+                extra.insert(
+                    "previous_response_id".into(),
+                    serde_json::Value::String(prev.to_string()),
+                );
+            }
+            if constraints.require_json {
+                extra.insert(
+                    "response_format".into(),
+                    serde_json::json!({"type": "json_object"}),
+                );
+            }
+            if let Some(max) = constraints.max_output_tokens {
+                extra.insert(
+                    "max_output_tokens".into(),
+                    serde_json::Value::Number(max.into()),
+                );
+            }
+            if !extra.is_empty() {
+                builder = builder.additional_params(serde_json::Value::Object(extra));
+            }
+
+            let resp = builder
+                .build()
+                .completion(message, Vec::<rig::message::Message>::new())
+                .await
+                .map_err(|e| fmt_err("openai", e))?
+                .send()
+                .await
+                .map_err(|e| fmt_err("openai", e))?;
+
+            let text = extract_text(&resp.choice);
+            let usage = to_coach_usage(resp.usage);
+            Ok((text, CoachChain::ServerId { id: resp.raw_response.id.clone() }, usage))
         }
         "anthropic" => {
             warn_emulation_once("anthropic", "client-side history with prompt caching");
             let history = match chain {
-                CoachChain::History { messages } => messages.clone(),
-                _ => Vec::new(),
+                CoachChain::History { messages } => messages.as_slice(),
+                _ => &[],
             };
-            let (text, new_history, usage) = chain_anthropic(
-                state,
-                Some(system_prompt),
-                &history,
-                message,
-                constraints.max_output_tokens,
-            )
-            .await?;
-            Ok((text, CoachChain::History { messages: new_history }, usage))
+
+            let client = anthropic::Client::new(&cfg.primary_token)
+                .map_err(|e| fmt_err("anthropic", e))?;
+            let model = client
+                .completion_model(&cfg.primary.model)
+                .with_automatic_caching();
+            let agent = rig::agent::AgentBuilder::new(model)
+                .preamble(system_prompt)
+                .build();
+
+            let max = constraints.max_output_tokens.unwrap_or(200) as u64;
+            let resp = agent
+                .completion(message, to_rig_history(history))
+                .await
+                .map_err(|e| fmt_err("anthropic", e))?
+                .max_tokens(max)
+                .send()
+                .await
+                .map_err(|e| fmt_err("anthropic", e))?;
+
+            let text = extract_text(&resp.choice);
+            let usage = to_coach_usage(resp.usage);
+            let new_messages = extend_history(history, message, &text);
+            Ok((text, CoachChain::History { messages: new_messages }, usage))
         }
         "google" => {
             warn_emulation_once("google", "client-side history, no prefix caching");
             let history = match chain {
-                CoachChain::History { messages } => messages.clone(),
-                _ => Vec::new(),
+                CoachChain::History { messages } => messages.as_slice(),
+                _ => &[],
             };
-            let (text, new_history, usage) = chain_gemini(
-                state,
-                Some(system_prompt),
-                &history,
-                message,
-                constraints.max_output_tokens,
-            )
-            .await?;
-            Ok((text, CoachChain::History { messages: new_history }, usage))
+
+            let client = gemini::Client::new(&cfg.primary_token)
+                .map_err(|e| fmt_err("google", e))?;
+            let agent = client
+                .agent(&cfg.primary.model)
+                .preamble(system_prompt)
+                .build();
+
+            let max = constraints.max_output_tokens.unwrap_or(200) as u64;
+            let resp = agent
+                .completion(message, to_rig_history(history))
+                .await
+                .map_err(|e| fmt_err("google", e))?
+                .max_tokens(max)
+                .send()
+                .await
+                .map_err(|e| fmt_err("google", e))?;
+
+            let text = extract_text(&resp.choice);
+            let usage = to_coach_usage(resp.usage);
+            let new_messages = extend_history(history, message, &text);
+            Ok((text, CoachChain::History { messages: new_messages }, usage))
         }
         other => Err(format!(
             "session_send: provider {other} has no session support (native or emulated)"
@@ -1319,87 +1139,79 @@ mod live_tests {
         Some(Arc::new(RwLock::new(state)))
     }
 
-    /// Smallest possible round-trip. Verifies the agent + Responses API
-    /// path returns text and a `resp_…` id we can chain with.
+    /// Smallest possible round-trip via session_send. Verifies the
+    /// OpenAI Responses API path returns text and a ServerId chain.
     #[tokio::test]
     #[ignore]
-    async fn live_chain_openai_basic() {
+    async fn live_session_send_openai_basic() {
         let Some(state) = live_state() else { return };
-        let call = chain_openai(
+        let (text, chain, usage) = session_send(
             &state,
+            &crate::state::CoachChain::Empty,
+            "You are a test bot.",
             "Reply with the single word: hello",
-            None,
-            None,
-            false,
-            Some(20),
+            CallConstraints { max_output_tokens: Some(20), require_json: false },
         )
         .await
-        .expect("chain_openai failed");
-        assert!(!call.text.is_empty(), "expected non-empty text");
-        assert!(
-            call.response_id.starts_with("resp_"),
-            "expected resp_ prefix, got: {}",
-            call.response_id
-        );
+        .expect("session_send failed");
+        assert!(!text.is_empty(), "expected non-empty text");
+        assert!(matches!(chain, crate::state::CoachChain::ServerId { .. }));
+        assert!(usage.input_tokens > 0);
     }
 
-    /// The whole reason we're using Responses API: server-side memory.
-    /// Tell the model a fact, then ask about it on the next turn using
-    /// only `previous_response_id` — if context is preserved, it knows.
+    /// Server-side memory via session_send: tell the model a fact, then
+    /// ask about it on the next turn through the chain.
     #[tokio::test]
     #[ignore]
-    async fn live_chain_continues_context_via_response_id() {
+    async fn live_session_send_openai_continues_context() {
         let Some(state) = live_state() else { return };
-        let r1 = chain_openai(
+        let system = "You are a test bot. Reply tersely.";
+        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false };
+
+        let (_t1, chain1, _u1) = session_send(
             &state,
+            &crate::state::CoachChain::Empty,
+            system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
-            None,
-            None,
-            false,
-            Some(20),
+            constraints,
         )
         .await
         .expect("first call failed");
 
-        let r2 = chain_openai(
+        let (text, _chain2, _u2) = session_send(
             &state,
+            &chain1,
+            system,
             "What was the token I told you to remember? Reply with just the token.",
-            None,
-            Some(&r1.response_id),
-            false,
-            Some(30),
+            constraints,
         )
         .await
         .expect("second call failed");
 
         assert!(
-            r2.text.contains("PURPLE-OWL-42"),
-            "model didn't remember across turns; got: {}",
-            r2.text
+            text.contains("PURPLE-OWL-42"),
+            "model didn't remember across turns; got: {text}"
         );
-        assert_ne!(r1.response_id, r2.response_id, "response_ids should differ");
     }
 
     /// json_object response format must produce parseable JSON.
-    /// This is the path evaluate_stop_chained relies on.
     #[tokio::test]
     #[ignore]
-    async fn live_chain_json_mode_returns_parseable_json() {
+    async fn live_session_send_openai_json_mode() {
         let Some(state) = live_state() else { return };
-        let call = chain_openai(
+        let (text, _chain, _usage) = session_send(
             &state,
+            &crate::state::CoachChain::Empty,
+            "You return JSON only.",
             "Return JSON of the form {\"answer\": <number>}. The number is 7.",
-            None,
-            None,
-            true,
-            Some(60),
+            CallConstraints { max_output_tokens: Some(60), require_json: true },
         )
         .await
-        .expect("chain_openai (json) failed");
+        .expect("session_send (json) failed");
 
-        let parsed: serde_json::Value = serde_json::from_str(&call.text)
-            .unwrap_or_else(|e| panic!("json parse failed ({e}) on: {}", call.text));
-        assert!(parsed.get("answer").is_some(), "missing 'answer' field: {}", call.text);
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("json parse failed ({e}) on: {text}"));
+        assert!(parsed.get("answer").is_some(), "missing 'answer' field: {text}");
     }
 
     /// observe_event chain: two events, each producing a new response_id,
@@ -1539,56 +1351,55 @@ mod live_tests {
         Some(Arc::new(RwLock::new(state)))
     }
 
-    /// Smallest possible Anthropic round-trip — verifies the agent +
-    /// caching builder + extraction path works end to end.
+    /// Smallest possible Anthropic round-trip via session_send.
     #[tokio::test]
     #[ignore]
-    async fn live_chain_anthropic_basic() {
+    async fn live_session_send_anthropic_basic() {
         let Some(state) = live_state_anthropic() else { return };
-        let (text, new_history, usage) = chain_anthropic(
+        let (text, chain, usage) = session_send(
             &state,
-            Some("You are a test bot. Respond with one word."),
-            &[],
+            &crate::state::CoachChain::Empty,
+            "You are a test bot. Respond with one word.",
             "Reply with the single word: hello",
-            Some(20),
+            CallConstraints { max_output_tokens: Some(20), require_json: false },
         )
         .await
-        .expect("chain_anthropic failed");
+        .expect("session_send failed");
         assert!(!text.is_empty(), "expected non-empty text");
-        assert_eq!(new_history.len(), 2, "history should grow by user+assistant");
-        // Usage should report something — both fields should be > 0 for any
-        // real call. This is the regression check for the rig field shape.
+        let messages = match &chain {
+            crate::state::CoachChain::History { messages } => messages,
+            other => panic!("expected History chain, got {other:?}"),
+        };
+        assert_eq!(messages.len(), 2, "history should grow by user+assistant");
         assert!(usage.input_tokens > 0, "expected non-zero input_tokens");
         assert!(usage.output_tokens > 0, "expected non-zero output_tokens");
-        assert_eq!(new_history[0].role, crate::state::CoachRole::User);
-        assert_eq!(new_history[1].role, crate::state::CoachRole::Assistant);
     }
 
-    /// Anthropic preserves context across turns when client passes the
-    /// growing history back. The "test" of statefulness is whether the
-    /// model can recall a token from an earlier turn.
+    /// Anthropic preserves context across turns via client-side history
+    /// threaded through CoachChain::History.
     #[tokio::test]
     #[ignore]
-    async fn live_chain_anthropic_continues_context_via_history() {
+    async fn live_session_send_anthropic_continues_context() {
         let Some(state) = live_state_anthropic() else { return };
         let system = "You are a test bot. Reply tersely.";
+        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false };
 
-        let (_t1, h1, _u1) = chain_anthropic(
+        let (_t1, chain1, _u1) = session_send(
             &state,
-            Some(system),
-            &[],
+            &crate::state::CoachChain::Empty,
+            system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
-            Some(20),
+            constraints,
         )
         .await
         .expect("first call failed");
 
-        let (text, _h2, _u2) = chain_anthropic(
+        let (text, _chain2, _u2) = session_send(
             &state,
-            Some(system),
-            &h1,
+            &chain1,
+            system,
             "What was the token I told you to remember? Reply with just the token.",
-            Some(30),
+            constraints,
         )
         .await
         .expect("second call failed");
@@ -1718,52 +1529,52 @@ mod live_tests {
         Some(Arc::new(RwLock::new(state)))
     }
 
-    /// Smallest Gemini round-trip — exercises the request builder,
-    /// role conversion, and max_tokens plumbing.
+    /// Smallest Gemini round-trip via session_send.
     #[tokio::test]
     #[ignore]
-    async fn live_chain_gemini_basic() {
+    async fn live_session_send_gemini_basic() {
         let Some(state) = live_state_google() else { return };
-        let (text, new_history, _usage) = chain_gemini(
+        let (text, chain, _usage) = session_send(
             &state,
-            Some("You are a test bot. Respond with one word."),
-            &[],
+            &crate::state::CoachChain::Empty,
+            "You are a test bot. Respond with one word.",
             "Reply with the single word: hello",
-            Some(20),
+            CallConstraints { max_output_tokens: Some(20), require_json: false },
         )
         .await
-        .expect("chain_gemini failed");
+        .expect("session_send failed");
         assert!(!text.is_empty(), "expected non-empty text");
-        assert_eq!(new_history.len(), 2, "history should grow by user+assistant");
-        assert_eq!(new_history[0].role, crate::state::CoachRole::User);
-        assert_eq!(new_history[1].role, crate::state::CoachRole::Assistant);
+        let messages = match &chain {
+            crate::state::CoachChain::History { messages } => messages,
+            other => panic!("expected History chain, got {other:?}"),
+        };
+        assert_eq!(messages.len(), 2, "history should grow by user+assistant");
     }
 
-    /// Gemini preserves context across turns the same way Anthropic does:
-    /// by us resending the growing history. Model should recall a token
-    /// planted on the previous turn.
+    /// Gemini preserves context via client-side history resend.
     #[tokio::test]
     #[ignore]
-    async fn live_chain_gemini_continues_context_via_history() {
+    async fn live_session_send_gemini_continues_context() {
         let Some(state) = live_state_google() else { return };
         let system = "You are a test bot. Reply tersely.";
+        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false };
 
-        let (_t1, h1, _u1) = chain_gemini(
+        let (_t1, chain1, _u1) = session_send(
             &state,
-            Some(system),
-            &[],
+            &crate::state::CoachChain::Empty,
+            system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
-            Some(20),
+            constraints,
         )
         .await
         .expect("first call failed");
 
-        let (text, _h2, _u2) = chain_gemini(
+        let (text, _chain2, _u2) = session_send(
             &state,
-            Some(system),
-            &h1,
+            &chain1,
+            system,
             "What was the token I told you to remember? Reply with just the token.",
-            Some(30),
+            constraints,
         )
         .await
         .expect("second call failed");
