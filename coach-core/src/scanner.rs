@@ -162,19 +162,14 @@ pub async fn sync_sessions_with(
                 .map(|s| s.current_session_id.clone())
                 .unwrap_or_else(|| session.session_id.clone());
             let effective_session = ClaudeSessionFile {
-                session_id: effective_sid,
+                session_id: effective_sid.clone(),
                 ..session.clone()
             };
             if let Some(jsonl_path) = jsonl_path_for(&effective_session, projects_dir) {
                 match bootstrap_from_jsonl(&jsonl_path) {
                     Ok(boot) => {
                         if let Some(sess) = coach.sessions.get_mut(&session.pid) {
-                            // Only adopt the session file's id if the hook
-                            // hasn't already set one — otherwise we'd mismatch
-                            // and the next hook would trigger the /clear path.
-                            if sess.current_session_id.is_empty() {
-                                sess.current_session_id = session.session_id.clone();
-                            }
+                            sess.bootstrapped_session_id = Some(effective_sid.clone());
                             sess.tool_counts = boot.tool_counts;
                             sess.active_agents = boot.active_agents;
                             sess.event_count = boot.total_tools;
@@ -559,7 +554,9 @@ mod tests {
         assert_eq!(sess.tool_counts.get("Agent"), Some(&1));
         assert_eq!(sess.active_agents, 1, "Agent t3 has no result yet");
         assert_eq!(sess.event_count, 3);
-        assert_eq!(sess.current_session_id, sid);
+        assert!(sess.current_session_id.is_empty(),
+            "bootstrap must not set current_session_id");
+        assert_eq!(sess.bootstrapped_session_id, Some(sid.to_string()));
     }
 
     /// A hook creates the session first (empty tool_counts), then the
@@ -670,6 +667,95 @@ mod tests {
             assert!(sess.event_count > 1,
                 "next hook should increment, not reset; got event_count={}",
                 sess.event_count);
+        }
+    }
+
+    /// Scanner-first with stale session file (after /clear). The hook
+    /// carries the REAL session_id. Bootstrap data from the old
+    /// conversation must be discarded.
+    #[tokio::test]
+    async fn scanner_first_stale_sid_then_hook_discards_bootstrap() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let my_pid = std::process::id();
+        let stale_sid = "stale-old-conversation";
+        let real_sid = "real-current-conversation";
+        let cwd = "/tmp/stale-scanner-test";
+
+        write_session_file_full(sessions_dir.path(), my_pid, stale_sid, cwd);
+        write_jsonl(projects_dir.path(), cwd, stale_sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        ]);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        // Scanner runs first — bootstraps from stale JSONL.
+        let live = scan_live_sessions_in(sessions_dir.path());
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+
+        {
+            let coach = state.read().await;
+            let sess = coach.sessions.get(&my_pid).unwrap();
+            assert!(sess.bootstrapped);
+            assert!(sess.current_session_id.is_empty());
+            assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
+        }
+
+        // Hook arrives with the REAL session_id — stale data discarded.
+        {
+            let mut coach = state.write().await;
+            let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
+            assert_eq!(sess.current_session_id, real_sid);
+            assert_eq!(sess.event_count, 1);
+            assert!(sess.tool_counts.is_empty(),
+                "stale bootstrap tool_counts must be cleared");
+        }
+    }
+
+    /// Scanner-first, session_id matches the hook. Bootstrap data is
+    /// preserved and the first hook increments event_count.
+    #[tokio::test]
+    async fn scanner_first_matching_sid_then_hook_keeps_bootstrap() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let my_pid = std::process::id();
+        let sid = "same-conversation";
+        let cwd = "/tmp/matching-sid-test";
+
+        write_session_file_full(sessions_dir.path(), my_pid, sid, cwd);
+        write_jsonl(projects_dir.path(), cwd, sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+        ]);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        let live = scan_live_sessions_in(sessions_dir.path());
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+
+        {
+            let coach = state.read().await;
+            let sess = coach.sessions.get(&my_pid).unwrap();
+            assert_eq!(sess.event_count, 2);
+        }
+
+        // Hook with same session_id — bootstrap data preserved.
+        {
+            let mut coach = state.write().await;
+            let sess = coach.apply_hook_event(my_pid, sid, Some(cwd));
+            assert_eq!(sess.event_count, 3,
+                "bootstrap event_count should be incremented, not reset");
+            assert_eq!(sess.tool_counts.get("Read"), Some(&1));
+            assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
         }
     }
 }

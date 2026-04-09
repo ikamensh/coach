@@ -231,6 +231,10 @@ pub struct SessionState {
     /// the JSONL conversation log. Prevents re-bootstrapping on every
     /// scan cycle.
     pub bootstrapped: bool,
+    /// The session_id whose JSONL was used for bootstrap. Lets
+    /// `apply_hook_event` decide whether bootstrapped tool_counts
+    /// belong to the current conversation (keep) or a stale one (discard).
+    pub bootstrapped_session_id: Option<String>,
 }
 
 /// Item enqueued for the per-session observer consumer.
@@ -395,13 +399,19 @@ impl CoachState {
                 adopt_cwd_if_unset(sess, cwd);
             }
             Some(sess) if sess.current_session_id.is_empty() => {
-                // First hook for a scanner-discovered placeholder. Adopt
-                // the conversation id without resetting started_at — the
-                // scanner already populated it from the session file.
+                // First hook for a scanner-discovered placeholder. If
+                // bootstrap loaded data for this same conversation, keep
+                // it and increment; otherwise discard stale bootstrap data.
                 sess.current_session_id = session_id.to_string();
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
-                sess.event_count = 1;
+                if sess.bootstrapped_session_id.as_deref() == Some(session_id) {
+                    sess.event_count += 1;
+                } else {
+                    sess.event_count = 1;
+                    sess.tool_counts.clear();
+                    sess.active_agents = 0;
+                }
                 adopt_cwd_if_unset(sess, cwd);
             }
             Some(sess) => {
@@ -419,6 +429,7 @@ impl CoachState {
                 sess.last_stop_blocked = None;
                 sess.telemetry = CoachTelemetry::new();
                 sess.activity.clear();
+                sess.bootstrapped_session_id = None;
                 adopt_cwd_if_unset(sess, cwd);
             }
             None => {
@@ -445,6 +456,7 @@ impl CoachState {
                         client: SessionClient::default(),
                         is_worktree: cwd.map_or(false, is_git_worktree),
                         bootstrapped: false,
+                        bootstrapped_session_id: None,
                     },
                 );
             }
@@ -517,6 +529,7 @@ impl CoachState {
                 client: SessionClient::Claude,
                 is_worktree: cwd.map_or(false, is_git_worktree),
                 bootstrapped: false,
+                bootstrapped_session_id: None,
             },
         );
         true
