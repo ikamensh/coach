@@ -70,19 +70,28 @@ export function SessionList() {
               onClick={() => openSession(session.pid)}
               className="flex items-start gap-3 bg-zinc-100 dark:bg-zinc-800/50 rounded-lg px-3 py-2 cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors"
             >
-              {session.client === "cursor" ? (
-                <CursorIcon
-                  size={26}
-                  color={tint}
-                  className="flex-shrink-0 mt-0.5"
-                />
-              ) : (
-                <OwlIcon
-                  size={26}
-                  color={tint}
-                  className="flex-shrink-0 mt-0.5"
-                />
-              )}
+              <div className="flex flex-col items-center flex-shrink-0 mt-0.5">
+                {session.client === "cursor" ? (
+                  <CursorIcon size={26} color={tint} />
+                ) : (
+                  <OwlIcon size={26} color={tint} />
+                )}
+                {session.subagent_count > 0 && session.subagent_count <= 6 && (
+                  <div className="flex flex-wrap justify-center gap-0 mt-0.5" style={{ maxWidth: 26 }}>
+                    {Array.from({ length: session.subagent_count }).map((_, i) => (
+                      <OwlIcon key={i} size={8} color={tint} />
+                    ))}
+                  </div>
+                )}
+                {session.subagent_count > 6 && (
+                  <div className="flex items-center gap-0.5 mt-0.5">
+                    <OwlIcon size={8} color={tint} />
+                    <span className="text-zinc-400" style={{ fontSize: 8, lineHeight: 1 }}>
+                      x{session.subagent_count}
+                    </span>
+                  </div>
+                )}
+              </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between gap-2">
                   <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">

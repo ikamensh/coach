@@ -174,6 +174,10 @@ pub struct SessionSnapshot {
     pub coach_total_usage: CoachUsage,
     /// Recent activity for the current conversation, oldest-first.
     pub activity: Vec<ActivityEntry>,
+    /// Number of live sub-agent processes (kind != "interactive")
+    /// whose parent chain leads to this session's PID.
+    #[serde(default)]
+    pub subagent_count: usize,
     /// Which agent CLI / IDE this session belongs to. Drives the icon
     /// rendered in the frontend session list.
     #[serde(default)]
@@ -258,6 +262,9 @@ pub struct SessionState {
     pub coach_last_usage: Option<CoachUsage>,
     pub coach_total_usage: CoachUsage,
     pub activity: VecDeque<ActivityEntry>,
+    /// Number of live sub-agent processes whose parent chain leads to
+    /// this session's PID. Recomputed on each scanner cycle.
+    pub subagent_count: usize,
     /// Which agent CLI / IDE this session belongs to. Set once on
     /// creation (Claude by default) and only updated by `mark_client`,
     /// which the cursor handlers call after the shared `run_*` path
@@ -532,6 +539,7 @@ impl CoachState {
                         coach_last_usage: None,
                         coach_total_usage: CoachUsage::default(),
                         activity: VecDeque::new(),
+                        subagent_count: 0,
                         client: SessionClient::default(),
                         observer_tx: None,
                     },
@@ -582,6 +590,7 @@ impl CoachState {
                 coach_last_usage: s.coach_last_usage,
                 coach_total_usage: s.coach_total_usage,
                 activity: s.activity.iter().cloned().collect(),
+                subagent_count: s.subagent_count,
                 client: s.client,
             })
             .collect();
@@ -704,6 +713,7 @@ impl CoachState {
                 coach_last_usage: None,
                 coach_total_usage: CoachUsage::default(),
                 activity: VecDeque::new(),
+                subagent_count: 0,
                 // The file scanner only walks `~/.claude/projects` so any
                 // session it discovers is necessarily Claude Code.
                 client: SessionClient::Claude,
@@ -721,6 +731,21 @@ impl CoachState {
         if let Some(s) = self.sessions.get_mut(&pid) {
             s.client = client;
         }
+    }
+
+    /// Replace every session's `subagent_count` with the values from
+    /// `counts`. Sessions not in the map get reset to 0. Returns true
+    /// if any value actually changed.
+    pub fn set_subagent_counts(&mut self, counts: &std::collections::HashMap<u32, usize>) -> bool {
+        let mut changed = false;
+        for (pid, sess) in &mut self.sessions {
+            let new = counts.get(pid).copied().unwrap_or(0);
+            if sess.subagent_count != new {
+                sess.subagent_count = new;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Remove sessions whose PID is not in the live set. Returns the
