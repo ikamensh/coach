@@ -227,6 +227,10 @@ pub struct SessionState {
     /// main checkout). Detected once on first cwd observation via
     /// `git rev-parse --git-dir`.
     pub is_worktree: bool,
+    /// Set to true after the scanner has bootstrapped this session from
+    /// the JSONL conversation log. Prevents re-bootstrapping on every
+    /// scan cycle.
+    pub bootstrapped: bool,
 }
 
 /// Item enqueued for the per-session observer consumer.
@@ -440,6 +444,7 @@ impl CoachState {
                         active_agents: 0,
                         client: SessionClient::default(),
                         is_worktree: cwd.map_or(false, is_git_worktree),
+                        bootstrapped: false,
                     },
                 );
             }
@@ -511,6 +516,7 @@ impl CoachState {
                 // session it discovers is necessarily Claude Code.
                 client: SessionClient::Claude,
                 is_worktree: cwd.map_or(false, is_git_worktree),
+                bootstrapped: false,
             },
         );
         true

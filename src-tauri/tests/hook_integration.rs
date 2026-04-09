@@ -481,7 +481,8 @@ async fn scanner_discovers_real_sessions() {
             .get(&file.pid)
             .unwrap_or_else(|| panic!("PID {} from session file should be in state", file.pid));
         assert_eq!(sess.pid, file.pid);
-        assert_eq!(sess.event_count, 0, "discovered sessions start with 0 events");
+        // Sessions are bootstrapped from their JSONL, so event_count may be > 0.
+        assert!(sess.bootstrapped, "discovered sessions should be bootstrapped");
     }
 }
 

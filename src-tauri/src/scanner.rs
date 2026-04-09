@@ -127,8 +127,17 @@ pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHa
             session.started_at_utc(),
         );
         if created {
-            // Bootstrap state from the JSONL conversation log so we
-            // show accurate tool counts and active agents from the start.
+            coach.log(session.pid, "Scanner", "process discovered", session.cwd.clone());
+            changed = true;
+        }
+
+        // Bootstrap from JSONL on first scan for sessions that haven't
+        // been bootstrapped yet. This covers both scanner-first and
+        // hook-first discovery: hooks create the session with empty
+        // tool_counts, the scanner fills it in from history.
+        let needs_bootstrap = coach.sessions.get(&session.pid)
+            .is_some_and(|s| !s.bootstrapped);
+        if needs_bootstrap {
             if let Some(jsonl_path) = jsonl_path_for(session) {
                 match bootstrap_from_jsonl(&jsonl_path) {
                     Ok(boot) => {
@@ -137,6 +146,7 @@ pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHa
                             sess.tool_counts = boot.tool_counts;
                             sess.active_agents = boot.active_agents;
                             sess.event_count = boot.total_tools;
+                            sess.bootstrapped = true;
                         }
                         coach.log(
                             session.pid,
@@ -145,14 +155,18 @@ pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHa
                             Some(format!("{} tools, {} active agents",
                                 boot.total_tools, boot.active_agents)),
                         );
+                        changed = true;
                     }
                     Err(e) => {
                         eprintln!("[coach] JSONL bootstrap failed for pid {}: {e}", session.pid);
                     }
                 }
+            } else {
+                // No JSONL found — mark as bootstrapped to avoid retrying.
+                if let Some(sess) = coach.sessions.get_mut(&session.pid) {
+                    sess.bootstrapped = true;
+                }
             }
-            coach.log(session.pid, "Scanner", "process discovered", session.cwd.clone());
-            changed = true;
         }
     }
 
