@@ -53,11 +53,16 @@ impl HookResponse {
 /// hash so distinct session_ids resolve to distinct fake PIDs.
 pub type PidResolver = Arc<dyn Fn(u16, &str) -> Option<u32> + Send + Sync>;
 
+/// Walk one level up the process tree. Injected into `AppState` so tests
+/// can supply a fake; production uses `pid_resolver::parent_pid`.
+pub type ParentPidFn = Arc<dyn Fn(u32) -> Option<u32> + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) coach: SharedState,
     pub(crate) emitter: Option<tauri::AppHandle>,
     resolver: PidResolver,
+    parent_pid_fn: ParentPidFn,
 }
 
 pub(crate) fn session_id(payload: &HookPayload) -> String {
@@ -79,10 +84,10 @@ pub(crate) fn emit_update(emitter: &Option<tauri::AppHandle>, coach: &crate::sta
 /// Returns None if the resolver fails — the caller should drop the
 /// event from session-list bookkeeping rather than create a phantom row.
 ///
-/// Logs once per new `session_id`, on the first successful resolution.
-/// This is the only signal `coach serve`'s stderr emits per inbound
-/// hook event, which is enough to debug "is Coach actually seeing
-/// claude's hooks?" without drowning the log in per-event noise.
+/// When the raw PID isn't a known session, walks up the parent chain.
+/// This handles command-type hooks where the TCP peer is the shim's
+/// curl process, not Claude Code. The parent walk finds the real
+/// Claude Code PID that the scanner already discovered.
 async fn resolve_pid(state: &AppState, sid: &str, peer_port: u16) -> Option<u32> {
     {
         let coach = state.coach.read().await;
@@ -90,11 +95,38 @@ async fn resolve_pid(state: &AppState, sid: &str, peer_port: u16) -> Option<u32>
             return Some(pid);
         }
     }
-    let pid = (state.resolver)(peer_port, sid);
-    if let Some(p) = pid {
-        eprintln!("[coach] resolved sid {sid} → pid {p} (peer port {peer_port})");
+    let raw_pid = (state.resolver)(peer_port, sid)?;
+
+    // Collect known session PIDs so we can check without holding the lock
+    // during the parent walk (which may do I/O).
+    let known: std::collections::HashSet<u32> = {
+        let coach = state.coach.read().await;
+        coach.sessions.keys().copied().collect()
+    };
+
+    if known.contains(&raw_pid) {
+        eprintln!("[coach] resolved sid {sid} → pid {raw_pid} (peer port {peer_port})");
+        return Some(raw_pid);
     }
-    pid
+
+    // Walk parent chain: curl → sh → Claude Code.
+    let mut candidate = raw_pid;
+    for _ in 0..5 {
+        match (state.parent_pid_fn)(candidate) {
+            Some(ppid) if known.contains(&ppid) => {
+                eprintln!(
+                    "[coach] resolved sid {sid} → pid {ppid} (parent of {raw_pid}, peer port {peer_port})"
+                );
+                return Some(ppid);
+            }
+            Some(ppid) => candidate = ppid,
+            None => break,
+        }
+    }
+
+    // No known ancestor — use raw PID (first hook before scanner runs).
+    eprintln!("[coach] resolved sid {sid} → pid {raw_pid} (peer port {peer_port})");
+    Some(raw_pid)
 }
 
 /// Shared by Claude `/hook/permission-request` and Cursor `/cursor/hook/*` permission analogues.
@@ -754,11 +786,13 @@ fn build_router(
     coach: SharedState,
     emitter: Option<tauri::AppHandle>,
     resolver: PidResolver,
+    parent_pid_fn: ParentPidFn,
 ) -> Router {
     let state = AppState {
         coach,
         emitter,
         resolver,
+        parent_pid_fn,
     };
     Router::new()
         .route("/hook/permission-request", post(handle_permission_request))
@@ -818,11 +852,27 @@ pub fn fake_resolver_from_sid() -> PidResolver {
     Arc::new(|_peer_port, sid| Some(fake_pid_for_sid(sid)))
 }
 
+/// No-op parent PID function for tests where fake PIDs have no real
+/// process tree. The parent walk in `resolve_pid` simply skips.
+pub fn no_parent() -> ParentPidFn {
+    Arc::new(|_| None)
+}
+
 /// Router without Tauri emitter — for integration tests.
 /// Tests inject a fake resolver via `fake_resolver_from_sid()` so the
 /// in-process client gets distinct fake PIDs per session_id.
 pub fn create_router_headless(coach: SharedState, resolver: PidResolver) -> Router {
-    build_router(coach, None, resolver)
+    build_router(coach, None, resolver, no_parent())
+}
+
+/// Router with a custom parent-PID function — for tests that exercise
+/// the parent walk (e.g. command-hook ghost session fix).
+pub fn create_router_headless_with_parent(
+    coach: SharedState,
+    resolver: PidResolver,
+    parent_pid_fn: ParentPidFn,
+) -> Router {
+    build_router(coach, None, resolver, parent_pid_fn)
 }
 
 /// Bind the production hook server. Pass `Some(app_handle)` from the
@@ -856,7 +906,8 @@ pub async fn serve_on_listener(
     app_handle: Option<tauri::AppHandle>,
     port: u16,
 ) {
-    let app = build_router(coach, app_handle, lsof_resolver(port));
+    let real_parent: ParentPidFn = Arc::new(crate::pid_resolver::parent_pid);
+    let app = build_router(coach, app_handle, lsof_resolver(port), real_parent);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

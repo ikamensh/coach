@@ -45,6 +45,20 @@ pub fn resolve_peer_pid(peer_port: u16, _listen_port: u16) -> Option<u32> {
     })
 }
 
+/// Walk one level up the process tree. Returns `None` for PID 0/1,
+/// for processes that already exited, or on lookup failure.
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&p| p > 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

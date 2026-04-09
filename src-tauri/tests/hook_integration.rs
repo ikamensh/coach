@@ -1546,3 +1546,73 @@ async fn user_prompt_submit_truncates_long_prompts() {
     // 200 x's plus the ellipsis character.
     assert_eq!(detail.chars().count(), 201);
 }
+
+// ── Command-hook ghost session bug ─────────────────────────────────────
+//
+// With command-type hooks the TCP peer is curl/sh, not Claude Code.
+// resolve_peer_pid returns curl's PID, which differs from the scanner-
+// discovered Claude Code PID. This created a ghost session for curl
+// while the real session got no activity.
+
+/// Reproduce the ghost-session bug: scanner discovers Claude Code PID,
+/// then a hook arrives from a different PID (simulating curl in the
+/// command-hook shim). Activity must land on the scanner session.
+#[tokio::test]
+async fn command_hook_updates_scanner_session_not_ghost() {
+    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
+    let claude_pid: u32 = 100;
+    let curl_pid: u32 = 200;
+
+    // Scanner discovers Claude Code before any hooks arrive.
+    state
+        .write()
+        .await
+        .register_discovered_pid(claude_pid, Some("/projects"), chrono::Utc::now());
+
+    // Resolver returns curl's PID; parent walk maps curl → Claude Code.
+    let resolver: coach_lib::server::PidResolver =
+        Arc::new(move |_peer_port, _sid| Some(curl_pid));
+    let parent_fn: coach_lib::server::ParentPidFn = Arc::new(move |pid| {
+        if pid == curl_pid { Some(claude_pid) } else { None }
+    });
+    let router = coach_lib::server::create_router_headless_with_parent(
+        state.clone(),
+        resolver,
+        parent_fn,
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    // Send a UserPromptSubmit hook (the path the user reported).
+    client
+        .post(format!("{base}/hook/user-prompt-submit"))
+        .json(&serde_json::json!({
+            "session_id": "conv-1",
+            "prompt": "hello",
+            "cwd": "/projects"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let s = state.read().await;
+    assert_eq!(
+        s.sessions[&claude_pid].event_count, 1,
+        "scanner session should receive the hook event"
+    );
+    assert!(
+        !s.sessions.contains_key(&curl_pid),
+        "no ghost session should be created for curl's PID"
+    );
+}
