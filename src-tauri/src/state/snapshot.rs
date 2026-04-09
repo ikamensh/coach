@@ -102,10 +102,16 @@ pub struct SessionSnapshot {
     pub coach_total_usage: CoachUsage,
     /// Recent activity for the current conversation, oldest-first.
     pub activity: Vec<ActivityEntry>,
+    /// Number of Agent tool calls currently in-flight.
+    #[serde(default)]
+    pub active_agents: usize,
     /// Which agent CLI / IDE this session belongs to. Drives the icon
     /// rendered in the frontend session list.
     #[serde(default)]
     pub client: SessionClient,
+    /// True when the session's cwd is a git linked worktree.
+    #[serde(default)]
+    pub is_worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -250,6 +256,8 @@ fn snapshot_session(s: &SessionState, now: DateTime<Utc>) -> SessionSnapshot {
         coach_last_usage: s.telemetry.last_usage,
         coach_total_usage: s.telemetry.total_usage,
         activity: s.activity.iter().cloned().collect(),
+        active_agents: s.active_agents,
         client: s.client,
+        is_worktree: s.is_worktree,
     }
 }

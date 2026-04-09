@@ -49,6 +49,7 @@ const CLAUDE_SHIM_FILENAME: &str = "claude-hook.sh";
 const CLAUDE_HOOK_EVENTS: &[(&str, &str)] = &[
     ("PermissionRequest", "permission-request"),
     ("Stop", "stop"),
+    ("PreToolUse", "pre-tool-use"),
     ("PostToolUse", "post-tool-use"),
     ("UserPromptSubmit", "user-prompt-submit"),
     // NOTE: SessionStart not included — Claude Code 2.1.92+ silently
@@ -797,7 +798,7 @@ mod tests {
         let status = check_hook_status_at(7700, std::path::Path::new("/nonexistent/path.json"), &shim);
         assert!(!status.installed);
         assert!(status.hooks.iter().all(|h| !h.installed));
-        assert_eq!(status.hooks.len(), 4);
+        assert_eq!(status.hooks.len(), CLAUDE_HOOK_EVENTS.len());
     }
 
     #[test]
@@ -1004,8 +1005,8 @@ mod tests {
         let added = sync_managed_hooks_at(7700, &path, &shim, &mut user_enabled).unwrap();
 
         assert!(user_enabled, "legacy install flips intent flag on");
-        // All four events should be added (legacy HTTP doesn't count as current command hook).
-        assert_eq!(added.len(), 4);
+        // All events should be added (legacy HTTP doesn't count as current command hook).
+        assert_eq!(added.len(), CLAUDE_HOOK_EVENTS.len());
 
         let status = check_hook_status_at(7700, &path, &shim);
         assert!(status.installed);

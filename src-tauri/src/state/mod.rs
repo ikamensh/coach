@@ -215,11 +215,18 @@ pub struct SessionState {
     /// Reset on `/clear` since the new conversation has no shared context.
     pub telemetry: CoachTelemetry,
     pub activity: VecDeque<ActivityEntry>,
+    /// Number of Agent tool calls currently in-flight. Incremented on
+    /// PreToolUse(Agent), decremented on PostToolUse(Agent).
+    pub active_agents: usize,
     /// Which agent CLI / IDE this session belongs to. Set once on
     /// creation (Claude by default) and only updated by `mark_client`,
     /// which the cursor handlers call after the shared `run_*` path
     /// creates the session.
     pub client: SessionClient,
+    /// True when the session's cwd is a git linked worktree (not the
+    /// main checkout). Detected once on first cwd observation via
+    /// `git rev-parse --git-dir`.
+    pub is_worktree: bool,
 }
 
 /// Item enqueued for the per-session observer consumer.
@@ -274,6 +281,17 @@ impl CoachState {
     }
 }
 
+/// Returns true when `cwd` is a git linked worktree (not the main checkout).
+fn is_git_worktree(cwd: &str) -> bool {
+    let Ok(out) = std::process::Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--git-dir"])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && String::from_utf8_lossy(&out.stdout).contains("/worktrees/")
+}
+
 /// Set the launch cwd on first observation. No-op if already set, so
 /// later hooks (which may report a different cwd after the user `cd`s)
 /// can't drift the window's identity.
@@ -284,6 +302,7 @@ fn adopt_cwd_if_unset(sess: &mut SessionState, cwd: Option<&str>) {
     if let Some(c) = cwd {
         sess.cwd = Some(c.to_string());
         sess.display_name = derive_display_name(sess.cwd.as_deref(), sess.pid);
+        sess.is_worktree = is_git_worktree(c);
     }
 }
 
@@ -390,6 +409,7 @@ impl CoachState {
                 sess.event_count = 1;
                 sess.started_at = now;
                 sess.tool_counts.clear();
+                sess.active_agents = 0;
                 sess.stop_count = 0;
                 sess.stop_blocked_count = 0;
                 sess.last_stop_blocked = None;
@@ -417,7 +437,9 @@ impl CoachState {
                         stop_blocked_count: 0,
                         telemetry: CoachTelemetry::new(),
                         activity: VecDeque::new(),
+                        active_agents: 0,
                         client: SessionClient::default(),
+                        is_worktree: cwd.map_or(false, is_git_worktree),
                     },
                 );
             }
@@ -484,9 +506,11 @@ impl CoachState {
                 stop_blocked_count: 0,
                 telemetry: CoachTelemetry::new(),
                 activity: VecDeque::new(),
+                active_agents: 0,
                 // The file scanner only walks `~/.claude/projects` so any
                 // session it discovers is necessarily Claude Code.
                 client: SessionClient::Claude,
+                is_worktree: cwd.map_or(false, is_git_worktree),
             },
         );
         true

@@ -61,7 +61,10 @@ interface SessionSnapshot {
   coach_last_usage: CoachUsage | null;
   coach_total_usage: CoachUsage;
   activity: ActivityEntry[];
+  /** Number of Agent tool calls currently in-flight. */
+  active_agents: number;
   client: SessionClient;
+  is_worktree: boolean;
 }
 
 interface ModelConfig {

@@ -78,26 +78,33 @@ export function SessionList() {
                 ) : (
                   <OwlIcon size={26} color={tint} />
                 )}
-                {(session.tool_counts.Agent ?? 0) > 0 && (session.tool_counts.Agent ?? 0) <= 6 && (
+                {session.active_agents > 0 && session.active_agents <= 6 && (
                   <div className="flex flex-wrap justify-center gap-0 mt-0.5" style={{ maxWidth: 26 }}>
-                    {Array.from({ length: session.tool_counts.Agent }).map((_, i) => (
+                    {Array.from({ length: session.active_agents }).map((_, i) => (
                       <OwlIcon key={i} size={8} color={tint} />
                     ))}
                   </div>
                 )}
-                {(session.tool_counts.Agent ?? 0) > 6 && (
+                {session.active_agents > 6 && (
                   <div className="flex items-center gap-0.5 mt-0.5">
                     <OwlIcon size={8} color={tint} />
                     <span className="text-zinc-400" style={{ fontSize: 8, lineHeight: 1 }}>
-                      x{session.tool_counts.Agent}
+                      x{session.active_agents}
                     </span>
                   </div>
                 )}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">
-                    {session.coach_session_title ?? session.display_name}
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">
+                      {session.coach_session_title ?? session.display_name}
+                    </div>
+                    {session.is_worktree && (
+                      <span className="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-600 dark:text-orange-400">
+                        ⎇ worktree
+                      </span>
+                    )}
                   </div>
                   <button
                     onClick={(e) => {

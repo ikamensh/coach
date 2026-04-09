@@ -405,6 +405,37 @@ pub(crate) fn should_request_title(event_count: usize) -> bool {
         || (event_count > TITLE_FIRST_EVENT && event_count.is_multiple_of(TITLE_INTERVAL_EVENTS))
 }
 
+pub(crate) async fn run_pre_tool_use(
+    state: &AppState,
+    pid: u32,
+    payload: HookPayload,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let tool = payload.tool_name.unwrap_or_default();
+
+    if tool == "Agent" {
+        let mut coach = state.coach.write().await;
+        let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
+        session.active_agents += 1;
+        coach.log(pid, "PreToolUse", "agent starting", None);
+        emit_update(&state.emitter, &coach);
+    }
+
+    Json(HookResponse::passthrough())
+}
+
+async fn handle_pre_tool_use(
+    AxumState(state): AxumState<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<HookPayload>,
+) -> Json<HookResponse> {
+    let sid = session_id(&payload);
+    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
+        return Json(HookResponse::passthrough());
+    };
+    run_pre_tool_use(&state, pid, payload).await
+}
+
 pub(crate) async fn run_post_tool_use(
     state: &AppState,
     pid: u32,
@@ -422,6 +453,9 @@ pub(crate) async fn run_post_tool_use(
         let event_count = {
             let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
             *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
+            if tool == "Agent" {
+                session.active_agents = session.active_agents.saturating_sub(1);
+            }
             session.event_count
         };
 
@@ -700,6 +734,7 @@ fn build_router(
     Router::new()
         .route("/hook/permission-request", post(handle_permission_request))
         .route("/hook/stop", post(handle_stop))
+        .route("/hook/pre-tool-use", post(handle_pre_tool_use))
         .route("/hook/post-tool-use", post(handle_post_tool_use))
         .route("/hook/user-prompt-submit", post(handle_user_prompt_submit))
         .route("/hook/session-start", post(handle_session_start))
