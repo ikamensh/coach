@@ -61,8 +61,6 @@ interface SessionSnapshot {
   coach_last_usage: CoachUsage | null;
   coach_total_usage: CoachUsage;
   activity: ActivityEntry[];
-  /** Number of live sub-agent processes parented to this session. */
-  subagent_count: number;
   client: SessionClient;
 }
 

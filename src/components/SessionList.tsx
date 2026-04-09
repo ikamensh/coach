@@ -78,18 +78,18 @@ export function SessionList() {
                 ) : (
                   <OwlIcon size={26} color={tint} />
                 )}
-                {session.subagent_count > 0 && session.subagent_count <= 6 && (
+                {(session.tool_counts.Agent ?? 0) > 0 && (session.tool_counts.Agent ?? 0) <= 6 && (
                   <div className="flex flex-wrap justify-center gap-0 mt-0.5" style={{ maxWidth: 26 }}>
-                    {Array.from({ length: session.subagent_count }).map((_, i) => (
+                    {Array.from({ length: session.tool_counts.Agent }).map((_, i) => (
                       <OwlIcon key={i} size={8} color={tint} />
                     ))}
                   </div>
                 )}
-                {session.subagent_count > 6 && (
+                {(session.tool_counts.Agent ?? 0) > 6 && (
                   <div className="flex items-center gap-0.5 mt-0.5">
                     <OwlIcon size={8} color={tint} />
                     <span className="text-zinc-400" style={{ fontSize: 8, lineHeight: 1 }}>
-                      x{session.subagent_count}
+                      x{session.tool_counts.Agent}
                     </span>
                   </div>
                 )}

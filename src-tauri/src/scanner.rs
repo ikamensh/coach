@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -119,24 +119,12 @@ pub async fn run_session_scanner(state: SharedState, app_handle: Option<tauri::A
 
 pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHandle>) {
     let live = scan_live_sessions();
-    sync_sessions_inner(state, app_handle, &live, crate::pid_resolver::parent_pid).await;
-}
-
-/// Testable core: accepts a parent_pid function so tests can inject fakes.
-pub async fn sync_sessions_inner(
-    state: &SharedState,
-    app_handle: Option<&tauri::AppHandle>,
-    live: &[ClaudeSessionFile],
-    parent_pid_fn: fn(u32) -> Option<u32>,
-) {
-    let (interactive, subagents): (Vec<_>, Vec<_>) =
-        live.iter().partition(|s| s.kind == "interactive");
-    let live_pids: HashSet<u32> = interactive.iter().map(|s| s.pid).collect();
+    let live_pids: HashSet<u32> = live.iter().map(|s| s.pid).collect();
 
     let mut coach = state.write().await;
     let mut changed = false;
 
-    for session in &interactive {
+    for session in &live {
         let created = coach.register_discovered_pid(
             session.pid,
             session.cwd.as_deref(),
@@ -146,12 +134,6 @@ pub async fn sync_sessions_inner(
             coach.log(session.pid, "Scanner", "process discovered", session.cwd.clone());
             changed = true;
         }
-    }
-
-    // Count live subagents per interactive parent.
-    let counts = count_subagents(&subagents, &live_pids, parent_pid_fn);
-    if coach.set_subagent_counts(&counts) {
-        changed = true;
     }
 
     let dead = coach.remove_dead_pids(&live_pids);
@@ -165,38 +147,6 @@ pub async fn sync_sessions_inner(
             let _ = handle.emit(EVENT_STATE_UPDATED, coach.snapshot());
         }
     }
-}
-
-/// For each non-interactive session, walk parent PIDs to find the
-/// interactive session that spawned it. Returns pid → subagent count.
-fn count_subagents(
-    subagents: &[&ClaudeSessionFile],
-    interactive_pids: &HashSet<u32>,
-    parent_pid_fn: fn(u32) -> Option<u32>,
-) -> HashMap<u32, usize> {
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    for sub in subagents {
-        if let Some(parent) = find_interactive_ancestor(sub.pid, interactive_pids, parent_pid_fn) {
-            *counts.entry(parent).or_default() += 1;
-        }
-    }
-    counts
-}
-
-fn find_interactive_ancestor(
-    pid: u32,
-    interactive_pids: &HashSet<u32>,
-    parent_pid_fn: fn(u32) -> Option<u32>,
-) -> Option<u32> {
-    let mut candidate = pid;
-    for _ in 0..10 {
-        match parent_pid_fn(candidate) {
-            Some(ppid) if interactive_pids.contains(&ppid) => return Some(ppid),
-            Some(ppid) => candidate = ppid,
-            None => break,
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -343,72 +293,4 @@ mod tests {
         assert_eq!(sessions[0].kind, "interactive");
     }
 
-    /// Subagents whose parent chain leads to an interactive PID get counted.
-    #[test]
-    fn count_subagents_attributes_to_parent() {
-        let interactive_pids: HashSet<u32> = [100].into();
-        let sub1 = ClaudeSessionFile { pid: 200, cwd: None, started_at: 0, kind: "task".into() };
-        let sub2 = ClaudeSessionFile { pid: 300, cwd: None, started_at: 0, kind: "task".into() };
-        let subs: Vec<&ClaudeSessionFile> = vec![&sub1, &sub2];
-
-        // Fake parent chain: 200→100, 300→250→100
-        fn fake_parent(pid: u32) -> Option<u32> {
-            match pid {
-                200 => Some(100),
-                300 => Some(250),
-                250 => Some(100),
-                _ => None,
-            }
-        }
-
-        let counts = super::count_subagents(&subs, &interactive_pids, fake_parent);
-        assert_eq!(counts.get(&100), Some(&2));
-    }
-
-    /// Subagents with no interactive ancestor are not counted.
-    #[test]
-    fn count_subagents_ignores_orphans() {
-        let interactive_pids: HashSet<u32> = [100].into();
-        let orphan = ClaudeSessionFile { pid: 999, cwd: None, started_at: 0, kind: "task".into() };
-        let subs = vec![&orphan];
-
-        fn no_parent(_: u32) -> Option<u32> { None }
-
-        let counts = super::count_subagents(&subs, &interactive_pids, no_parent);
-        assert!(counts.is_empty());
-    }
-
-    /// sync_sessions_inner registers only interactive sessions and
-    /// counts subagents on their parents.
-    #[tokio::test]
-    async fn sync_sessions_inner_counts_subagents() {
-        use crate::state::SharedState;
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
-
-        let state: SharedState = Arc::new(RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
-        ));
-
-        let my_pid = std::process::id();
-        let sessions = vec![
-            ClaudeSessionFile { pid: my_pid, cwd: Some("/tmp".into()), started_at: 1775383533697, kind: "interactive".into() },
-            ClaudeSessionFile { pid: my_pid + 1, cwd: Some("/tmp".into()), started_at: 1775383533697, kind: "task".into() },
-        ];
-
-        // Fake: subagent's parent is the interactive session
-        fn fake_parent(pid: u32) -> Option<u32> {
-            let my = std::process::id();
-            if pid == my + 1 { Some(my) } else { None }
-        }
-
-        super::sync_sessions_inner(&state, None, &sessions, fake_parent).await;
-
-        let coach = state.read().await;
-        // Only the interactive session is registered
-        assert_eq!(coach.sessions.len(), 1);
-        assert!(coach.sessions.contains_key(&my_pid));
-        // It knows about its subagent
-        assert_eq!(coach.sessions[&my_pid].subagent_count, 1);
-    }
 }
