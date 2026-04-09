@@ -92,6 +92,13 @@ impl std::ops::AddAssign for CoachUsage {
     }
 }
 
+/// Mock override for [`crate::llm::session_send`]. When set, all LLM calls
+/// that go through `session_send` return this function's result instead of
+/// calling a real provider. Receives `(system_prompt, user_message)`.
+pub type MockSessionSend = Arc<
+    dyn Fn(&str, &str) -> Result<(String, CoachUsage), String> + Send + Sync,
+>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -256,6 +263,17 @@ pub struct SessionState {
     /// which the cursor handlers call after the shared `run_*` path
     /// creates the session.
     pub client: SessionClient,
+    /// Per-session observer queue. Events are enqueued instantly from
+    /// PostToolUse; a single consumer processes them in order so the
+    /// chain builds up sequentially. `None` until the first observer
+    /// event. Dropped on `/clear` (consumer exits, new queue on next event).
+    pub observer_tx: Option<tokio::sync::mpsc::UnboundedSender<ObserverQueueItem>>,
+}
+
+/// Item enqueued for the per-session observer consumer.
+pub struct ObserverQueueItem {
+    pub priorities: Vec<String>,
+    pub event: String,
 }
 
 pub struct CoachState {
@@ -282,6 +300,9 @@ pub struct CoachState {
     pub hooks_user_enabled: bool,
     /// Same, for Cursor Agent hooks.
     pub cursor_hooks_user_enabled: bool,
+    /// When set, `llm::session_send` returns this function's result instead
+    /// of calling a real provider. Used by scenario replay tests.
+    pub mock_session_send: Option<MockSessionSend>,
     /// Optional Python sidecar (`pycoach serve`). `None` until/unless the
     /// user opts in via `COACH_PYCOACH_BIN` / `COACH_PYCOACH_CMD`. The Arc
     /// owns a child process with `kill_on_drop`, so dropping `CoachState`
@@ -378,6 +399,7 @@ impl CoachState {
             auto_uninstall_hooks_on_exit: settings.auto_uninstall_hooks_on_exit,
             hooks_user_enabled: settings.hooks_user_enabled,
             cursor_hooks_user_enabled: settings.cursor_hooks_user_enabled,
+            mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
         }
@@ -476,6 +498,9 @@ impl CoachState {
                 sess.coach_last_usage = None;
                 sess.coach_total_usage = CoachUsage::default();
                 sess.activity.clear();
+                // Drop old observer queue — consumer exits, fresh queue
+                // on the next observer event.
+                sess.observer_tx = None;
                 adopt_cwd_if_unset(sess, cwd);
             }
             None => {
@@ -508,6 +533,7 @@ impl CoachState {
                         coach_total_usage: CoachUsage::default(),
                         activity: VecDeque::new(),
                         client: SessionClient::default(),
+                        observer_tx: None,
                     },
                 );
             }
@@ -681,6 +707,7 @@ impl CoachState {
                 // The file scanner only walks `~/.claude/projects` so any
                 // session it discovers is necessarily Claude Code.
                 client: SessionClient::Claude,
+                observer_tx: None,
             },
         );
         true
@@ -757,6 +784,7 @@ pub(crate) fn test_state() -> CoachState {
         auto_uninstall_hooks_on_exit: true,
         hooks_user_enabled: false,
         cursor_hooks_user_enabled: false,
+        mock_session_send: None,
         #[cfg(feature = "pycoach")]
         pycoach: None,
     }

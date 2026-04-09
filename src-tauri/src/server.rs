@@ -399,15 +399,15 @@ pub(crate) async fn run_post_tool_use(
     let tool = payload.tool_name.unwrap_or_default();
     let tool_input = payload.tool_input.unwrap_or(serde_json::Value::Null);
 
-    let observer_input;
     let namer_input;
     let rule_message;
+    let mut consumer_rx = None;
     {
         let mut coach = state.coach.write().await;
-        let (prev_chain, event_count) = {
+        let event_count = {
             let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
             *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
-            (session.coach_chain.clone(), session.event_count)
+            session.event_count
         };
 
         rule_message = check_rules(&coach.rules, &tool, &tool_input);
@@ -423,38 +423,34 @@ pub(crate) async fn run_post_tool_use(
             coach.log(pid, "PostToolUse", "observed", Some(tool.clone()));
         }
 
-        // Decide if we should fire the observer. Requires LLM mode + a
-        // provider that supports stateful coach chains (OpenAI Responses
-        // or Anthropic with prompt caching, currently).
         let llm_active = coach.coach_mode == EngineMode::Llm
             && crate::settings::OBSERVER_CAPABLE_PROVIDERS
                 .contains(&coach.model.provider.as_str());
 
-        observer_input = if llm_active {
+        if llm_active {
             match crate::llm::build_observer_event(&tool, &tool_input) {
-                Ok(event) => Some(ObserverInput {
-                    pid,
-                    priorities: coach.priorities.clone(),
-                    prev_chain,
-                    event,
-                }),
+                Ok(event) => {
+                    let priorities = coach.priorities.clone();
+                    let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
+                    if session.observer_tx.is_none() {
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        session.observer_tx = Some(tx);
+                        consumer_rx = Some(rx);
+                    }
+                    let _ = session.observer_tx.as_ref().unwrap().send(
+                        crate::state::ObserverQueueItem { priorities, event },
+                    );
+                }
                 Err(e) => {
                     eprintln!("[coach] observer event prompt failed: {e}");
                     if let Some(s) = coach.sessions.get_mut(&pid) {
                         s.coach_errors += 1;
                         s.coach_last_error = Some(e);
                     }
-                    None
                 }
             }
-        } else {
-            None
-        };
+        }
 
-        // Periodic title generation. Same provider/mode gate as the
-        // observer (one switch to disable both), but the title call is
-        // stateless so the namer turn never enters the observer chain
-        // that the Stop hook reads.
         namer_input = if llm_active && should_request_title(event_count) {
             let session = coach.sessions.get(&pid).expect("apply_hook_event populated");
             Some(crate::llm::NameSessionInput {
@@ -470,13 +466,12 @@ pub(crate) async fn run_post_tool_use(
         emit_update(&state.emitter, &coach);
     } // lock released
 
-    // Fire-and-forget: the observer call may take seconds, but the agent
-    // shouldn't wait. PostToolUse always returns immediately.
-    if let Some(input) = observer_input {
+    // Spawn the sequential observer consumer if we just created the queue.
+    if let Some(rx) = consumer_rx {
         let coach_state = state.coach.clone();
         let emitter = state.emitter.clone();
         tokio::spawn(async move {
-            run_observer(coach_state, emitter, input).await;
+            observer_consumer(coach_state, emitter, pid, rx).await;
         });
     }
 
@@ -511,51 +506,59 @@ async fn handle_post_tool_use(
     run_post_tool_use(&state, pid, payload).await
 }
 
-struct ObserverInput {
-    pid: u32,
-    priorities: Vec<String>,
-    prev_chain: crate::state::CoachChain,
-    event: String,
-}
-
-async fn run_observer(
+/// Sequential observer consumer for one session. Reads chain from
+/// session state before each LLM call, so each observation builds on
+/// the previous one. Exits when the sender is dropped (session end or
+/// `/clear`).
+async fn observer_consumer(
     coach: SharedState,
     emitter: Option<tauri::AppHandle>,
-    input: ObserverInput,
+    pid: u32,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::state::ObserverQueueItem>,
 ) {
-    let started = std::time::Instant::now();
-    match crate::llm::observe_event(
-        &coach,
-        &input.priorities,
-        &input.prev_chain,
-        &input.event,
-    )
-    .await
-    {
-        Ok((text, new_chain, usage)) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            let mut s = coach.write().await;
-            if let Some(sess) = s.sessions.get_mut(&input.pid) {
-                sess.coach_chain = new_chain;
-                sess.coach_last_assessment = Some(text.clone());
-                sess.coach_calls += 1;
-                sess.coach_last_called_at = Some(chrono::Utc::now());
-                sess.coach_last_latency_ms = Some(latency_ms);
-                sess.coach_last_usage = Some(usage);
-                sess.coach_total_usage += usage;
+    while let Some(item) = rx.recv().await {
+        // Read the current chain — includes all previous observations.
+        let chain = {
+            let s = coach.read().await;
+            s.sessions.get(&pid)
+                .map(|sess| sess.coach_chain.clone())
+                .unwrap_or_default()
+        };
+
+        let started = std::time::Instant::now();
+        match crate::llm::observe_event(
+            &coach,
+            &item.priorities,
+            &chain,
+            &item.event,
+        )
+        .await
+        {
+            Ok((text, new_chain, usage)) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let mut s = coach.write().await;
+                if let Some(sess) = s.sessions.get_mut(&pid) {
+                    sess.coach_chain = new_chain;
+                    sess.coach_last_assessment = Some(text.clone());
+                    sess.coach_calls += 1;
+                    sess.coach_last_called_at = Some(chrono::Utc::now());
+                    sess.coach_last_latency_ms = Some(latency_ms);
+                    sess.coach_last_usage = Some(usage);
+                    sess.coach_total_usage += usage;
+                }
+                s.log(pid, "Observer", "noted", Some(text));
+                emit_update(&emitter, &s);
             }
-            s.log(input.pid, "Observer", "noted", Some(text));
-            emit_update(&emitter, &s);
-        }
-        Err(e) => {
-            eprintln!("[coach] observer call failed: {e}");
-            let mut s = coach.write().await;
-            if let Some(sess) = s.sessions.get_mut(&input.pid) {
-                sess.coach_errors += 1;
-                sess.coach_last_error = Some(e.clone());
+            Err(e) => {
+                eprintln!("[coach] observer call failed: {e}");
+                let mut s = coach.write().await;
+                if let Some(sess) = s.sessions.get_mut(&pid) {
+                    sess.coach_errors += 1;
+                    sess.coach_last_error = Some(e.clone());
+                }
+                s.log(pid, "Observer", "error", Some(e));
+                emit_update(&emitter, &s);
             }
-            s.log(input.pid, "Observer", "error", Some(e));
-            emit_update(&emitter, &s);
         }
     }
 }

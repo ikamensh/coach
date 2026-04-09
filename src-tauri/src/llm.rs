@@ -661,6 +661,24 @@ async fn read_provider(state: &SharedState) -> String {
 ///
 /// Emulated providers emit a once-per-process stderr warning on first
 /// use so the developer knows the cost model differs from native.
+
+/// Build an Anthropic-style chain from a mock response, so tests see
+/// conversation growth in the session state.
+fn grow_mock_chain(
+    chain: &crate::state::CoachChain,
+    user_msg: &str,
+    asst_msg: &str,
+) -> crate::state::CoachChain {
+    use crate::state::{CoachChain, CoachMessage, CoachRole};
+    let mut history = match chain {
+        CoachChain::Anthropic { history } => history.clone(),
+        _ => Vec::new(),
+    };
+    history.push(CoachMessage { role: CoachRole::User, content: user_msg.to_string() });
+    history.push(CoachMessage { role: CoachRole::Assistant, content: asst_msg.to_string() });
+    CoachChain::Anthropic { history }
+}
+
 pub async fn session_send(
     state: &SharedState,
     chain: &crate::state::CoachChain,
@@ -669,6 +687,22 @@ pub async fn session_send(
     constraints: CallConstraints,
 ) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
     use crate::state::CoachChain;
+
+    // Mock interception: lets tests exercise the full pipeline without a
+    // real LLM provider. The mock receives (system, message) and returns
+    // (text, usage); we synthesise an Anthropic-style chain so observers
+    // see conversation growth.
+    {
+        let s = state.read().await;
+        if let Some(ref mock) = s.mock_session_send {
+            let result = mock(system_prompt, message);
+            drop(s);
+            return result.map(|(text, usage)| {
+                let new_chain = grow_mock_chain(chain, message, &text);
+                (text, new_chain, usage)
+            });
+        }
+    }
 
     match read_provider(state).await.as_str() {
         "openai" => {
@@ -1278,6 +1312,7 @@ mod live_tests {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
+            mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
         };
@@ -1497,6 +1532,7 @@ mod live_tests {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
+            mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
         };
@@ -1675,6 +1711,7 @@ mod live_tests {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
+            mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
         };
