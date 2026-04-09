@@ -3,7 +3,8 @@ import { formatDuration } from "../utils/time";
 import { abbreviateCwd } from "../utils/path";
 import { OwlIcon } from "./OwlIcon";
 import { CursorIcon } from "./CursorIcon";
-import { ActivityBar } from "./ActivityBar";
+import { useState } from "react";
+import { ActivityBar, ActivityLegend } from "./ActivityBar";
 
 /** Top N tools by count, formatted like "Write: 14, Bash: 8". */
 export function topTools(toolCounts: Record<string, number>, n = 3): string {
@@ -19,6 +20,7 @@ export function SessionList() {
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
   const setAllMode = useCoachStore((s) => s.setAllMode);
   const openSession = useCoachStore((s) => s.openSession);
+  const [hovered, setHovered] = useState<string | null>(null);
 
   const allAway = sessions.length > 0 && sessions.every((s) => s.mode === "away");
   const allPresent = sessions.length > 0 && sessions.every((s) => s.mode === "present");
@@ -123,13 +125,14 @@ export function SessionList() {
                     <span> · {topTools(session.tool_counts)}</span>
                   )}
                 </div>
-                <ActivityBar entries={session.activity} />
+                <ActivityBar entries={session.activity} hovered={hovered} setHovered={setHovered} />
               </div>
             </li>
             );
           })}
         </ul>
       )}
+      {sessions.length > 0 && <ActivityLegend hovered={hovered} setHovered={setHovered} />}
     </div>
   );
 }
