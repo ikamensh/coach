@@ -1,6 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, Path, State as AxumState},
-    http::StatusCode,
+    extract::{ConnectInfo, State as AxumState},
     routing::{get, post},
     Json, Router,
 };
@@ -9,9 +8,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::settings::{CoachRule, EngineMode, ModelConfig};
+use crate::settings::EngineMode;
 use crate::state::{CoachMode, SharedState};
 
+mod api;
 mod cursor;
 
 #[derive(Deserialize)]
@@ -622,131 +622,6 @@ async fn handle_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-// ── /api/* endpoints used by the CLI when Coach is running ──────────────
-//
-// These mirror the Tauri commands in commands.rs so the CLI never has to
-// touch ~/.coach/settings.json directly while the GUI is up. Each handler
-// mutates the in-memory state, persists to disk, and emits the same
-// `coach-state-updated` event the Tauri commands emit so the GUI refreshes.
-
-#[derive(Deserialize)]
-struct ModePayload {
-    mode: CoachMode,
-}
-
-#[derive(Deserialize)]
-struct PrioritiesPayload {
-    priorities: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct ApiTokenPayload {
-    provider: String,
-    token: String,
-}
-
-#[derive(Deserialize)]
-struct CoachModePayload {
-    coach_mode: EngineMode,
-}
-
-#[derive(Deserialize)]
-struct RulesPayload {
-    rules: Vec<CoachRule>,
-}
-
-async fn api_set_session_mode(
-    AxumState(state): AxumState<AppState>,
-    Path(pid): Path<u32>,
-    Json(payload): Json<ModePayload>,
-) -> Result<Json<crate::state::CoachSnapshot>, (StatusCode, String)> {
-    let mut s = state.coach.write().await;
-    if !s.sessions.contains_key(&pid) {
-        return Err((StatusCode::NOT_FOUND, format!("no session for pid {pid}")));
-    }
-    if let Some(sess) = s.sessions.get_mut(&pid) {
-        sess.mode = payload.mode;
-    }
-    let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
-    Ok(Json(snap))
-}
-
-async fn api_set_all_modes(
-    AxumState(state): AxumState<AppState>,
-    Json(payload): Json<ModePayload>,
-) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.set_all_modes(payload.mode);
-    let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
-    Json(snap)
-}
-
-async fn api_set_priorities(
-    AxumState(state): AxumState<AppState>,
-    Json(payload): Json<PrioritiesPayload>,
-) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.priorities = payload.priorities;
-    s.save();
-    let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
-    Json(snap)
-}
-
-async fn api_set_model(
-    AxumState(state): AxumState<AppState>,
-    Json(payload): Json<ModelConfig>,
-) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.model = payload;
-    s.save();
-    let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
-    Json(snap)
-}
-
-async fn api_set_api_token(
-    AxumState(state): AxumState<AppState>,
-    Json(payload): Json<ApiTokenPayload>,
-) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    if payload.token.is_empty() {
-        s.api_tokens.remove(&payload.provider);
-    } else {
-        s.api_tokens.insert(payload.provider, payload.token);
-    }
-    s.save();
-    let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
-    Json(snap)
-}
-
-async fn api_set_coach_mode(
-    AxumState(state): AxumState<AppState>,
-    Json(payload): Json<CoachModePayload>,
-) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.coach_mode = payload.coach_mode;
-    s.save();
-    let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
-    Json(snap)
-}
-
-async fn api_set_rules(
-    AxumState(state): AxumState<AppState>,
-    Json(payload): Json<RulesPayload>,
-) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.rules = payload.rules;
-    s.save();
-    let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
-    Json(snap)
-}
-
 fn build_router(
     coach: SharedState,
     emitter: Option<tauri::AppHandle>,
@@ -778,13 +653,13 @@ fn build_router(
         .route("/version", get(handle_version))
         // CLI-facing API. Mirrors Tauri commands; same in-memory state.
         .route("/api/state", get(handle_get_state))
-        .route("/api/sessions/mode", post(api_set_all_modes))
-        .route("/api/sessions/{pid}/mode", post(api_set_session_mode))
-        .route("/api/config/priorities", post(api_set_priorities))
-        .route("/api/config/model", post(api_set_model))
-        .route("/api/config/api-token", post(api_set_api_token))
-        .route("/api/config/coach-mode", post(api_set_coach_mode))
-        .route("/api/config/rules", post(api_set_rules))
+        .route("/api/sessions/mode", post(api::set_all_modes))
+        .route("/api/sessions/{pid}/mode", post(api::set_session_mode))
+        .route("/api/config/priorities", post(api::set_priorities))
+        .route("/api/config/model", post(api::set_model))
+        .route("/api/config/api-token", post(api::set_api_token))
+        .route("/api/config/coach-mode", post(api::set_coach_mode))
+        .route("/api/config/rules", post(api::set_rules))
         .with_state(state)
 }
 
