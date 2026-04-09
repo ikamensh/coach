@@ -110,10 +110,13 @@ fn cli_hooks_install_matches_install_hooks_at() {
         serde_json::from_str(&std::fs::read_to_string(&cli_path).unwrap()).unwrap();
 
     // Build the expected settings.json by calling the helper directly
-    // against a separate temp file.
+    // against a separate temp file. The shim path must match what the
+    // CLI used (HOME/.coach/claude-hook.sh) so the command strings in
+    // settings.json are identical.
     let other = tempfile::tempdir().unwrap();
     let helper_path = other.path().join("settings.json");
-    coach_lib::settings::install_hooks_at(7700, &helper_path).unwrap();
+    let helper_shim = home.join(".coach").join("claude-hook.sh");
+    coach_lib::settings::install_hooks_at(7700, &helper_path, &helper_shim).unwrap();
     let helper_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&helper_path).unwrap()).unwrap();
 
