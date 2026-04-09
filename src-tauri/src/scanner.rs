@@ -1,21 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::state::{SharedState, EVENT_STATE_UPDATED};
 
 /// Minimal view of `~/.claude/sessions/<pid>.json`.
-///
-/// We **only** trust `pid` and `cwd` from this file. The `session_id`
-/// stored inside is whatever conversation Claude Code launched with —
-/// always stale once the user has run `/clear`. The current conversation
-/// id arrives via hooks; see docs/SESSION_TRACKING.md.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeSessionFile {
     pub pid: u32,
+    pub session_id: String,
     pub cwd: Option<String>,
     pub started_at: i64, // Unix millis
     #[serde(default = "default_kind")]
@@ -131,6 +127,30 @@ pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHa
             session.started_at_utc(),
         );
         if created {
+            // Bootstrap state from the JSONL conversation log so we
+            // show accurate tool counts and active agents from the start.
+            if let Some(jsonl_path) = jsonl_path_for(session) {
+                match bootstrap_from_jsonl(&jsonl_path) {
+                    Ok(boot) => {
+                        if let Some(sess) = coach.sessions.get_mut(&session.pid) {
+                            sess.current_session_id = session.session_id.clone();
+                            sess.tool_counts = boot.tool_counts;
+                            sess.active_agents = boot.active_agents;
+                            sess.event_count = boot.total_tools;
+                        }
+                        coach.log(
+                            session.pid,
+                            "Scanner",
+                            "bootstrapped from JSONL",
+                            Some(format!("{} tools, {} active agents",
+                                boot.total_tools, boot.active_agents)),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[coach] JSONL bootstrap failed for pid {}: {e}", session.pid);
+                    }
+                }
+            }
             coach.log(session.pid, "Scanner", "process discovered", session.cwd.clone());
             changed = true;
         }
@@ -147,6 +167,92 @@ pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHa
             let _ = handle.emit(EVENT_STATE_UPDATED, coach.snapshot());
         }
     }
+}
+
+// ── JSONL bootstrapping ─────────────────────────────────────────────────
+
+/// Derive the JSONL path: `~/.claude/projects/{mangled-cwd}/{sessionId}.jsonl`
+fn jsonl_path_for(session: &ClaudeSessionFile) -> Option<PathBuf> {
+    let cwd = session.cwd.as_deref()?;
+    let home = dirs::home_dir()?;
+    let mangled = cwd.replace('/', "-");
+    Some(home.join(".claude").join("projects").join(mangled).join(format!("{}.jsonl", session.session_id)))
+}
+
+/// State bootstrapped from a JSONL conversation log.
+#[derive(Debug, Clone)]
+pub struct BootstrapState {
+    pub tool_counts: HashMap<String, usize>,
+    pub active_agents: usize,
+    pub total_tools: usize,
+}
+
+/// Parse a Claude Code JSONL to extract tool counts and active agent count.
+///
+/// Agent tool_use blocks that don't yet have a matching tool_result are
+/// counted as active agents.
+pub fn bootstrap_from_jsonl(path: &Path) -> Result<BootstrapState, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+
+    let mut tool_counts: HashMap<String, usize> = HashMap::new();
+    let mut agent_tool_ids: HashSet<String> = HashSet::new();
+    let mut agent_results: HashSet<String> = HashSet::new();
+
+    for line in content.lines() {
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        match entry.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                let blocks = entry
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array());
+                if let Some(blocks) = blocks {
+                    for block in blocks {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                *tool_counts.entry(name.to_string()).or_default() += 1;
+                                if name == "Agent" {
+                                    if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                                        agent_tool_ids.insert(id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some("user") => {
+                let blocks = entry
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array());
+                if let Some(blocks) = blocks {
+                    for block in blocks {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                            if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+                                if agent_tool_ids.contains(id) {
+                                    agent_results.insert(id.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let total_tools: usize = tool_counts.values().sum();
+    let active_agents = agent_tool_ids.len().saturating_sub(agent_results.len());
+
+    Ok(BootstrapState {
+        tool_counts,
+        active_agents,
+        total_tools,
+    })
 }
 
 #[cfg(test)]
@@ -202,6 +308,7 @@ mod tests {
     fn started_at_utc_roundtrips() {
         let session = ClaudeSessionFile {
             pid: 1,
+            session_id: "test".to_string(),
             cwd: None,
             started_at: 1775383533697,
             kind: "interactive".to_string(),
@@ -293,4 +400,62 @@ mod tests {
         assert_eq!(sessions[0].kind, "interactive");
     }
 
+    /// bootstrap_from_jsonl extracts tool counts and active agent count.
+    #[test]
+    fn bootstrap_counts_tools_and_active_agents() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        // Two Bash tool_uses, one Agent tool_use, no Agent result → 1 active agent
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}},{"type":"tool_use","id":"t3","name":"Agent","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+            // t3 (Agent) has no tool_result → still active
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let boot = bootstrap_from_jsonl(&path).unwrap();
+        assert_eq!(boot.tool_counts.get("Bash"), Some(&2));
+        assert_eq!(boot.tool_counts.get("Agent"), Some(&1));
+        assert_eq!(boot.active_agents, 1);
+        assert_eq!(boot.total_tools, 3);
+    }
+
+    /// When an Agent's tool_result appears, it's no longer active.
+    #[test]
+    fn bootstrap_agent_completes_when_result_arrives() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a1","name":"Agent","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a1","content":"done"}]}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let boot = bootstrap_from_jsonl(&path).unwrap();
+        assert_eq!(boot.active_agents, 0);
+        assert_eq!(boot.tool_counts.get("Agent"), Some(&1));
+    }
+
+    /// Bootstrap against a real JSONL from the current session, if available.
+    #[test]
+    fn bootstrap_reads_real_session() {
+        // Find any live session JSONL to verify we can parse it without errors.
+        let sessions_dir = match dirs::home_dir() {
+            Some(h) => h.join(".claude").join("sessions"),
+            None => return,
+        };
+        let sessions = scan_live_sessions_in(&sessions_dir);
+        for session in sessions.iter().take(1) {
+            if let Some(path) = jsonl_path_for(session) {
+                if path.exists() {
+                    let boot = bootstrap_from_jsonl(&path);
+                    assert!(boot.is_ok(), "failed to parse {}: {:?}", path.display(), boot.err());
+                }
+            }
+        }
+    }
 }
