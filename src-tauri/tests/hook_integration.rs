@@ -892,15 +892,15 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
                 );
                 // Counters: error path must tick coach_errors and leave
                 // coach_calls / usage at zero (no successful round-trip).
-                assert_eq!(sess.coach_errors, 1, "error counter should tick");
-                assert_eq!(sess.coach_calls, 0, "no successful call yet");
-                assert!(sess.coach_last_called_at.is_none());
-                assert_eq!(sess.coach_total_usage.input_tokens, 0);
+                assert_eq!(sess.telemetry.errors, 1, "error counter should tick");
+                assert_eq!(sess.telemetry.calls, 0, "no successful call yet");
+                assert!(sess.telemetry.last_called_at.is_none());
+                assert_eq!(sess.telemetry.total_usage.input_tokens, 0);
                 // The error message must be captured so the panel can show
                 // it. Should match the activity log detail exactly.
-                assert!(sess.coach_last_error.is_some());
+                assert!(sess.telemetry.last_error.is_some());
                 assert_eq!(
-                    sess.coach_last_error.as_deref(),
+                    sess.telemetry.last_error.as_deref(),
                     observer_entry.detail.as_deref(),
                 );
                 return;
