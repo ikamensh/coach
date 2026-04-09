@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::state::{SharedState, EVENT_STATE_UPDATED};
+use crate::state::SharedState;
+use crate::EventEmitter;
 
 /// Minimal view of `~/.claude/sessions/<pid>.json`.
 ///
@@ -104,20 +105,20 @@ pub fn scan_live_sessions_in(dir: &Path) -> Vec<ClaudeSessionFile> {
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Periodically refresh the session list from `~/.claude/sessions/*.json`.
-/// Pass `Some(app_handle)` from the Tauri GUI path so changes emit
-/// `EVENT_STATE_UPDATED` to the frontend; pass `None` for headless mode.
-pub async fn run_session_scanner(state: SharedState, app_handle: Option<tauri::AppHandle>) {
-    sync_sessions(&state, app_handle.as_ref()).await;
+/// Emits `EVENT_STATE_UPDATED` via the provided `EventEmitter` when changes
+/// are detected.
+pub async fn run_session_scanner(state: SharedState, emitter: std::sync::Arc<dyn EventEmitter>) {
+    sync_sessions(&state, &*emitter).await;
 
     let mut interval = tokio::time::interval(SCAN_INTERVAL);
     interval.tick().await; // first tick is immediate, skip it
     loop {
         interval.tick().await;
-        sync_sessions(&state, app_handle.as_ref()).await;
+        sync_sessions(&state, &*emitter).await;
     }
 }
 
-pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHandle>) {
+pub async fn sync_sessions(state: &SharedState, emitter: &dyn EventEmitter) {
     let live = scan_live_sessions();
     let live_pids: HashSet<u32> = live.iter().map(|s| s.pid).collect();
 
@@ -142,10 +143,7 @@ pub async fn sync_sessions(state: &SharedState, app_handle: Option<&tauri::AppHa
     }
 
     if changed {
-        if let Some(handle) = app_handle {
-            use tauri::Emitter;
-            let _ = handle.emit(EVENT_STATE_UPDATED, coach.snapshot());
-        }
+        emitter.emit_state_update(&coach.snapshot());
     }
 }
 

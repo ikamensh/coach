@@ -55,7 +55,7 @@ pub(crate) async fn set_session_mode(
         sess.mode = payload.mode;
     }
     let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
+    emit_update(&*state.emitter, &s);
     Ok(Json(snap))
 }
 
@@ -66,7 +66,7 @@ pub(crate) async fn set_all_modes(
     let mut s = state.coach.write().await;
     s.set_all_modes(payload.mode);
     let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
+    emit_update(&*state.emitter, &s);
     Json(snap)
 }
 
@@ -78,7 +78,7 @@ pub(crate) async fn set_priorities(
     s.priorities = payload.priorities;
     s.save();
     let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
+    emit_update(&*state.emitter, &s);
     Json(snap)
 }
 
@@ -90,7 +90,7 @@ pub(crate) async fn set_model(
     s.model = payload;
     s.save();
     let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
+    emit_update(&*state.emitter, &s);
     Json(snap)
 }
 
@@ -106,7 +106,7 @@ pub(crate) async fn set_api_token(
     }
     s.save();
     let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
+    emit_update(&*state.emitter, &s);
     Json(snap)
 }
 
@@ -118,7 +118,7 @@ pub(crate) async fn set_coach_mode(
     s.coach_mode = payload.coach_mode;
     s.save();
     let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
+    emit_update(&*state.emitter, &s);
     Json(snap)
 }
 
@@ -130,6 +130,6 @@ pub(crate) async fn set_rules(
     s.rules = payload.rules;
     s.save();
     let snap = s.snapshot();
-    emit_update(&state.emitter, &s);
+    emit_update(&*state.emitter, &s);
     Json(snap)
 }

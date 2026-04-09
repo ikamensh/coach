@@ -1,4 +1,4 @@
-use crate::state::{CoachMode, SharedState, EVENT_STATE_UPDATED};
+use coach_core::state::{CoachMode, SharedState, EVENT_STATE_UPDATED};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},

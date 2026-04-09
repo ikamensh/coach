@@ -8,15 +8,15 @@
 /// peer port. Tests run client and server in the same process, so we inject
 /// a fake resolver (`fake_resolver_from_sid`) that hashes the session_id to
 /// a deterministic non-zero u32. Tests can compute the same fake PID via
-/// `coach_lib::server::fake_pid_for_sid` to look up state.
+/// `coach_core::server::fake_pid_for_sid` to look up state.
 ///
 /// The `test_with_real_claude_code` test (ignored by default) launches the
 /// actual `claude` CLI against a temporary project and checks that its
 /// session appears in Coach state. Run it with:
 ///     cargo test -p coach -- --ignored
-use coach_lib::server::fake_pid_for_sid;
-use coach_lib::settings::Settings;
-use coach_lib::state::CoachState;
+use coach_core::server::fake_pid_for_sid;
+use coach_core::settings::Settings;
+use coach_core::state::CoachState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -24,9 +24,9 @@ use tokio::sync::RwLock;
 /// Start the hook server on an OS-assigned port and return its base URL.
 async fn start_test_server() -> (String, Arc<RwLock<CoachState>>) {
     let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
-    let router = coach_lib::server::create_router_headless(
+    let router = coach_core::server::create_router_headless(
         state.clone(),
-        coach_lib::server::fake_resolver_from_sid(),
+        coach_core::server::fake_resolver_from_sid(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -299,10 +299,10 @@ async fn permission_request_auto_approves_in_away_mode() {
 
     {
         let mut s = state.write().await;
-        s.default_mode = coach_lib::state::CoachMode::Away;
+        s.default_mode = coach_core::state::CoachMode::Away;
         let pid = fake_pid_for_sid("away-sess");
         if let Some(sess) = s.sessions.get_mut(&pid) {
-            sess.mode = coach_lib::state::CoachMode::Away;
+            sess.mode = coach_core::state::CoachMode::Away;
         }
     }
 
@@ -346,7 +346,7 @@ async fn stop_blocks_then_allows_on_cooldown() {
         let mut s = state.write().await;
         let pid = fake_pid_for_sid("stop-sess");
         if let Some(sess) = s.sessions.get_mut(&pid) {
-            sess.mode = coach_lib::state::CoachMode::Away;
+            sess.mode = coach_core::state::CoachMode::Away;
         }
     }
 
@@ -470,10 +470,10 @@ async fn clear_replaces_session_in_same_window() {
 async fn scanner_discovers_real_sessions() {
     let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
 
-    coach_lib::scanner::sync_sessions(&state, None).await;
+    coach_core::scanner::sync_sessions(&state, &coach_core::NoopEmitter).await;
 
     let coach = state.read().await;
-    let live_files = coach_lib::scanner::scan_live_sessions();
+    let live_files = coach_core::scanner::scan_live_sessions();
 
     for file in &live_files {
         let sess = coach
@@ -703,10 +703,10 @@ async fn all_hook_responses_conform_to_claude_code_schema() {
 
     {
         let mut s = state.write().await;
-        s.default_mode = coach_lib::state::CoachMode::Away;
+        s.default_mode = coach_core::state::CoachMode::Away;
         let pid = fake_pid_for_sid("schema-present");
         if let Some(sess) = s.sessions.get_mut(&pid) {
-            sess.mode = coach_lib::state::CoachMode::Away;
+            sess.mode = coach_core::state::CoachMode::Away;
         }
     }
 
@@ -799,8 +799,8 @@ async fn post_tool_use_rule_response_schema() {
 
 async fn put_in_llm_mode_no_key(state: &Arc<RwLock<CoachState>>) {
     let mut s = state.write().await;
-    s.coach_mode = coach_lib::settings::EngineMode::Llm;
-    s.model = coach_lib::settings::ModelConfig {
+    s.coach_mode = coach_core::settings::EngineMode::Llm;
+    s.model = coach_core::settings::ModelConfig {
         provider: "openai".into(),
         model: "gpt-5.4-mini".into(),
     };
@@ -829,7 +829,7 @@ async fn stop_in_llm_mode_falls_back_to_fixed_when_no_key() {
         let mut s = state.write().await;
         let pid = fake_pid_for_sid("llm-fallback");
         if let Some(sess) = s.sessions.get_mut(&pid) {
-            sess.mode = coach_lib::state::CoachMode::Away;
+            sess.mode = coach_core::state::CoachMode::Away;
         }
     }
 
@@ -954,8 +954,8 @@ async fn observer_does_not_fire_for_non_capable_provider() {
     // so we pick openrouter to keep this gate test meaningful.
     {
         let mut s = state.write().await;
-        s.coach_mode = coach_lib::settings::EngineMode::Llm;
-        s.model = coach_lib::settings::ModelConfig {
+        s.coach_mode = coach_core::settings::EngineMode::Llm;
+        s.model = coach_core::settings::ModelConfig {
             provider: "openrouter".into(),
             model: "openrouter/auto".into(),
         };
@@ -1104,7 +1104,7 @@ async fn test_with_real_cursor_agent() {
     let tmp = tempfile::tempdir().unwrap();
     let hooks_path = tmp.path().join(".cursor").join("hooks.json");
     let shim_path = tmp.path().join(".cursor").join("coach-cursor-hook.sh");
-    coach_lib::settings::install_cursor_hooks_at(port, &hooks_path, &shim_path)
+    coach_core::settings::install_cursor_hooks_at(port, &hooks_path, &shim_path)
         .expect("install cursor hooks");
 
     // git-init so cursor-agent treats the tempdir as a real workspace.
@@ -1356,10 +1356,10 @@ async fn api_set_all_sessions_mode_flips_every_session() {
 
     let s = state.read().await;
     assert!(
-        s.sessions.values().all(|sess| sess.mode == coach_lib::state::CoachMode::Away),
+        s.sessions.values().all(|sess| sess.mode == coach_core::state::CoachMode::Away),
         "every session must be in away mode after the bulk POST"
     );
-    assert_eq!(s.default_mode, coach_lib::state::CoachMode::Away);
+    assert_eq!(s.default_mode, coach_core::state::CoachMode::Away);
 }
 
 #[tokio::test]
@@ -1394,11 +1394,11 @@ async fn api_set_session_mode_targets_one_pid() {
     let s = state.read().await;
     assert_eq!(
         s.sessions.get(&alpha_pid).unwrap().mode,
-        coach_lib::state::CoachMode::Away
+        coach_core::state::CoachMode::Away
     );
     assert_eq!(
         s.sessions.get(&beta_pid).unwrap().mode,
-        coach_lib::state::CoachMode::Present,
+        coach_core::state::CoachMode::Present,
         "beta must NOT be touched by a per-pid POST to alpha"
     );
 }
@@ -1474,7 +1474,7 @@ async fn api_set_coach_mode_round_trip() {
         .unwrap();
     {
         let s = state.read().await;
-        assert_eq!(s.coach_mode, coach_lib::settings::EngineMode::Llm);
+        assert_eq!(s.coach_mode, coach_core::settings::EngineMode::Llm);
     }
 
     client
@@ -1484,7 +1484,7 @@ async fn api_set_coach_mode_round_trip() {
         .await
         .unwrap();
     let s = state.read().await;
-    assert_eq!(s.coach_mode, coach_lib::settings::EngineMode::Rules);
+    assert_eq!(s.coach_mode, coach_core::settings::EngineMode::Rules);
 }
 
 #[tokio::test]
@@ -1570,12 +1570,12 @@ async fn command_hook_updates_scanner_session_not_ghost() {
         .register_discovered_pid(claude_pid, Some("/projects"), chrono::Utc::now());
 
     // Resolver returns curl's PID; parent walk maps curl → Claude Code.
-    let resolver: coach_lib::server::PidResolver =
+    let resolver: coach_core::server::PidResolver =
         Arc::new(move |_peer_port, _sid| Some(curl_pid));
-    let parent_fn: coach_lib::server::ParentPidFn = Arc::new(move |pid| {
+    let parent_fn: coach_core::server::ParentPidFn = Arc::new(move |pid| {
         if pid == curl_pid { Some(claude_pid) } else { None }
     });
-    let router = coach_lib::server::create_router_headless_with_parent(
+    let router = coach_core::server::create_router_headless_with_parent(
         state.clone(),
         resolver,
         parent_fn,

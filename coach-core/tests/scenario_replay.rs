@@ -11,9 +11,9 @@
 /// Real coach scenarios:
 ///     cargo test -p coach --test scenario_replay -- --ignored --nocapture
 
-use coach_lib::server::fake_pid_for_sid;
-use coach_lib::settings::{EngineMode, ModelConfig, Settings};
-use coach_lib::state::{CoachMode, CoachState, CoachUsage, MockSessionSend};
+use coach_core::server::fake_pid_for_sid;
+use coach_core::settings::{EngineMode, ModelConfig, Settings};
+use coach_core::state::{CoachMode, CoachState, CoachUsage, MockSessionSend};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,9 +59,9 @@ impl Harness {
     }
 
     async fn boot(state: Arc<RwLock<CoachState>>) -> Self {
-        let router = coach_lib::server::create_router_headless(
+        let router = coach_core::server::create_router_headless(
             state.clone(),
-            coach_lib::server::fake_resolver_from_sid(),
+            coach_core::server::fake_resolver_from_sid(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -127,7 +127,7 @@ impl Harness {
         if let Some(ref t) = sess.telemetry.session_title { eprintln!("  title: {t}"); }
         eprintln!("  events: {}  coach_calls: {}  errors: {}", sess.event_count, sess.telemetry.calls, sess.telemetry.errors);
         eprintln!("  chain: {} ({} msgs)", sess.telemetry.chain.kind(), match &sess.telemetry.chain {
-            coach_lib::state::CoachChain::History { messages } => messages.len(),
+            coach_core::state::CoachChain::History { messages } => messages.len(),
             _ => 0,
         });
         if let Some(ref err) = sess.telemetry.last_error { eprintln!("  error: {err}"); }
