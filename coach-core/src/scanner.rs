@@ -155,7 +155,17 @@ pub async fn sync_sessions_with(
         let needs_bootstrap = coach.sessions.get(&session.pid)
             .is_some_and(|s| !s.bootstrapped);
         if needs_bootstrap {
-            if let Some(jsonl_path) = jsonl_path_for(session, projects_dir) {
+            // Prefer the hook's session_id (current conversation) over
+            // the session file's (may be stale after /clear).
+            let effective_sid = coach.sessions.get(&session.pid)
+                .filter(|s| !s.current_session_id.is_empty())
+                .map(|s| s.current_session_id.clone())
+                .unwrap_or_else(|| session.session_id.clone());
+            let effective_session = ClaudeSessionFile {
+                session_id: effective_sid,
+                ..session.clone()
+            };
+            if let Some(jsonl_path) = jsonl_path_for(&effective_session, projects_dir) {
                 match bootstrap_from_jsonl(&jsonl_path) {
                     Ok(boot) => {
                         if let Some(sess) = coach.sessions.get_mut(&session.pid) {
@@ -611,10 +621,17 @@ mod tests {
 
         // Session file has the STALE id.
         write_session_file_full(sessions_dir.path(), my_pid, file_sid, cwd);
-        // JSONL exists for the stale id (has some history).
+        // JSONL for the stale id (old conversation — should be ignored).
         write_jsonl(projects_dir.path(), cwd, file_sid, &[
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"old1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"old1","content":"ok"}]}}"#,
+        ]);
+        // JSONL for the current conversation (should be used).
+        write_jsonl(projects_dir.path(), cwd, hook_sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Edit","input":{}},{"type":"tool_use","id":"t3","name":"Edit","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"},{"type":"tool_result","tool_use_id":"t3","content":"ok"}]}}"#,
         ]);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -637,13 +654,19 @@ mod tests {
         assert_eq!(sess.current_session_id, hook_sid,
             "bootstrap must not overwrite the hook's session_id");
         assert!(sess.bootstrapped);
+        // Should have loaded the CURRENT conversation's tools (Read+Edit+Edit),
+        // not the stale one (Bash).
+        assert_eq!(sess.tool_counts.get("Read"), Some(&1));
+        assert_eq!(sess.tool_counts.get("Edit"), Some(&2));
+        assert_eq!(sess.tool_counts.get("Bash"), None,
+            "stale conversation's tools should not appear");
+        assert_eq!(sess.event_count, 3);
 
-        // Now simulate the next hook — same hook_sid, should NOT reset.
+        // Next hook with same session_id should increment, not reset.
         drop(coach);
         {
             let mut coach = state.write().await;
             let sess = coach.apply_hook_event(my_pid, hook_sid, Some(cwd));
-            // If the bug were present, this would be 1 (reset). Should be 2+.
             assert!(sess.event_count > 1,
                 "next hook should increment, not reset; got event_count={}",
                 sess.event_count);
