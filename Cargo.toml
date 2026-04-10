@@ -3,4 +3,8 @@ members = ["src-tauri", "coach-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.62"
+version = "0.1.65"
+
+[profile.release]
+incremental = true
+opt-level = 1
