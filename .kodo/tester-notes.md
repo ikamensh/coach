@@ -117,9 +117,26 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 
 ## Linux ARM64 — Debian 12 VPS
 
+### PID resolution + session identity (focused, 2026-04-10)
+
+Host `root@46.225.111.102`, binary `/root/coach/target/release/coach` 0.1.78. Isolated `mktemp` `HOME`, seeded `~/.coach/settings.json` `port`, `env -i HOME=… USER=test PATH=/usr/bin:/bin`.
+
+Claude `/hook/*` uses TCP peer PID: slow POST to `/hook/user-prompt-submit` (`--limit-rate` + ~200k JSON) and `ss -tnp` while upload is in flight shows `ESTAB 127.0.0.1:<ephemeral> → 127.0.0.1:<listen>` with `users:(("curl",pid=P,…))`. Daemon stderr matches: `[coach] resolved sid … → pid P (peer port <ephemeral>)` — same P and ephemeral port as `ss`. A second `curl` to `/hook/session-start` yields a new curl P′ and a second log line; `GET /api/state` then lists two sessions with distinct pids.
+
+User-visible model: in-memory sessions and `/api/state` are keyed by OS `pid` (one row per process); each row has `session_id` (conversation id) in JSON. `coach status` prints `pid=` per line. Two parallel curl clients ⇒ two pids ⇒ two rows; a single long-lived client keeps one pid while `session_id` can change on `/clear` (`apply_hook_event` in `state/mod.rs`).
+
 ### Release binary quick E2E (2026-04-10, re-run)
 
 **Host:** `root@46.225.111.102`. **`env -i` + `mktemp` `HOME`**, seeded `~/.coach/settings.json` `port` → **`coach status`** exit **1** when down, **`coach serve --port`** + **`coach status`** + **`curl /api/state`** OK, second **`serve`** → **EADDRINUSE `os error 98`**. **`pid_resolver::tests::resolves_real_connection_to_child_pid`** — `cargo test -p coach-core … -- --exact` **pass** (uses **`/proc/net/tcp`** / netstat-style path on Linux).
+
+### Concurrent HTTP hook stress (`coach serve`, Debian 12 ARM64, 2026-04-10)
+
+- **Binary:** `/root/coach/target/release/coach` **0.1.78**. Isolated **`mktemp` `HOME`**, **`echo '{"port":PORT}' > ~/.coach/settings.json`**, **`env -i HOME=… USER=test PATH=/usr/bin:/bin`** for **`serve`** and **`coach status`**.
+- **Wave A — Codex:** **`seq 1 300 | xargs -P40 -I{} sh -c '…'`** POST **`http://127.0.0.1:$PORT/codex/hook/user-prompt-submit`** with **`session_id` = `sess-$(expr {} % 5 + 1)`** → **300× HTTP 200**.
+- **State consistency:** **15×** rapid **`curl -s http://127.0.0.1:$PORT/api/state`** → **same** `len(sessions)` on every poll (no flapping).
+- **Wave B — Cursor:** **150×** POST **`/cursor/hook/before-submit-prompt`**, **`session_id` = `cur-$(expr {} % 4 + 1)`** → **150× 200**. **`coach status`** session count matched **`GET /api/state`**.
+- **Synthetic PID collisions (deterministic, not concurrency bugs):** `fake_pid_for_sid` (`coach-core/src/server.rs`) hashes `session_id` to **`u32`**. Short labels **`sess-2`/`sess-3`** and **`sess-4`/`sess-5`** (and **`cur-2`/`cur-3`**) **collide** — you see **3 Codex + 3 Cursor** rows for **5+4** distinct strings. Use longer unique `session_id`s in stress scripts if you need one row per string.
+- **Shutdown under load:** background **`seq 1 400 | xargs -P50`** POST **`/codex/hook/stop`**, **`sleep 0.12`**, **`kill -TERM $daemon_pid`**, **`wait`** the xargs job → **`curl -w '%{http_code}'`** histogram about **`200`: ~71**, rest **`000`** (reset/refused after listen socket closed). Daemon exits; **`ss -ltn`** shows port free. Redirect curl stderr if you only need numeric codes.
 
 ### Stage 2 verification (2026-04-10, re-run)
 

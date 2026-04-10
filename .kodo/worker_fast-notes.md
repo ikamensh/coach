@@ -16,6 +16,7 @@
 - **Discovery (Stage 1):** `.kodo/test-report.md` (setup + CLI smoke), `.kodo/test-coverage.md` (coverage matrix; Codex HTTP routes pending in tests).
 - **Kodo improve (Stage 3):** auto-fixes land as `chore: auto-fix issues found by kodo improve`; triage report is `improve-report.md` under `~/.kodo/runs/<run_id>/` (ensure Rust/npm counts in the report match actual `cargo test` / `npm test` output).
 - **Linux Stage 3 (2026-04-10):** Debian 12 ARM64 release binary **`coach 0.1.78`** — isolated-`HOME` E2E for `path`, `config`, `serve`/`status` (incl. EADDRINUSE), Claude/Cursor/Codex hooks. Matrix + repro: **`.kodo/test-coverage.md`** / **`.kodo/tester-notes.md`**. **Edge:** if `hooks install` writes the shim then the final config merge/write fails (e.g. immutable `~/.claude/settings.json`), an orphan **`~/.coach/claude-hook.sh`** can remain.
+- **Linux Stage 4 (2026-04-10):** Same VPS — **`coach serve`** HTTP E2E (Claude/Cursor/Codex hooks, `/api/state`, clean Ctrl-C/SIGTERM). Live TCP peer PID matches **`ss -tnp`** and daemon logs (netlink/proc resolver on aarch64). Stress: hundreds of concurrent hook POSTs, stable `/api/state` polls, shutdown under load. **Sessions are keyed by resolved OS PID** (one row per process; `session_id` lives on that row) — counts follow process identity, not distinct short `session_id` strings; short synthetic labels can collide via `fake_pid_for_sid` hashing (see **`.kodo/tester-notes.md`**).
 
 ## Frontend / integration
 
