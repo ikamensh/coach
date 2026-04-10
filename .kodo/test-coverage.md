@@ -6,6 +6,8 @@ Tracked across `kodo test` runs.
 
 **Authoritative cross-platform run** (2026-04-10): `cargo test --workspace` — **219 passed, 0 failed, 21 ignored** on **both macOS (local) and Debian 12 ARM64 VPS** (`root@46.225.111.102`). Breakdown: coach-core 171+15ign, cli_integration 18, hook_integration 29+2ign, scenario_replay 1+4ign.
 
+**Linux Stage 1 (CLI / system integration, 2026-04-10):** On the same VPS, **`cargo build --release -p coach`** → **`/root/coach/target/release/coach`** (**0.1.78**, ELF aarch64). Isolated **`HOME=$(mktemp -d)`** + **`PATH="$HOME/.local/bin:…"`** — shallow pass: **`path`**, file-backed **`config`**, **Claude/Cursor hooks**; **deep pass (Stage 1b):** **`serve`**, **`status`** / **`status --json`**, **`mode`**, **`config set`** with daemon **up** (HTTP) vs **down** (file), **`hooks codex install|uninstall`**. Details: **Stage 1 — Linux ARM64 CLI** below.
+
 **`observer_does_not_fire_in_rules_mode` resolution**: **Incorrect test setup, not a product bug.** The test asserted that rules mode does not fire the observer, but never set `coach_mode = EngineMode::Rules` — `Settings::default()` is `EngineMode::Llm`. The test passed incidentally on macOS (observer spawns in Llm mode but fails quickly without API keys, no activity entry within 150ms). On VPS with API keys in env, the observer could actually fire and the test would fail. **Fix:** set `coach_mode = EngineMode::Rules` on the test server state before the hook call (`coach-core/tests/hook_integration.rs`).
 
 **CLI E2E (config + path)**: 2026-04-10 — `target/release/coach`; Coach daemon **not** on port 7700 (file-backed `config set`); settings restored from backup after mutations.
@@ -16,6 +18,79 @@ Tracked across `kodo test` runs.
 - **TS**: `npm run test` → vitest, **3** files (**35** tests): `ActivityBar.test.ts`, `SessionList.test.ts`, `SettingsPane.test.ts` under `src/components/`. Vitest config excludes **`**/.claude/**`** so Claude Code worktrees do not duplicate tests.
 - **Rust**: `cargo test --workspace` → **219** tests (coach-core, hook_integration, cli_integration, scenario_replay, etc.), **21** ignored
 - **Ignored**: 21 Rust tests need live API keys or external processes (see test-report.md)
+
+## Stage 1 — Linux ARM64 CLI / system integration (2026-04-10)
+
+**Goal:** Map how Coach behaves on Linux for real file/PATH workflows, then run representative commands as a user would (not the full HTTP/GUI matrix).
+
+### Map (integration surface, ~15% effort)
+
+| Area | On Debian 12 aarch64 |
+|------|----------------------|
+| **Binary** | Workspace `cargo build --release -p coach` → `target/release/coach` (ELF **aarch64** PIE, dynamic linker `/lib/ld-linux-aarch64.so.1`). |
+| **Config / state** | `~/.coach/settings.json` (created on first `config set` or implied load). |
+| **PATH shim** | Default `~/.local/bin/coach` → symlink to the binary used for `path install`. |
+| **Hook payloads** | Claude: `~/.claude/settings.json`; Cursor: `~/.cursor/hooks.json`; Codex: `~/.codex/hooks.json`. Shell shims live under `~/.coach/*.sh`. |
+| **Help** | Only **top-level** `coach`, `help`, `-h`, `--help` and **`coach serve --help`**; other subcommands have **no** dedicated `--help` (see issues). |
+| **Daemon** | **`coach serve --port N`** writes **`port`** to **`~/.coach/settings.json`** then listens. **`coach status`** / **`mode`** probe **`http://127.0.0.1:{port}/version`**. No systemd. |
+
+### Exercises run — shallow (VPS `root@46.225.111.102`, isolated `HOME`)
+
+| Command / workflow | Result | Notes |
+|--------------------|--------|--------|
+| `coach --version` | **pass** | `coach 0.1.78` |
+| `coach --help` | **pass** | Lists `hooks codex`, `hooks cursor`, `path`, `config`, etc. |
+| `coach serve --help` | **pass** | Usage + `--port`; **exit 0**; does not listen |
+| `coach config list` | **exit 1** | `coach: usage: coach config <get\|set>; got 'list'` |
+| `coach config get` | **pass** | Full JSON (defaults until mutated) |
+| `coach config get not_a_key` | **exit 1** | `unknown config key 'not_a_key'` |
+| `coach config set priorities …` / `coach-mode` / `model` + `config get …` | **pass** | File-backed writes when daemon **not** on `configured_port()`; `settings.json` matches |
+| `coach path status` (no shim) | **pass** | `installed: false`; `on $PATH: true` when `$HOME/.local/bin` prepended |
+| `coach path install` | **pass** | `lrwxrwxrwx … coach -> /root/coach/target/release/coach` |
+| `coach path status` (installed) | **pass** | `matches_running: true` when continuing to invoke the same release binary |
+| `coach hooks status` (no `~/.claude/settings.json` yet) | **pass** | Path under `HOME` shown; all hooks **not** installed |
+| Seed “dirty” Claude + Cursor JSON → **`hooks install`** / **`hooks cursor install`** | **pass** | Claude **6** hooks; Cursor **8** hooks; user keys **`someUserSetting`**, **`permissions`**, **`gleanerMeta`** still present after uninstall |
+| **`hooks uninstall`** / **`hooks cursor uninstall`** | **pass** | Stdout: removed from `~/.claude/settings.json` / `~/.cursor/hooks.json` (tilde paths in message) |
+| `coach path uninstall` | **pass** | Symlink removed |
+| `coach hooks codex status` | **pass** | Missing file path listed under `~/.codex/hooks.json`; all **·** (not installed) |
+
+### Stage 1b — deep Linux pass (same VPS, isolated `HOME`, 2026-04-10)
+
+**Binary:** `/root/coach/target/release/coach` (**0.1.78**). **Port used:** `45123` (free on host). **No new defects observed** beyond Stage 1 issues already listed (`hooks install --help`, etc.).
+
+| Command / workflow | Result | Notes |
+|--------------------|--------|--------|
+| **`coach status`** (no daemon, empty `HOME`) | **exit 1** | `coach: Coach is not running on port 7700. Start it with \`coach serve\` or launch the GUI.` |
+| **`coach status --json`** (daemon down) | **exit 1** | Same **plain text** on stderr — **not** JSON (matches existing CLI E2E note). |
+| **`coach config set priorities …`** (daemon **down**) | **pass** | File write; **`port`: 7700** in JSON until **`serve`**. |
+| **`coach serve --port 45123`** (background) | **pass** | Stderr: `[coach serve] listening on 127.0.0.1:45123, priorities=[…]`; **`settings.json`** → **`"port": 45123`**. |
+| **`coach status`** (daemon **up**) | **exit 0** | Text: `0 session(s)`, **`port:    45123`**, model/engine/priorities lines. |
+| **`coach status --json`** (daemon **up**) | **exit 0** | Pretty JSON; includes **`observer_capable_providers`**, **`sessions`**: `[]` initially. |
+| **`coach config set priorities …`** (daemon **up**) | **pass** | **`config get`** + **`settings.json`** show new list — **HTTP path** (server keeps running; file on disk matches). |
+| **`curl` `POST /hook/session-start`** then **`coach mode away`** / **`coach mode present`** | **pass** | **`curl`** HTTP **200**, body `{}`; mode lines **`set all sessions to away|present`**; **`status`** shows **`pid=… mode="away"|"present"`** (synthetic PID from hook stack). |
+| **Kill `serve`** → **`coach status`** | **exit 1** | `Coach is not running on port 45123…` (uses port from **saved** settings). |
+| **`coach config set priorities …`** (daemon **down** again) | **pass** | Returns to **file** path; priorities persist. |
+| **`hooks codex status`** (no `hooks.json`) | **pass** | **`hooks file:`** … **`all installed: false`**, six **·** rows. |
+| **`hooks codex install`** | **pass** | `installed 6 Codex hook(s) into …/.codex/hooks.json`; creates **`~/.coach/codex-hook.sh`**. |
+| **`hooks codex status`** (after install) | **pass** | **`all installed: true`**, six **✓**. |
+| **`hooks codex uninstall`** | **pass** | `removed coach Codex hooks from ~/.codex/hooks.json`; file becomes **`{"hooks":{}}`** (**17** bytes); status → all **·** again. |
+
+### Stage 1 / 1b — still untested on Linux (this project)
+
+- **`path install --dir` / `path status --dir` / `path uninstall --dir`** — still only **Rust integration + macOS** E2E in doc; not re-run on Linux.
+- **`sessions list`**, **`replay`** — not exercised in Stage 1b.
+- **`coach mode --pid N`** — only **all-sessions** `mode away` / `mode present` tested.
+- **Malformed hook JSON** — appendix **Hook E2E**; not repeated on VPS this session.
+- **Real Claude Code / Cursor / Codex** processes hitting hooks — no agents on VPS.
+- **Parallel daemons / port collision** — covered by `cargo` tests; not manually re-run here.
+
+### Reproducible issues (observed on Linux; likely cross-platform)
+
+1. **`coach hooks install --help`** does **not** show help — it runs **`install`** and exits **0**; `--help` is ignored. Users expecting subcommand help will mutate config unintentionally.
+2. **`coach hooks`** with no verb defaults to **`status`** (same as explicit `hooks status`) — not an error; discoverability differs from `config`/`path` strict usage.
+3. **Minor labeling:** `hooks codex status` prints **`hooks file:`** while Claude/Cursor use **`settings file:`** — cosmetic only.
+
+---
 
 ## Stage 5 — Frontend (build + Vitest)
 

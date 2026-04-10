@@ -15,6 +15,7 @@
 - Frontend: repo root `npm test`, `npm run build`.
 - **Discovery (Stage 1):** `.kodo/test-report.md` (setup + CLI smoke), `.kodo/test-coverage.md` (coverage matrix; Codex HTTP routes pending in tests).
 - **Kodo improve (Stage 3):** auto-fixes land as `chore: auto-fix issues found by kodo improve`; triage report is `improve-report.md` under `~/.kodo/runs/<run_id>/` (ensure Rust/npm counts in the report match actual `cargo test` / `npm test` output).
+- **Linux Stage 3 (2026-04-10):** Debian 12 ARM64 release binary **`coach 0.1.78`** — isolated-`HOME` E2E for `path`, `config`, `serve`/`status` (incl. EADDRINUSE), Claude/Cursor/Codex hooks. Matrix + repro: **`.kodo/test-coverage.md`** / **`.kodo/tester-notes.md`**. **Edge:** if `hooks install` writes the shim then the final config merge/write fails (e.g. immutable `~/.claude/settings.json`), an orphan **`~/.coach/claude-hook.sh`** can remain.
 
 ## Frontend / integration
 

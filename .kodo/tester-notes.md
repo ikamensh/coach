@@ -2,10 +2,10 @@
 
 ## Environment (verified 2026-04-10)
 
-- **Binary:** Workspace outputs `coach` at **`target/release/coach`** from repo root (or `target/debug/coach` after `cargo test`). Not under `src-tauri/target/` alone — use workspace root `target/`. **0.1.75** in this pass.
-- **Rust:** `cargo test --workspace` — **219** passed, **21** ignored (2026-04-10 re-verify). Use `--workspace`; bare `cargo test` from repo root can be misleading if you only read the last `test result` line.
+- **Binary:** Workspace outputs `coach` at **`target/release/coach`** from repo root (or `target/debug/coach` after `cargo test`). Not under `src-tauri/target/` alone — use workspace root `target/`. **0.1.78** in this pass.
+- **Rust:** `cargo test --workspace` — **219** passed, **21** ignored (2026-04-10 re-verify). Use `--workspace`; bare `cargo test` from repo root can be misleading if you only read the last `test result` line. Per-crate spot check: `hook_integration` **31** tests (not 29); `coach-core` unit **171** passed + **15** ignored.
 - **Node:** **`npm run build`** = `tsc -b tsconfig.app.json && vite build`; **`npm test`** = `vitest run`. Vitest **35** tests, **3** files — **`ActivityBar`**, **`SessionList`**, **`SettingsPane`** `*.test.ts` (helpers + **`PROVIDERS`** + observer-capable consistency vs duplicated backend list; **no** full `SettingsPane` mount, **no** Tauri). **`vite.config.ts`** excludes **`**/.claude/**`**. No ESLint script.
-- **CLI:** `./target/release/coach --version` matches workspace (e.g. `0.1.75`).
+- **CLI:** `./target/release/coach --version` matches workspace (e.g. `0.1.78`).
 
 ## UX gotchas (reconfirmed)
 
@@ -47,7 +47,7 @@ Binary: `./target/release/coach` from repo root.
 **Repro C — port collision**
 
 1. `./target/release/coach serve --port 19993 &` (wait until listening).
-2. Second: `./target/release/coach serve --port 19993` — **exit 1**, stdout/stderr: `coach: failed to bind 127.0.0.1:19993: Address already in use (os error 48)` (macOS).
+2. Second: `./target/release/coach serve --port 19993` — **exit 1**, stdout/stderr: `coach: failed to bind 127.0.0.1:19993: Address already in use (os error 48)` (**macOS**) or **`os error 98`** (**Linux**).
 3. Kill the first process.
 
 **`status --json` (E2E):** When the daemon is **up**, output is pretty-printed JSON (exit 0). When **down**, stderr/stdout is still the **plain text** error (`Coach is not running on port …`) — **not** JSON — exit **1**. Scripts cannot rely on `--json` alone for machine-readable errors.
@@ -68,7 +68,7 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 
 | Case | `hooks install` / `hooks cursor install` | `hooks uninstall` / `hooks cursor uninstall` |
 |------|--------------------------------------------|---------------------------------------------|
-| **Syntax-invalid JSON** (truncated `{`, `not json`) | **Exit 1** — `refusing to overwrite … — it contains invalid JSON: …`; **config file bytes unchanged**; **no new shim** (`~/.coach/claude-hook.sh` / `~/.cursor/coach-cursor-hook.sh`) — parse runs **before** any shim write (**E2E 2026-04-10**, `target/release/coach` **0.1.75**, isolated `HOME`). | **Exit 1** — parse error; **file unchanged** |
+| **Syntax-invalid JSON** (truncated `{`, `not json`) | **Exit 1** — `refusing to overwrite … — it contains invalid JSON: …`; **config file bytes unchanged**; **no new shim** (`~/.coach/claude-hook.sh` / `~/.cursor/coach-cursor-hook.sh`) — parse runs **before** any shim write (**E2E 2026-04-10**, `target/release/coach` **0.1.78**, isolated `HOME`). | **Exit 1** — parse error; **file unchanged** |
 | **Valid JSON, root not an object** (e.g. `[1,2,3]`) | **Exit 1** — `config file is not a JSON object` (Claude); **file unchanged** | Same — **unchanged** if still invalid |
 | **Root object but `"hooks"` not an object** (e.g. `"hooks":"nope"`) | **Exit 1** — `hooks is not an object`; **file unchanged** | Needs parseable `hooks` object — **fails** if still wrong |
 
@@ -89,7 +89,7 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 - **`npm test`**: pass — **3** files, **35** tests, **~150ms** (Vitest **4.1.2**).
 - **Lint / typecheck scripts:** **`package.json` has no `lint`**. Typecheck is **`tsc -b`** inside **`npm run build`** only (no standalone `typecheck` script).
 - **Rust `cargo test --workspace`**: **219** passed, **21** ignored (same baseline as notes).
-- **IPC audit (commands):** `rg` on `src/**/*.ts(x)` `invoke("…")` vs `generate_handler![…]` in `src-tauri/src/lib.rs` — **27** command names on each side; **set equality match** (no Rust-only command, no frontend-only name). Invokes live in **`useCoachStore.ts`** + **`DevPane.tsx`** (`list_saved_sessions`, `replay_session`).
+- **IPC audit (commands):** `rg` on `src/**/*.ts(x)` `invoke("…")` vs `generate_handler![…]` in `src-tauri/src/lib.rs` — **26** Tauri commands; **set equality match** with all `invoke` sites (**`useCoachStore.ts`** + **`DevPane.tsx`**). No Rust-only or frontend-only names.
 - **IPC audit (events):** Rust emits `coach_core::state::EVENT_STATE_UPDATED` / `EVENT_THEME_CHANGED` (`coach-state-updated`, `coach-theme-changed`). **`useCoachStore.ts`** listens on the same two strings — **match**. (Tray/commands also emit state updates — same event name.)
 - **Provider / observer UX (worker fix):** **`CoachSnapshot`** includes **`observer_capable_providers`**; store hydrates from **`get_state`** + **`coach-state-updated`**. **`SettingsPane`**: provider `<select>` appends **`(no observer)`** when not in that list; **LLM** mode + non-capable provider shows amber warning (`data-testid="observer-warning"`). Vitest covers **PROVIDERS** ⊇ backend observer list + non-observer providers have labels — **not** mounted UI / webview.
 - **Real scope:** Still **no** `tauri dev` in automated pass — runtime `invoke`/`listen` and DOM visibility of warnings not exercised here.
@@ -108,7 +108,7 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 
 ## Settings file corruption (`~/.coach/settings.json`, E2E 2026-04-10)
 
-- **Binary:** `coach/target/release/coach` (0.1.75).
+- **Binary:** `coach/target/release/coach` (0.1.78).
 - **Implementation:** `Settings::load_from` — parse error → `eprintln!` warning + **`Settings::default()`**; missing file → defaults **without** warning (`read` error).
 - **Read-only (`config get`, etc.):** corrupt file **stays on disk** unchanged; stderr shows serde error; values shown are **full defaults** (not a partial merge).
 - **`{}`:** valid JSON — deserializes with serde defaults for missing fields → **no warning** (differs from syntax-invalid files).
@@ -116,6 +116,10 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 - **Nits:** `config set` with corrupt file can **print the parse warning twice** (`configured_port()` + inner `Settings::load()`). While corrupt, **`configured_port()` is 7700**, so `hooks install` / server probe use default port — can mismatch a custom port that was only in the broken file.
 
 ## Linux ARM64 — Debian 12 VPS
+
+### Release binary quick E2E (2026-04-10, re-run)
+
+**Host:** `root@46.225.111.102`. **`env -i` + `mktemp` `HOME`**, seeded `~/.coach/settings.json` `port` → **`coach status`** exit **1** when down, **`coach serve --port`** + **`coach status`** + **`curl /api/state`** OK, second **`serve`** → **EADDRINUSE `os error 98`**. **`pid_resolver::tests::resolves_real_connection_to_child_pid`** — `cargo test -p coach-core … -- --exact` **pass** (uses **`/proc/net/tcp`** / netstat-style path on Linux).
 
 ### Stage 2 verification (2026-04-10, re-run)
 
@@ -131,9 +135,49 @@ ssh root@46.225.111.102 'bash -lc "cd /root/coach && export PATH=/root/.cargo/bi
 
 **`observer_does_not_fire_in_rules_mode` — wrong test setup, not a product bug.** Production gates the observer queue on `coach_mode == Llm` + capable provider (`server.rs` `run_post_tool_use`). The test must set **`coach_mode = EngineMode::Rules`** because `Settings::default()` is **Llm**. Extra check: **`OPENAI_API_KEY=sk-fake… cargo test -p coach-core observer_does_not_fire_in_rules_mode -- --exact`** still **pass** — confirms Rules mode, not missing keys/timing.
 
-**Linux-specific checks:** **`pid_resolver::tests::resolves_real_connection_to_child_pid`** (**netstat2** / **`/proc/net/tcp`**) — **pass** in suite.
+**Linux-specific checks:** **`pid_resolver::tests::resolves_real_connection_to_child_pid`** (**netstat2** / **`/proc/net/tcp`**) — **pass** in suite; run alone: **`cargo test -p coach-core pid_resolver::tests::resolves_real_connection_to_child_pid -- --exact`**.
 
 **`npm test`:** **35** passed (3 files) — not re-run this session; prior baseline unchanged unless `package.json` shifts.
+
+### Stage 3 — release binary: `~/.local/bin` shim + hooks (Debian 12 ARM64 VPS)
+
+**Host:** `root@46.225.111.102` (**openclaw-1**, **6.1.0-44-arm64**). **Binary under test:** **`/root/coach/target/release/coach`** (workspace **`cargo build --release -p coach`** on the VPS — do not use stale packaged artifacts). **Re-verified:** **2026-04-10** — **`coach 0.1.78`**, **`ELF … ARM aarch64`**.
+
+**Shell rc / PATH — product behavior:** Coach **does not** create or edit **`~/.bashrc`**, **`~/.profile`**, or **`~/.zshrc`**. It only **detects** whether the install directory is on **`$PATH`** (`path_install::dir_on_path`) and, if not, **prints** **`export PATH="<dir>:$PATH"`** (stdout). Verified with **`env -i HOME=$(mktemp -d)`**.
+
+**Isolation:** Every scenario uses **`env -i HOME=<tmp> USER=test PATH=…`** so Claude (**`~/.claude/settings.json`**), Cursor (**`~/.cursor/hooks.json`**), Codex (**`~/.codex/hooks.json`**), and shims under **`~/.coach/`** stay separate from the real admin **`HOME`**.
+
+**PATH shim (same results as prior pass):** **`path install`** without `~/.local/bin` on **`PATH`** → warning + symlink; **`path status`** → **`on $PATH: true`** when prepended; **`path install`** twice → idempotent; **`path uninstall`** ×2 → second **exit non-zero** (`no shim installed at …`); **`path install --dir` / `status --dir` / `uninstall --dir`** roundtrip OK.
+
+**Hooks — Claude / Cursor / Codex (dirty pre-existing JSON):** User keys + extra hook rows preserved; **`hooks install`** / **`hooks cursor install`** / **`hooks codex install`** each run **3×** — config **`sha256sum`** stable after the **2nd** run (idempotent); shims **`claude-hook.sh`**, **`coach-cursor-hook.sh`**, **`codex-hook.sh`** executable; **`hooks <target> status`** → **`all installed: true`**; **`hooks uninstall`** + **`hooks cursor uninstall`** + **`hooks codex uninstall`** → Coach shims removed, user JSON content retained.
+
+**Missing dirs:** Fresh **`HOME`** with only **`~/.coach/settings.json`** (`port`) → **`hooks install`** creates **`.claude/settings.json`** + shim (**exit 0**).
+
+**Invalid JSON (syntax):** **`hooks install`**, **`hooks cursor install`**, **`hooks codex install`** on **`{ bad`** (truncated) → **exit 1**, stderr **`refusing to overwrite … — it contains invalid JSON:`**; **config bytes unchanged**; **no** **`coach-cursor-hook.sh`** / **`codex-hook.sh`** on Cursor/Codex failure path (parse before shim).
+
+**Valid JSON, wrong shape:** **`[1,2,3]`** in **`~/.claude/settings.json`** → **exit 1**, **`config file is not a JSON object`**.
+
+**Permission / write failure:** As **`root`**, **`chmod a-w`** on **`settings.json`** does **not** block writes — **`hooks install` still succeeds** (expected Unix root behavior). To force a real failure: **`chattr +i ~/.claude/settings.json`** (valid **`{}`**) → **`hooks install`** → **exit 1**, **`Operation not permitted (os error 1)`**. **Finding:** **`claude-hook.sh`** may still be written under **`~/.coach/`** before the final config write fails — possible **orphan shim** if JSON merge/write fails after shim creation (not specific to `chattr`; same ordering for any late write error).
+
+**One-liner — rebuild + inspect artifact on VPS:**
+
+```bash
+ssh root@46.225.111.102 'bash -lc "cd /root/coach && export PATH=/root/.cargo/bin:/usr/bin:/bin && cargo build --release -p coach && ./target/release/coach --version && file ./target/release/coach"'
+```
+
+**Minimal isolated smoke (copy-paste on VPS):**
+
+```bash
+COACH=/root/coach/target/release/coach
+H=$(mktemp -d)
+export HOME="$H"
+mkdir -p "$HOME/.coach" && echo '{"port":7700}' > "$HOME/.coach/settings.json"
+env -i HOME="$HOME" USER=test PATH=/usr/bin:/bin "$COACH" path install
+env -i HOME="$HOME" USER=test PATH="$HOME/.local/bin:/usr/bin:/bin" "$COACH" hooks install
+env -i HOME="$HOME" USER=test PATH=/usr/bin:/bin "$COACH" hooks cursor install
+env -i HOME="$HOME" USER=test PATH=/usr/bin:/bin "$COACH" hooks codex install
+rm -rf "$H"
+```
 
 ### Historical: E2E after `RunEvent::Reopen` fix
 
