@@ -51,9 +51,7 @@ pub(crate) async fn set_session_mode(
     if !s.sessions.contains_key(&pid) {
         return Err((StatusCode::NOT_FOUND, format!("no session for pid {pid}")));
     }
-    if let Some(sess) = s.sessions.get_mut(&pid) {
-        sess.mode = payload.mode;
-    }
+    s.set_session_mode(pid, payload.mode);
     let snap = s.snapshot();
     emit_update(&*state.emitter, &s);
     Ok(Json(snap))
@@ -75,8 +73,7 @@ pub(crate) async fn set_priorities(
     Json(payload): Json<PrioritiesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let mut s = state.coach.write().await;
-    s.priorities = payload.priorities;
-    s.save();
+    s.update_priorities(payload.priorities);
     let snap = s.snapshot();
     emit_update(&*state.emitter, &s);
     Json(snap)
@@ -87,8 +84,7 @@ pub(crate) async fn set_model(
     Json(payload): Json<ModelConfig>,
 ) -> Json<crate::state::CoachSnapshot> {
     let mut s = state.coach.write().await;
-    s.model = payload;
-    s.save();
+    s.update_model(payload);
     let snap = s.snapshot();
     emit_update(&*state.emitter, &s);
     Json(snap)
@@ -99,12 +95,7 @@ pub(crate) async fn set_api_token(
     Json(payload): Json<ApiTokenPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let mut s = state.coach.write().await;
-    if payload.token.is_empty() {
-        s.api_tokens.remove(&payload.provider);
-    } else {
-        s.api_tokens.insert(payload.provider, payload.token);
-    }
-    s.save();
+    s.update_api_token(&payload.provider, &payload.token);
     let snap = s.snapshot();
     emit_update(&*state.emitter, &s);
     Json(snap)
@@ -115,8 +106,7 @@ pub(crate) async fn set_coach_mode(
     Json(payload): Json<CoachModePayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let mut s = state.coach.write().await;
-    s.coach_mode = payload.coach_mode;
-    s.save();
+    s.update_coach_mode(payload.coach_mode);
     let snap = s.snapshot();
     emit_update(&*state.emitter, &s);
     Json(snap)
@@ -127,8 +117,7 @@ pub(crate) async fn set_rules(
     Json(payload): Json<RulesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let mut s = state.coach.write().await;
-    s.rules = payload.rules;
-    s.save();
+    s.update_rules(payload.rules);
     let snap = s.snapshot();
     emit_update(&*state.emitter, &s);
     Json(snap)

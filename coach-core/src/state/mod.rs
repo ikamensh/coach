@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 #[cfg(feature = "pycoach")]
 use crate::pycoach::Pycoach;
-use crate::settings::{CoachRule, EngineMode, ModelConfig, Settings};
+use crate::settings::{CoachRule, EngineMode, HookTarget, ModelConfig, Settings};
 
 mod snapshot;
 pub use snapshot::{
@@ -434,6 +434,71 @@ impl CoachState {
         for session in self.sessions.values_mut() {
             session.mode = mode;
         }
+    }
+
+    // ── Config mutation methods ────────────────────────────────────────
+    //
+    // Centralise "mutate field + persist" so callers (Tauri commands,
+    // HTTP API handlers) don't each reimplement the same logic.
+
+    pub fn update_priorities(&mut self, priorities: Vec<String>) {
+        self.priorities = priorities;
+        self.save();
+    }
+
+    pub fn update_model(&mut self, model: ModelConfig) {
+        self.model = model;
+        self.save();
+    }
+
+    pub fn update_api_token(&mut self, provider: &str, token: &str) {
+        if token.is_empty() {
+            self.api_tokens.remove(provider);
+        } else {
+            self.api_tokens.insert(provider.to_string(), token.to_string());
+        }
+        self.save();
+    }
+
+    pub fn update_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.save();
+    }
+
+    pub fn update_coach_mode(&mut self, mode: EngineMode) {
+        self.coach_mode = mode;
+        self.save();
+    }
+
+    pub fn update_rules(&mut self, rules: Vec<CoachRule>) {
+        self.rules = rules;
+        self.save();
+    }
+
+    pub fn update_auto_uninstall(&mut self, enabled: bool) {
+        self.auto_uninstall_hooks_on_exit = enabled;
+        self.save();
+    }
+
+    pub fn set_session_mode(&mut self, pid: u32, mode: CoachMode) {
+        if let Some(session) = self.sessions.get_mut(&pid) {
+            session.mode = mode;
+        }
+    }
+
+    pub fn set_intervention_muted(&mut self, pid: u32, muted: bool) {
+        if let Some(session) = self.sessions.get_mut(&pid) {
+            session.coach.intervention_muted = muted;
+        }
+    }
+
+    pub fn set_hook_enabled(&mut self, target: HookTarget, enabled: bool) {
+        match target {
+            HookTarget::Claude => self.hooks_user_enabled = enabled,
+            HookTarget::Cursor => self.cursor_hooks_user_enabled = enabled,
+            HookTarget::Codex => self.codex_hooks_user_enabled = enabled,
+        }
+        self.save();
     }
 
     pub fn to_settings(&self) -> Settings {

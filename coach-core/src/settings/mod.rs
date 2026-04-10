@@ -7,6 +7,44 @@ use crate::state::Theme;
 mod hooks;
 pub use hooks::*;
 
+// ── HookTarget ─────────────────────────────────────────────────────────
+//
+// Dispatch layer over the per-client hook functions so callers don't
+// need to match on three sets of functions themselves.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookTarget {
+    Claude,
+    Cursor,
+    Codex,
+}
+
+impl HookTarget {
+    pub fn check_status(&self, port: u16) -> HookStatus {
+        match self {
+            Self::Claude => check_hook_status(port),
+            Self::Cursor => check_cursor_hook_status(),
+            Self::Codex => check_codex_hook_status(),
+        }
+    }
+
+    pub fn install(&self, port: u16) -> Result<(), String> {
+        match self {
+            Self::Claude => install_hooks(port),
+            Self::Cursor => install_cursor_hooks(port),
+            Self::Codex => install_codex_hooks(port),
+        }
+    }
+
+    pub fn uninstall(&self, port: u16) -> Result<(), String> {
+        match self {
+            Self::Claude => uninstall_hooks(port),
+            Self::Cursor => uninstall_cursor_hooks(),
+            Self::Codex => uninstall_codex_hooks(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub provider: String,
