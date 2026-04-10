@@ -2,9 +2,9 @@
 
 Tracked across `kodo test` runs.
 
-**Baseline run**: 2026-04-10 — **254** pass (**219** Rust + **35** Vitest), 0 fail, **21** ignored (`cargo test --workspace` + `npm test`). *(Earlier docs listed inflated Vitest counts when `vitest` picked up duplicate `*.test.ts` under **`.claude/worktrees/`**; `vite.config.ts` excludes that path.)* **CLI E2E re-verify:** `cargo build --release -p coach`; isolated `HOME` + `settings.json` `{"port":1}` — `coach status` down prints **`Start it with \`coach serve\` or launch the GUI`**; `coach serve --port` then `coach status` exit 0; **`path status|uninstall --dir`** custom-dir roundtrip. **Stage 5 re-verify:** `npm test` green; `cargo test --workspace` **219** passed / **21** ignored.
+**Baseline run**: 2026-04-10 — **256** pass (**221** Rust + **35** Vitest), 0 fail, **21** ignored (`cargo test --workspace` + `npm test`). *(Earlier docs listed inflated Vitest counts when `vitest` picked up duplicate `*.test.ts` under **`.claude/worktrees/`**; `vite.config.ts` excludes that path.)* **Hook-orphan regression (same day):** `cargo test -p coach-core no_shim` — **4** passed (invalid JSON + chmod-not-writable paths). **CLI E2E re-verify:** `cargo build --release -p coach`; isolated `HOME` + `settings.json` `{"port":1}` — `coach status` down prints **`Start it with \`coach serve\` or launch the GUI`**; `coach serve --port` then `coach status` exit 0; **`path status|uninstall --dir`** custom-dir roundtrip. **Stage 5 re-verify:** `npm test` green; `cargo test --workspace` **221** passed / **21** ignored.
 
-**Authoritative cross-platform run** (2026-04-10): `cargo test --workspace` — **219 passed, 0 failed, 21 ignored** on **both macOS (local) and Debian 12 ARM64 VPS** (`root@46.225.111.102`). Breakdown: coach-core 171+15ign, cli_integration 18, hook_integration 29+2ign, scenario_replay 1+4ign.
+**Authoritative cross-platform run** (2026-04-10): `cargo test --workspace` — **221 passed, 0 failed, 21 ignored** on macOS (local) and **Debian 12 aarch64** (`root@46.225.111.102`, env keys stripped). Breakdown: coach-core 173+15ign, cli_integration 18, hook_integration 29+2ign, scenario_replay 1+4ign. **Orphan-shim unit tests:** `install_nested_no_shim_when_config_not_writable`, `install_cursor_no_shim_when_hooks_json_not_writable` (+ invalid-JSON pair); filter **`cargo test -p coach-core no_shim`**. **VPS E2E (immutable config):** `chattr +i` on `~/.claude/settings.json`, `~/.cursor/hooks.json`, or `~/.codex/hooks.json` — install exits **1** (`Operation not permitted (os error 1)`); **no** `claude-hook.sh` / `coach-cursor-hook.sh` / `codex-hook.sh` left behind (see **`.kodo/tester-notes.md`**).
 
 **Linux Stage 1 (CLI / system integration, 2026-04-10):** On the same VPS, **`cargo build --release -p coach`** → **`/root/coach/target/release/coach`** (**0.1.78**, ELF aarch64). Isolated **`HOME=$(mktemp -d)`** + **`PATH="$HOME/.local/bin:…"`** — shallow pass: **`path`**, file-backed **`config`**, **Claude/Cursor hooks**; **deep pass (Stage 1b):** **`serve`**, **`status`** / **`status --json`**, **`mode`**, **`config set`** with daemon **up** (HTTP) vs **down** (file), **`hooks codex install|uninstall`**. Details: **Stage 1 — Linux ARM64 CLI** below.
 
@@ -18,7 +18,7 @@ Tracked across `kodo test` runs.
 
 ## Test Entrypoints
 - **TS**: `npm run test` → vitest, **3** files (**35** tests): `ActivityBar.test.ts`, `SessionList.test.ts`, `SettingsPane.test.ts` under `src/components/`. Vitest config excludes **`**/.claude/**`** so Claude Code worktrees do not duplicate tests.
-- **Rust**: `cargo test --workspace` → **219** tests (coach-core, hook_integration, cli_integration, scenario_replay, etc.), **21** ignored
+- **Rust**: `cargo test --workspace` → **221** tests (coach-core, hook_integration, cli_integration, scenario_replay, etc.), **21** ignored
 - **Ignored**: 21 Rust tests need live API keys or external processes (see test-report.md)
 
 ## Stage 1 — Linux ARM64 CLI / system integration (2026-04-10)
@@ -179,7 +179,7 @@ Tracked across `kodo test` runs.
 | LLM observer | 2026-04-10 | pass | observer_fires_in_llm_mode_and_records_failure |
 | Settings: load/save | 2026-04-10 | pass | Unit tests for serde roundtrip |
 | Settings: corrupt/malformed JSON recovery (CLI + `serve`, release binary) | 2026-04-10 | pass | Truncated / non-JSON / empty / wrong-type → warning + defaults; `{}` silent defaults; read-only leaves file corrupt; `config set` + `serve` rewrite file. **Data loss** of prior fields on recovery without backup; see `tester-notes` |
-| Hook installation: merge logic | 2026-04-10 | pass | install_hooks_at tested |
+| Hook installation: merge logic | 2026-04-10 | **fixed** | Stage 3: shim-before-config left orphans on write failure. Fix: `install_nested_hooks` (Claude + Codex) and `install_cursor_hooks_at` write **config first**, **shim last**. Tests: `cargo test -p coach-core no_shim` (**4** — invalid JSON + chmod 444; chmod path **no-ops on root**). **VPS:** `chattr +i` on each JSON + `hooks install` / `hooks cursor install` / `hooks codex install` — **exit 1**, no orphan shims (0.1.79) |
 | Logging: file rotation | 2026-04-10 | pass | Unit tests for log rotation |
 | PID resolution | 2026-04-10 | pass | Unit test resolves_real_connection_to_child_pid |
 | Prompt loading | 2026-04-10 | pass | embedded_templates_are_non_empty |

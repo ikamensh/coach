@@ -2,10 +2,10 @@
 
 ## Environment (verified 2026-04-10)
 
-- **Binary:** Workspace outputs `coach` at **`target/release/coach`** from repo root (or `target/debug/coach` after `cargo test`). Not under `src-tauri/target/` alone — use workspace root `target/`. **0.1.78** in this pass.
-- **Rust:** `cargo test --workspace` — **219** passed, **21** ignored (2026-04-10 re-verify). Use `--workspace`; bare `cargo test` from repo root can be misleading if you only read the last `test result` line. Per-crate spot check: `hook_integration` **31** tests (not 29); `coach-core` unit **171** passed + **15** ignored.
+- **Binary:** Workspace outputs `coach` at **`target/release/coach`** from repo root (or `target/debug/coach` after `cargo test`). Not under `src-tauri/target/` alone — use workspace root `target/`. **0.1.79** (2026-04-10 hook-orphan verification pass).
+- **Rust:** `cargo test --workspace` — **221** passed, **21** ignored (2026-04-10 hook-orphan E2E pass, macOS + Debian 12 aarch64). Use `--workspace`; bare `cargo test` from repo root can be misleading if you only read the last `test result` line. Per-crate spot check: `hook_integration` **31** tests; `coach-core` unit **173** passed + **15** ignored. **Hook orphan regression filter:** `cargo test -p coach-core no_shim` — **4** tests (invalid JSON + non-writable config paths).
 - **Node:** **`npm run build`** = `tsc -b tsconfig.app.json && vite build`; **`npm test`** = `vitest run`. Vitest **35** tests, **3** files — **`ActivityBar`**, **`SessionList`**, **`SettingsPane`** `*.test.ts` (helpers + **`PROVIDERS`** + observer-capable consistency vs duplicated backend list; **no** full `SettingsPane` mount, **no** Tauri). **`vite.config.ts`** excludes **`**/.claude/**`**. No ESLint script.
-- **CLI:** `./target/release/coach --version` matches workspace (e.g. `0.1.78`).
+- **CLI:** `./target/release/coach --version` matches workspace (e.g. `0.1.79`).
 
 ## UX gotchas (reconfirmed)
 
@@ -88,7 +88,7 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 - **`npm run build`**: pass — `tsc -b tsconfig.app.json` + Vite **~1.8s**; `dist/` (`assets/index-*.js` ~250 kB gzip ~74 kB).
 - **`npm test`**: pass — **3** files, **35** tests, **~150ms** (Vitest **4.1.2**).
 - **Lint / typecheck scripts:** **`package.json` has no `lint`**. Typecheck is **`tsc -b`** inside **`npm run build`** only (no standalone `typecheck` script).
-- **Rust `cargo test --workspace`**: **219** passed, **21** ignored (same baseline as notes).
+- **Rust `cargo test --workspace`**: **221** passed, **21** ignored (same baseline as notes).
 - **IPC audit (commands):** `rg` on `src/**/*.ts(x)` `invoke("…")` vs `generate_handler![…]` in `src-tauri/src/lib.rs` — **26** Tauri commands; **set equality match** with all `invoke` sites (**`useCoachStore.ts`** + **`DevPane.tsx`**). No Rust-only or frontend-only names.
 - **IPC audit (events):** Rust emits `coach_core::state::EVENT_STATE_UPDATED` / `EVENT_THEME_CHANGED` (`coach-state-updated`, `coach-theme-changed`). **`useCoachStore.ts`** listens on the same two strings — **match**. (Tray/commands also emit state updates — same event name.)
 - **Provider / observer UX (worker fix):** **`CoachSnapshot`** includes **`observer_capable_providers`**; store hydrates from **`get_state`** + **`coach-state-updated`**. **`SettingsPane`**: provider `<select>` appends **`(no observer)`** when not in that list; **LLM** mode + non-capable provider shows amber warning (`data-testid="observer-warning"`). Vitest covers **PROVIDERS** ⊇ backend observer list + non-observer providers have labels — **not** mounted UI / webview.
@@ -97,7 +97,7 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 
 ## Discovery docs
 
-- **`.kodo/test-report.md`** — may list older Vitest/Rust totals; prefer **`test-coverage.md`** for current **35** Vitest / **219** Rust numbers.
+- **`.kodo/test-report.md`** — may list older Vitest/Rust totals; prefer **`test-coverage.md`** for current **35** Vitest / **221** Rust numbers.
 - **`.kodo/test-coverage.md`** — Rust + Vitest + Stage 5 frontend; HTTP hook E2E in coverage table.
 
 ## Optional / not run here
@@ -148,7 +148,7 @@ User-visible model: in-memory sessions and `/api/state` are keyed by OS `pid` (o
 ssh root@46.225.111.102 'bash -lc "cd /root/coach && export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin && env -i HOME=/root USER=root PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin RUST_BACKTRACE=1 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GOOGLE_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY cargo test --workspace"'
 ```
 
-**`cargo test --workspace`:** **219** passed, **0** failed, **21** ignored — per-crate: `coach_lib` **0**; `coach` **0**; `cli_integration` **18**; `pycoach_sidecar` **0**; coach-core unit **171** + **15** ign; `hook_integration` **29** + **2** ign; `scenario_replay` **1** + **4** ign; doc-tests **0**.
+**`cargo test --workspace`:** **221** passed, **0** failed, **21** ignored — per-crate: `coach_lib` **0**; `coach` **0**; `cli_integration` **18**; `pycoach_sidecar` **0**; coach-core unit **173** + **15** ign; `hook_integration` **29** + **2** ign; `scenario_replay` **1** + **4** ign; doc-tests **0**.
 
 **`observer_does_not_fire_in_rules_mode` — wrong test setup, not a product bug.** Production gates the observer queue on `coach_mode == Llm` + capable provider (`server.rs` `run_post_tool_use`). The test must set **`coach_mode = EngineMode::Rules`** because `Settings::default()` is **Llm**. Extra check: **`OPENAI_API_KEY=sk-fake… cargo test -p coach-core observer_does_not_fire_in_rules_mode -- --exact`** still **pass** — confirms Rules mode, not missing keys/timing.
 
@@ -158,7 +158,7 @@ ssh root@46.225.111.102 'bash -lc "cd /root/coach && export PATH=/root/.cargo/bi
 
 ### Stage 3 — release binary: `~/.local/bin` shim + hooks (Debian 12 ARM64 VPS)
 
-**Host:** `root@46.225.111.102` (**openclaw-1**, **6.1.0-44-arm64**). **Binary under test:** **`/root/coach/target/release/coach`** (workspace **`cargo build --release -p coach`** on the VPS — do not use stale packaged artifacts). **Re-verified:** **2026-04-10** — **`coach 0.1.78`**, **`ELF … ARM aarch64`**.
+**Host:** `root@46.225.111.102` (**openclaw-1**, **6.1.0-44-arm64**). **Binary under test:** **`/root/coach/target/release/coach`** (workspace **`cargo build --release -p coach`** on the VPS — do not use stale packaged artifacts). **Re-verified:** **2026-04-10** — **`coach 0.1.79`**, **`ELF … ARM aarch64`**.
 
 **Shell rc / PATH — product behavior:** Coach **does not** create or edit **`~/.bashrc`**, **`~/.profile`**, or **`~/.zshrc`**. It only **detects** whether the install directory is on **`$PATH`** (`path_install::dir_on_path`) and, if not, **prints** **`export PATH="<dir>:$PATH"`** (stdout). Verified with **`env -i HOME=$(mktemp -d)`**.
 
@@ -174,7 +174,38 @@ ssh root@46.225.111.102 'bash -lc "cd /root/coach && export PATH=/root/.cargo/bi
 
 **Valid JSON, wrong shape:** **`[1,2,3]`** in **`~/.claude/settings.json`** → **exit 1**, **`config file is not a JSON object`**.
 
-**Permission / write failure:** As **`root`**, **`chmod a-w`** on **`settings.json`** does **not** block writes — **`hooks install` still succeeds** (expected Unix root behavior). To force a real failure: **`chattr +i ~/.claude/settings.json`** (valid **`{}`**) → **`hooks install`** → **exit 1**, **`Operation not permitted (os error 1)`**. **Finding:** **`claude-hook.sh`** may still be written under **`~/.coach/`** before the final config write fails — possible **orphan shim** if JSON merge/write fails after shim creation (not specific to `chattr`; same ordering for any late write error).
+**Permission / write failure:** As **`root`**, **`chmod a-w`** on **`settings.json`** does **not** block writes — **`hooks install` still succeeds** (expected Unix root behavior). To force a real failure: **`chattr +i ~/.claude/settings.json`** (valid **`{}`**) → **`hooks install`** → **exit 1**, **`Operation not permitted (os error 1)`**.
+
+**Stage 3 — orphan shim (config write fails after reorder fix)**
+
+- **Bug (pre-fix):** Shim was written before the merged hook JSON; a failed **`fs::write`** on the config (immutable file, full disk, etc.) left **`claude-hook.sh`** / **`coach-cursor-hook.sh`** / **`codex-hook.sh`** without matching hook entries.
+- **Fix:** **`install_nested_hooks`** (Claude + Codex — same function) and **`install_cursor_hooks_at`** write **config first**, **shim last**.
+- **Automated:** `cargo test -p coach-core no_shim` — **4** tests (`install_nested_no_shim_*`, `install_cursor_no_shim_*`). On **non-root**, `chmod 444` exercises real write failure; on **root** those two tests **return early** (root ignores mode bits) — they still **pass** but do not assert. **`chattr +i`** on the VPS is the real root-level check.
+- **Debian 12 ARM64 E2E (2026-04-10):** Host **`root@46.225.111.102`**, binary **`/root/coach/target/release/coach`** **0.1.79**, isolated **`mktemp` `HOME`**, **`env -i HOME=… USER=test PATH=/usr/bin:/bin`**. **`chattr +i`** on the target JSON, then install — **exit 1**, stderr **`coach: Operation not permitted (os error 1)`**, **no** orphan shim:
+
+| Surface | Command | Shim path checked (must not exist) |
+|---------|---------|-----------------------------------|
+| Claude (nested) | `hooks install` | `$HOME/.coach/claude-hook.sh` |
+| Cursor | `hooks cursor install` | `$HOME/.cursor/coach-cursor-hook.sh` (and `$HOME/.coach/` — none) |
+| Codex (nested) | `hooks codex install` | `$HOME/.coach/codex-hook.sh` |
+
+**Automated (macOS, repo root):** `cargo test --workspace` → **221** passed, **21** ignored; `cargo test -p coach-core no_shim` → **4** passed; `npm test` → **35** passed.
+
+**Full suite on VPS (CI-like, keys stripped):** `cd /root/coach && env -i HOME=/root USER=root PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GOOGLE_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY cargo test --workspace` → **221** passed, **21** ignored (same per-crate breakdown as macOS). **`cargo test -p coach-core no_shim`** on VPS → **4** passed (on **root**, the two `chmod` tests exit early without asserting).
+
+```bash
+# VPS — one scenario (Claude); repeat for Cursor (.cursor/hooks.json + hooks cursor install)
+# and Codex (.codex/hooks.json + hooks codex install) with same chattr pattern.
+COACH=/root/coach/target/release/coach
+H=$(mktemp -d); export HOME="$H"
+mkdir -p "$HOME/.claude" "$HOME/.coach"
+echo '{"port":7700}' > "$HOME/.coach/settings.json"
+echo '{}' > "$HOME/.claude/settings.json"
+chattr +i "$HOME/.claude/settings.json"
+env -i HOME="$HOME" USER=test PATH=/usr/bin:/bin "$COACH" hooks install || true
+test ! -f "$HOME/.coach/claude-hook.sh" && echo OK_no_orphan
+chattr -i "$HOME/.claude/settings.json"; rm -rf "$H"
+```
 
 **One-liner — rebuild + inspect artifact on VPS:**
 

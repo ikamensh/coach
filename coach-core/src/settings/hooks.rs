@@ -302,7 +302,9 @@ fn has_any_legacy_http_hooks(path: &std::path::Path) -> bool {
 }
 
 /// Shared install logic for nested-format hooks (Claude Code & Codex).
-/// Writes the shim script, then merges hook entries into the config file.
+/// Merges hook entries in memory, writes the config file first, then the shim
+/// so a failed config write (permissions, immutable file, full disk) never
+/// leaves an orphaned shim under `~/.coach/`.
 fn install_nested_hooks(
     config_path: &std::path::Path,
     shim_path: &std::path::Path,
@@ -328,14 +330,7 @@ fn install_nested_hooks(
         Err(e) => return Err(e.to_string()),
     };
 
-    // 2. Write the shim script so the command is on disk before the JSON.
-    if let Some(parent) = shim_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(shim_path, shim_content).map_err(|e| e.to_string())?;
-    crate::path_install::make_executable(shim_path)?;
-
-    // 3. Merge hook entries into the config file, preserving user entries.
+    // 2. Merge hook entries into the in-memory config, preserving user entries.
     let expected = expected_commands(shim_path, events);
 
     let settings_obj = settings
@@ -374,12 +369,20 @@ fn install_nested_hooks(
         }
     }
 
+    // 3. Write config first so a failure here leaves no shim on disk.
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(config_path, json).map_err(|e| e.to_string())?;
+
+    // 4. Shim last: JSON already references this path.
+    if let Some(parent) = shim_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(shim_path, shim_content).map_err(|e| e.to_string())?;
+    crate::path_install::make_executable(shim_path)?;
 
     Ok(())
 }
@@ -703,15 +706,7 @@ pub fn install_cursor_hooks_at(
         Err(e) => return Err(e.to_string()),
     };
 
-    // 2. Write the shim script so the executable referenced by
-    //    hooks.json is on disk by the time the JSON is written.
-    if let Some(parent) = shim_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(shim_path, cursor_shim_script(port)).map_err(|e| e.to_string())?;
-    crate::path_install::make_executable(shim_path)?;
-
-    // 3. Merge our hook entries into hooks.json, preserving any existing
+    // 2. Merge our hook entries into hooks.json, preserving any existing
     //    user entries (e.g. gleaner-cursor-upload).
     let expected = expected_cursor_hook_commands(shim_path);
 
@@ -757,12 +752,20 @@ pub fn install_cursor_hooks_at(
         }
     }
 
+    // 3. Write hooks.json first so a failure leaves no Cursor shim behind.
     if let Some(parent) = hooks_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(hooks_path, json).map_err(|e| e.to_string())?;
+
+    // 4. Shim last — JSON already references this path.
+    if let Some(parent) = shim_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(shim_path, cursor_shim_script(port)).map_err(|e| e.to_string())?;
+    crate::path_install::make_executable(shim_path)?;
 
     Ok(())
 }
@@ -1472,6 +1475,57 @@ mod tests {
         let result = install_cursor_hooks_at(7700, &hooks_path, &shim);
         assert!(result.is_err());
         assert!(!shim.exists(), "shim must not exist after failed install");
+    }
+
+    /// Valid JSON but the config file cannot be overwritten — no orphan shim.
+    /// Skipped when euid is 0: root ignores Unix permission bits and can still write.
+    #[cfg(unix)]
+    #[test]
+    fn install_nested_no_shim_when_config_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let shim = test_shim(dir.path());
+
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let result = install_hooks_at(7700, &path, &shim);
+        assert!(result.is_err(), "expected write failure, got: {result:?}");
+        assert!(
+            !shim.exists(),
+            "no orphan shim when config write fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_cursor_no_shim_when_hooks_json_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        let shim = dir.path().join("coach-cursor-hook.sh");
+
+        std::fs::write(
+            &hooks_path,
+            r#"{"version":1,"hooks":{}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&hooks_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let result = install_cursor_hooks_at(7700, &hooks_path, &shim);
+        assert!(result.is_err());
+        assert!(!shim.exists());
     }
 
     #[test]

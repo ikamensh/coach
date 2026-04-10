@@ -32,10 +32,11 @@
 - 2026-04-10: Frontend now threads `observer_capable_providers` from backend snapshot through TS types → store → SettingsPane UI; shows warning for non-observer providers in LLM mode; 4 regression tests
 - 2026-04-10: `path uninstall` and `path status` now accept `--dir` to match `path install --dir`; 1 integration roundtrip test added
 - 2026-04-10: `observer_does_not_fire_in_rules_mode` — **incorrect test, not a product bug**. Test never set `coach_mode = Rules` (default is `Llm`). Fixed by setting `EngineMode::Rules` on the test server state before the hook call. Verified on both macOS and Debian ARM64 VPS.
+- 2026-04-10: **Linux Stage 3 orphan-shim fix** — `install_nested_hooks` and `install_cursor_hooks_at` wrote shim before config; if config write failed (permissions, immutable, full disk), orphan `~/.coach/claude-hook.sh` remained. Fix: reordered to write config first, shim last. 2 new `#[cfg(unix)]` tests (skip on root).
 
 ## Authoritative Test Counts (2026-04-10)
-- **macOS + Debian ARM64 (identical):** 219 passed, 0 failed, 21 ignored
-  - coach-core unit: 171 passed, 15 ignored
+- **macOS:** 221 passed, 0 failed, 21 ignored
+  - coach-core unit: 173 passed, 15 ignored
   - cli_integration: 18 passed
   - hook_integration: 29 passed, 2 ignored
   - scenario_replay: 1 passed, 4 ignored
