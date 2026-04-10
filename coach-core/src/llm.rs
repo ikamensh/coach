@@ -914,6 +914,7 @@ mod live_tests {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
+            codex_hooks_user_enabled: false,
             mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
@@ -1126,6 +1127,7 @@ mod live_tests {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
+            codex_hooks_user_enabled: false,
             mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
@@ -1304,6 +1306,7 @@ mod live_tests {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
+            codex_hooks_user_enabled: false,
             mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,

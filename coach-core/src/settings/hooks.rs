@@ -43,8 +43,6 @@ pub fn claude_shim_path() -> PathBuf {
         .join("claude-hook.sh")
 }
 
-const CLAUDE_SHIM_FILENAME: &str = "claude-hook.sh";
-
 /// (Claude Code event name, URL slug under `/hook/`).
 const CLAUDE_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
@@ -79,12 +77,19 @@ fi
     )
 }
 
-pub fn expected_hook_commands(shim_path: &std::path::Path) -> Vec<(&'static str, String)> {
+fn expected_commands(
+    shim_path: &std::path::Path,
+    events: &[(&'static str, &'static str)],
+) -> Vec<(&'static str, String)> {
     let shim = shim_path.display().to_string();
-    CLAUDE_HOOK_EVENTS
+    events
         .iter()
         .map(|(event, slug)| (*event, format!("{shim} {slug}")))
         .collect()
+}
+
+pub fn expected_hook_commands(shim_path: &std::path::Path) -> Vec<(&'static str, String)> {
+    expected_commands(shim_path, CLAUDE_HOOK_EVENTS)
 }
 
 /// True if this hook entry has a `"type": "command"` whose command string
@@ -109,10 +114,9 @@ fn is_coach_command_entry(entry: &serde_json::Value, expected_cmd: &str) -> bool
         })
 }
 
-/// Broader check: is this a Coach-managed hook entry? Matches both the
-/// current shim-based command hooks and legacy HTTP hooks so both can be
-/// cleaned up during install/uninstall.
-fn is_managed_claude_entry(entry: &serde_json::Value) -> bool {
+/// Is this a Coach-managed nested-format hook entry? Matches command hooks
+/// referencing the given shim filename, and (for Claude) legacy HTTP hooks.
+fn is_managed_nested_entry(entry: &serde_json::Value, shim_filename: &str) -> bool {
     entry
         .get("hooks")
         .and_then(|h| h.as_array())
@@ -123,7 +127,7 @@ fn is_managed_claude_entry(entry: &serde_json::Value) -> bool {
                     && hook
                         .get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains(CLAUDE_SHIM_FILENAME));
+                        .is_some_and(|c| c.contains(shim_filename));
                 // Legacy: HTTP hook pointing at localhost/hook/*.
                 let is_legacy_http = hook.get("type").and_then(|t| t.as_str()) == Some("http")
                     && hook
@@ -142,15 +146,15 @@ pub fn check_hook_status(port: u16) -> HookStatus {
     check_hook_status_at(port, &claude_settings_path(), &claude_shim_path())
 }
 
-pub fn check_hook_status_at(
-    port: u16,
-    path: &std::path::Path,
+/// Shared status check for nested-format hooks (Claude Code & Codex).
+fn check_nested_status(
+    config_path: &std::path::Path,
     shim_path: &std::path::Path,
+    events: &[(&'static str, &'static str)],
 ) -> HookStatus {
-    let _ = port; // port is baked into the shim; we match by command string
-    let expected = expected_hook_commands(shim_path);
+    let expected = expected_commands(shim_path, events);
 
-    let settings: serde_json::Value = std::fs::read_to_string(path)
+    let settings: serde_json::Value = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null);
@@ -177,9 +181,18 @@ pub fn check_hook_status_at(
 
     HookStatus {
         installed: all_installed,
-        path: path.display().to_string(),
+        path: config_path.display().to_string(),
         hooks: entries,
     }
+}
+
+pub fn check_hook_status_at(
+    port: u16,
+    path: &std::path::Path,
+    shim_path: &std::path::Path,
+) -> HookStatus {
+    let _ = port;
+    check_nested_status(path, shim_path, CLAUDE_HOOK_EVENTS)
 }
 
 /// Merge coach hooks into ~/.claude/settings.json, preserving existing hooks.
@@ -208,19 +221,21 @@ pub fn sync_managed_hooks(port: u16, user_enabled: &mut bool) -> Result<Vec<Stri
     sync_managed_hooks_at(port, &claude_settings_path(), &claude_shim_path(), user_enabled)
 }
 
-pub fn sync_managed_hooks_at(
-    port: u16,
-    path: &std::path::Path,
+/// Shared sync logic for nested-format hooks.
+fn sync_nested_hooks(
+    config_path: &std::path::Path,
     shim_path: &std::path::Path,
+    shim_content: &str,
+    events: &'static [(&'static str, &'static str)],
     user_enabled: &mut bool,
+    check_legacy_http: bool,
 ) -> Result<Vec<String>, String> {
-    let status = check_hook_status_at(port, path, shim_path);
+    let status = check_nested_status(config_path, shim_path, events);
     let any_installed = status.hooks.iter().any(|h| h.installed);
 
-    // Legacy migration: hooks on disk but no recorded intent → adopt as
-    // opted-in. Also detect old-style HTTP hooks as "opted in" so they
-    // get migrated to command hooks.
-    if !*user_enabled && (any_installed || has_any_legacy_http_hooks(path)) {
+    if !*user_enabled
+        && (any_installed || (check_legacy_http && has_any_legacy_http_hooks(config_path)))
+    {
         *user_enabled = true;
     }
 
@@ -237,8 +252,24 @@ pub fn sync_managed_hooks_at(
     if missing.is_empty() {
         return Ok(vec![]);
     }
-    install_hooks_at(port, path, shim_path)?;
+    install_nested_hooks(config_path, shim_path, shim_content, events)?;
     Ok(missing)
+}
+
+pub fn sync_managed_hooks_at(
+    port: u16,
+    path: &std::path::Path,
+    shim_path: &std::path::Path,
+    user_enabled: &mut bool,
+) -> Result<Vec<String>, String> {
+    sync_nested_hooks(
+        path,
+        shim_path,
+        &claude_shim_script(port),
+        CLAUDE_HOOK_EVENTS,
+        user_enabled,
+        true, // Claude has legacy HTTP hooks to migrate
+    )
 }
 
 /// Returns true if the settings file has any legacy HTTP hooks pointing
@@ -270,31 +301,37 @@ fn has_any_legacy_http_hooks(path: &std::path::Path) -> bool {
     })
 }
 
-pub fn install_hooks_at(
-    port: u16,
-    path: &std::path::Path,
+/// Shared install logic for nested-format hooks (Claude Code & Codex).
+/// Writes the shim script, then merges hook entries into the config file.
+fn install_nested_hooks(
+    config_path: &std::path::Path,
     shim_path: &std::path::Path,
+    shim_content: &str,
+    events: &[(&'static str, &'static str)],
 ) -> Result<(), String> {
-    // 1. Write the shim script so the command referenced by settings.json
-    //    is on disk by the time the JSON is written.
+    let shim_filename = shim_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+
+    // 1. Write the shim script so the command is on disk before the JSON.
     if let Some(parent) = shim_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(shim_path, claude_shim_script(port)).map_err(|e| e.to_string())?;
+    std::fs::write(shim_path, shim_content).map_err(|e| e.to_string())?;
     crate::path_install::make_executable(shim_path)?;
 
-    // 2. Merge our command hook entries into settings.json, preserving
-    //    existing user entries. Legacy HTTP hooks are removed first.
-    let expected = expected_hook_commands(shim_path);
+    // 2. Merge hook entries into the config file, preserving user entries.
+    let expected = expected_commands(shim_path, events);
 
-    let mut settings: serde_json::Value = std::fs::read_to_string(path)
+    let mut settings: serde_json::Value = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::json!({}));
 
     let settings_obj = settings
         .as_object_mut()
-        .ok_or("Claude settings is not a JSON object")?;
+        .ok_or("config file is not a JSON object")?;
 
     if !settings_obj.contains_key("hooks") {
         settings_obj.insert("hooks".into(), serde_json::json!({}));
@@ -305,12 +342,10 @@ pub fn install_hooks_at(
         .and_then(|v| v.as_object_mut())
         .ok_or("hooks is not an object")?;
 
-    // Sweep legacy Coach entries from *all* events (not just managed
-    // ones) — e.g. SessionStart had an HTTP hook in older versions that
-    // was later removed from the managed set.
+    // Sweep stale Coach-managed entries from all events.
     for event_arr in hooks_obj.values_mut() {
         if let Some(arr) = event_arr.as_array_mut() {
-            arr.retain(|entry| !is_managed_claude_entry(entry));
+            arr.retain(|entry| !is_managed_nested_entry(entry, shim_filename));
         }
     }
 
@@ -330,14 +365,22 @@ pub fn install_hooks_at(
         }
     }
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
+    std::fs::write(config_path, json).map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+pub fn install_hooks_at(
+    port: u16,
+    path: &std::path::Path,
+    shim_path: &std::path::Path,
+) -> Result<(), String> {
+    install_nested_hooks(path, shim_path, &claude_shim_script(port), CLAUDE_HOOK_EVENTS)
 }
 
 /// Remove coach hooks from ~/.claude/settings.json, preserving everything else.
@@ -345,13 +388,17 @@ pub fn uninstall_hooks(port: u16) -> Result<(), String> {
     uninstall_hooks_at(port, &claude_settings_path(), &claude_shim_path())
 }
 
-pub fn uninstall_hooks_at(
-    port: u16,
-    path: &std::path::Path,
+/// Shared uninstall logic for nested-format hooks (Claude Code & Codex).
+fn uninstall_nested_hooks(
+    config_path: &std::path::Path,
     shim_path: &std::path::Path,
 ) -> Result<(), String> {
-    let _ = port;
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let shim_filename = shim_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+
+    let content = std::fs::read_to_string(config_path).map_err(|e| e.to_string())?;
     let mut settings: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| e.to_string())?;
 
@@ -360,14 +407,12 @@ pub fn uninstall_hooks_at(
         .and_then(|v| v.as_object_mut())
         .ok_or("No hooks object in settings")?;
 
-    // Remove both current command hooks and legacy HTTP hooks.
     for event_arr in hooks_obj.values_mut() {
         if let Some(arr) = event_arr.as_array_mut() {
-            arr.retain(|entry| !is_managed_claude_entry(entry));
+            arr.retain(|entry| !is_managed_nested_entry(entry, shim_filename));
         }
     }
 
-    // Clean up empty event arrays.
     let empty_events: Vec<String> = hooks_obj
         .iter()
         .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
@@ -378,12 +423,127 @@ pub fn uninstall_hooks_at(
     }
 
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
+    std::fs::write(config_path, json).map_err(|e| e.to_string())?;
 
-    // Best-effort: remove the shim script.
     let _ = std::fs::remove_file(shim_path);
 
     Ok(())
+}
+
+pub fn uninstall_hooks_at(
+    port: u16,
+    path: &std::path::Path,
+    shim_path: &std::path::Path,
+) -> Result<(), String> {
+    let _ = port;
+    uninstall_nested_hooks(path, shim_path)
+}
+
+// ── Codex CLI hooks (`~/.codex/hooks.json`, nested format like Claude) ───
+//
+// Codex CLI's hook system is modeled on Claude Code's: same event names,
+// same nested `{"hooks": [{"type": "command", ...}]}` entry format, same
+// stdin/stdout JSON protocol. The only differences are the config file
+// path and the route prefix in the shim script.
+
+fn codex_hooks_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("no home directory")
+        .join(".codex")
+        .join("hooks.json")
+}
+
+pub fn codex_shim_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("no home directory")
+        .join(".coach")
+        .join("codex-hook.sh")
+}
+
+/// Same events as Claude Code — Codex adopted the same hook lifecycle.
+const CODEX_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("PermissionRequest", "permission-request"),
+    ("Stop", "stop"),
+    ("PreToolUse", "pre-tool-use"),
+    ("PostToolUse", "post-tool-use"),
+    ("UserPromptSubmit", "user-prompt-submit"),
+];
+
+fn codex_shim_script(port: u16) -> String {
+    format!(
+        r#"#!/bin/sh
+# Auto-generated by Coach — forwards hook events to the Coach server.
+resp=$(curl -sS --connect-timeout 2 -X POST "http://127.0.0.1:{port}/codex/hook/$1" \
+     -H "Content-Type: application/json" \
+     --data-binary @- 2>/dev/null)
+if [ $? -eq 0 ]; then
+    printf '%s' "$resp"
+else
+    case "$1" in
+        stop|user-prompt-submit)
+            printf '{{"systemMessage":"Coach is offline"}}' ;;
+    esac
+fi
+"#,
+    )
+}
+
+pub fn check_codex_hook_status() -> HookStatus {
+    check_codex_hook_status_at(&codex_hooks_path(), &codex_shim_path())
+}
+
+pub fn check_codex_hook_status_at(
+    hooks_path: &std::path::Path,
+    shim_path: &std::path::Path,
+) -> HookStatus {
+    check_nested_status(hooks_path, shim_path, CODEX_HOOK_EVENTS)
+}
+
+pub fn install_codex_hooks(port: u16) -> Result<(), String> {
+    install_codex_hooks_at(port, &codex_hooks_path(), &codex_shim_path())
+}
+
+pub fn install_codex_hooks_at(
+    port: u16,
+    hooks_path: &std::path::Path,
+    shim_path: &std::path::Path,
+) -> Result<(), String> {
+    install_nested_hooks(hooks_path, shim_path, &codex_shim_script(port), CODEX_HOOK_EVENTS)
+}
+
+pub fn uninstall_codex_hooks() -> Result<(), String> {
+    uninstall_codex_hooks_at(&codex_hooks_path(), &codex_shim_path())
+}
+
+pub fn uninstall_codex_hooks_at(
+    hooks_path: &std::path::Path,
+    shim_path: &std::path::Path,
+) -> Result<(), String> {
+    uninstall_nested_hooks(hooks_path, shim_path)
+}
+
+pub fn sync_managed_codex_hooks(
+    port: u16,
+    user_enabled: &mut bool,
+) -> Result<Vec<String>, String> {
+    sync_managed_codex_hooks_at(port, &codex_hooks_path(), &codex_shim_path(), user_enabled)
+}
+
+pub fn sync_managed_codex_hooks_at(
+    port: u16,
+    hooks_path: &std::path::Path,
+    shim_path: &std::path::Path,
+    user_enabled: &mut bool,
+) -> Result<Vec<String>, String> {
+    sync_nested_hooks(
+        hooks_path,
+        shim_path,
+        &codex_shim_script(port),
+        CODEX_HOOK_EVENTS,
+        user_enabled,
+        false, // Codex has no legacy HTTP hooks
+    )
 }
 
 // ── Cursor Agent hooks (`~/.cursor/hooks.json`, `command` + stdin JSON) ──
@@ -687,6 +847,8 @@ pub fn cleanup_hooks_on_exit() {
         &Settings::load(),
         &claude_settings_path(),
         &claude_shim_path(),
+        &codex_hooks_path(),
+        &codex_shim_path(),
         &cursor_hooks_path(),
         &cursor_shim_path(),
     );
@@ -697,6 +859,8 @@ pub fn cleanup_hooks_on_exit_at(
     settings: &Settings,
     claude_path: &std::path::Path,
     claude_shim: &std::path::Path,
+    codex_path: &std::path::Path,
+    codex_shim: &std::path::Path,
     cursor_path: &std::path::Path,
     cursor_shim: &std::path::Path,
 ) {
@@ -709,6 +873,12 @@ pub fn cleanup_hooks_on_exit_at(
             Err(e) => eprintln!("[coach] cleanup: Claude hook removal failed: {e}"),
         }
     }
+    if settings.codex_hooks_user_enabled && codex_path.exists() {
+        match uninstall_codex_hooks_at(codex_path, codex_shim) {
+            Ok(()) => eprintln!("[coach] cleanup: removed Codex hooks"),
+            Err(e) => eprintln!("[coach] cleanup: Codex hook removal failed: {e}"),
+        }
+    }
     if settings.cursor_hooks_user_enabled && cursor_path.exists() {
         match uninstall_cursor_hooks_at(cursor_path, cursor_shim) {
             Ok(()) => eprintln!("[coach] cleanup: removed Cursor hooks"),
@@ -716,6 +886,11 @@ pub fn cleanup_hooks_on_exit_at(
         }
     }
 }
+
+#[cfg(test)]
+const CLAUDE_SHIM_FILENAME: &str = "claude-hook.sh";
+#[cfg(test)]
+const CODEX_SHIM_FILENAME: &str = "codex-hook.sh";
 
 #[cfg(test)]
 mod tests {
@@ -753,14 +928,14 @@ mod tests {
         assert!(!has_command_hook(&entries, "http://localhost:7700/hook/stop"));
     }
 
-    // ── is_managed_claude_entry ─────────────────────────────────────────
+    // ── is_managed_nested_entry ───────────────────────────────────────
 
     #[test]
     fn is_managed_detects_shim_command() {
         let entry = serde_json::json!({
             "hooks": [{"type": "command", "command": "/home/u/.coach/claude-hook.sh stop"}]
         });
-        assert!(is_managed_claude_entry(&entry));
+        assert!(is_managed_nested_entry(&entry, CLAUDE_SHIM_FILENAME));
     }
 
     #[test]
@@ -768,7 +943,7 @@ mod tests {
         let entry = serde_json::json!({
             "hooks": [{"type": "http", "url": "http://localhost:7700/hook/stop"}]
         });
-        assert!(is_managed_claude_entry(&entry));
+        assert!(is_managed_nested_entry(&entry, CLAUDE_SHIM_FILENAME));
     }
 
     #[test]
@@ -776,7 +951,7 @@ mod tests {
         let entry = serde_json::json!({
             "hooks": [{"type": "command", "command": "echo stopped"}]
         });
-        assert!(!is_managed_claude_entry(&entry));
+        assert!(!is_managed_nested_entry(&entry, CLAUDE_SHIM_FILENAME));
     }
 
     // ── Helper: temp shim path for tests ────────────────────────────────
@@ -1082,38 +1257,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let claude = dir.path().join("claude_settings.json");
         let claude_shim = dir.path().join(CLAUDE_SHIM_FILENAME);
+        let codex = dir.path().join("codex_hooks.json");
+        let codex_shim = dir.path().join(CODEX_SHIM_FILENAME);
         let cursor_hooks = dir.path().join("cursor_hooks.json");
         let cursor_shim = dir.path().join("coach-cursor-hook.sh");
 
-        // User opts in to both surfaces.
+        // User opts in to all surfaces.
         install_hooks_at(7700, &claude, &claude_shim).unwrap();
+        install_codex_hooks_at(7700, &codex, &codex_shim).unwrap();
         install_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim).unwrap();
         let original_claude = std::fs::read_to_string(&claude).unwrap();
+        let original_codex = std::fs::read_to_string(&codex).unwrap();
         let original_cursor = std::fs::read_to_string(&cursor_hooks).unwrap();
 
         // Simulate app shutdown with auto-uninstall enabled.
         let settings = Settings {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: true,
+            codex_hooks_user_enabled: true,
             cursor_hooks_user_enabled: true,
             port: 7700,
             ..Settings::default()
         };
-        cleanup_hooks_on_exit_at(&settings, &claude, &claude_shim, &cursor_hooks, &cursor_shim);
+        cleanup_hooks_on_exit_at(
+            &settings, &claude, &claude_shim, &codex, &codex_shim,
+            &cursor_hooks, &cursor_shim,
+        );
 
-        // After cleanup, neither file should still contain managed hooks.
+        // After cleanup, no file should still contain managed hooks.
         assert!(!check_hook_status_at(7700, &claude, &claude_shim).installed);
+        assert!(!check_codex_hook_status_at(&codex, &codex_shim).installed);
         assert!(!check_cursor_hook_status_at(&cursor_hooks, &cursor_shim).installed);
 
         // Simulate next startup: sync re-installs based on intent flags.
         let mut hooks_intent = true;
+        let mut codex_intent = true;
         let mut cursor_intent = true;
         sync_managed_hooks_at(7700, &claude, &claude_shim, &mut hooks_intent).unwrap();
+        sync_managed_codex_hooks_at(7700, &codex, &codex_shim, &mut codex_intent).unwrap();
         sync_managed_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim, &mut cursor_intent)
             .unwrap();
 
         // The end state should be byte-equivalent to the original install.
         assert_eq!(std::fs::read_to_string(&claude).unwrap(), original_claude);
+        assert_eq!(std::fs::read_to_string(&codex).unwrap(), original_codex);
         assert_eq!(std::fs::read_to_string(&cursor_hooks).unwrap(), original_cursor);
     }
 
@@ -1124,22 +1311,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let claude = dir.path().join("claude_settings.json");
         let claude_shim = dir.path().join(CLAUDE_SHIM_FILENAME);
+        let codex = dir.path().join("codex_hooks.json");
+        let codex_shim = dir.path().join(CODEX_SHIM_FILENAME);
         let cursor_hooks = dir.path().join("cursor_hooks.json");
         let cursor_shim = dir.path().join("coach-cursor-hook.sh");
 
         install_hooks_at(7700, &claude, &claude_shim).unwrap();
+        install_codex_hooks_at(7700, &codex, &codex_shim).unwrap();
         install_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim).unwrap();
 
         let settings = Settings {
             auto_uninstall_hooks_on_exit: false,
             hooks_user_enabled: true,
+            codex_hooks_user_enabled: true,
             cursor_hooks_user_enabled: true,
             port: 7700,
             ..Settings::default()
         };
-        cleanup_hooks_on_exit_at(&settings, &claude, &claude_shim, &cursor_hooks, &cursor_shim);
+        cleanup_hooks_on_exit_at(
+            &settings, &claude, &claude_shim, &codex, &codex_shim,
+            &cursor_hooks, &cursor_shim,
+        );
 
         assert!(check_hook_status_at(7700, &claude, &claude_shim).installed);
+        assert!(check_codex_hook_status_at(&codex, &codex_shim).installed);
         assert!(check_cursor_hook_status_at(&cursor_hooks, &cursor_shim).installed);
     }
 
@@ -1149,23 +1344,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let claude = dir.path().join("claude_settings.json");
         let claude_shim = dir.path().join(CLAUDE_SHIM_FILENAME);
+        let codex = dir.path().join("codex_hooks.json");
+        let codex_shim = dir.path().join(CODEX_SHIM_FILENAME);
         let cursor_hooks = dir.path().join("cursor_hooks.json");
         let cursor_shim = dir.path().join("coach-cursor-hook.sh");
 
         install_hooks_at(7700, &claude, &claude_shim).unwrap();
+        install_codex_hooks_at(7700, &codex, &codex_shim).unwrap();
         install_cursor_hooks_at(7700, &cursor_hooks, &cursor_shim).unwrap();
+        let codex_before = std::fs::read_to_string(&codex).unwrap();
         let cursor_before = std::fs::read_to_string(&cursor_hooks).unwrap();
 
         let settings = Settings {
             auto_uninstall_hooks_on_exit: true,
             hooks_user_enabled: true,
+            codex_hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
             port: 7700,
             ..Settings::default()
         };
-        cleanup_hooks_on_exit_at(&settings, &claude, &claude_shim, &cursor_hooks, &cursor_shim);
+        cleanup_hooks_on_exit_at(
+            &settings, &claude, &claude_shim, &codex, &codex_shim,
+            &cursor_hooks, &cursor_shim,
+        );
 
         assert!(!check_hook_status_at(7700, &claude, &claude_shim).installed);
+        assert_eq!(std::fs::read_to_string(&codex).unwrap(), codex_before);
         assert_eq!(std::fs::read_to_string(&cursor_hooks).unwrap(), cursor_before);
     }
 }

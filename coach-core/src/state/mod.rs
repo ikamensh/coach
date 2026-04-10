@@ -187,6 +187,7 @@ pub enum SessionClient {
     #[default]
     Claude,
     Cursor,
+    Codex,
 }
 
 /// Per-window state. The owning `CoachState.sessions` map is keyed by
@@ -299,6 +300,8 @@ pub struct CoachState {
     pub hooks_user_enabled: bool,
     /// Same, for Cursor Agent hooks.
     pub cursor_hooks_user_enabled: bool,
+    /// Same, for Codex CLI hooks.
+    pub codex_hooks_user_enabled: bool,
     /// When set, `llm::session_send` returns this function's result instead
     /// of calling a real provider. Used by scenario replay tests.
     pub mock_session_send: Option<MockSessionSend>,
@@ -364,6 +367,7 @@ impl CoachState {
             auto_uninstall_hooks_on_exit: settings.auto_uninstall_hooks_on_exit,
             hooks_user_enabled: settings.hooks_user_enabled,
             cursor_hooks_user_enabled: settings.cursor_hooks_user_enabled,
+            codex_hooks_user_enabled: settings.codex_hooks_user_enabled,
             mock_session_send: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
@@ -389,6 +393,7 @@ impl CoachState {
             auto_uninstall_hooks_on_exit: self.auto_uninstall_hooks_on_exit,
             hooks_user_enabled: self.hooks_user_enabled,
             cursor_hooks_user_enabled: self.cursor_hooks_user_enabled,
+            codex_hooks_user_enabled: self.codex_hooks_user_enabled,
         }
     }
 
@@ -601,6 +606,7 @@ pub(crate) fn test_state() -> CoachState {
         auto_uninstall_hooks_on_exit: true,
         hooks_user_enabled: false,
         cursor_hooks_user_enabled: false,
+        codex_hooks_user_enabled: false,
         mock_session_send: None,
         #[cfg(feature = "pycoach")]
         pycoach: None,
@@ -1048,6 +1054,7 @@ mod tests {
             auto_uninstall_hooks_on_exit: false,
             hooks_user_enabled: true,
             cursor_hooks_user_enabled: true,
+            codex_hooks_user_enabled: true,
         };
 
         // Round-trip via from_settings/to_settings — exercises the full
@@ -1071,6 +1078,10 @@ mod tests {
         assert_eq!(
             restored.cursor_hooks_user_enabled,
             original.cursor_hooks_user_enabled
+        );
+        assert_eq!(
+            restored.codex_hooks_user_enabled,
+            original.codex_hooks_user_enabled
         );
     }
 

@@ -83,6 +83,9 @@ pub struct Settings {
     /// Same idea, for Cursor Agent hooks.
     #[serde(default)]
     pub cursor_hooks_user_enabled: bool,
+    /// Same idea, for Codex CLI hooks.
+    #[serde(default)]
+    pub codex_hooks_user_enabled: bool,
 }
 
 fn default_model() -> ModelConfig {
@@ -150,6 +153,7 @@ impl Default for Settings {
             auto_uninstall_hooks_on_exit: default_true(),
             hooks_user_enabled: false,
             cursor_hooks_user_enabled: false,
+            codex_hooks_user_enabled: false,
         }
     }
 }
@@ -295,6 +299,7 @@ mod tests {
             auto_uninstall_hooks_on_exit: false,
             hooks_user_enabled: true,
             cursor_hooks_user_enabled: true,
+            codex_hooks_user_enabled: true,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -316,6 +321,10 @@ mod tests {
         assert_eq!(
             restored.cursor_hooks_user_enabled,
             original.cursor_hooks_user_enabled
+        );
+        assert_eq!(
+            restored.codex_hooks_user_enabled,
+            original.codex_hooks_user_enabled
         );
     }
 
@@ -339,5 +348,6 @@ mod tests {
         assert!(from_json.auto_uninstall_hooks_on_exit);
         assert!(!from_json.hooks_user_enabled);
         assert!(!from_json.cursor_hooks_user_enabled);
+        assert!(!from_json.codex_hooks_user_enabled);
     }
 }

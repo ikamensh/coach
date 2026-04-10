@@ -20,7 +20,7 @@ interface ActivityEntry {
   detail: string | null;
 }
 
-type SessionClient = "claude" | "cursor";
+type SessionClient = "claude" | "cursor" | "codex";
 
 interface CoachUsage {
   input_tokens: number;
@@ -119,6 +119,7 @@ interface CoachState {
   engineMode: EngineMode;
   rules: CoachRule[];
   hookStatus: HookStatus | null;
+  codexHookStatus: HookStatus | null;
   cursorHookStatus: HookStatus | null;
   pathStatus: PathStatus | null;
   autoUninstallHooksOnExit: boolean;
@@ -149,6 +150,9 @@ interface CoachActions {
   refreshHookStatus: () => Promise<void>;
   installHooks: () => Promise<void>;
   uninstallHooks: () => Promise<void>;
+  refreshCodexHookStatus: () => Promise<void>;
+  installCodexHooks: () => Promise<void>;
+  uninstallCodexHooks: () => Promise<void>;
   refreshCursorHookStatus: () => Promise<void>;
   installCursorHooks: () => Promise<void>;
   uninstallCursorHooks: () => Promise<void>;
@@ -186,6 +190,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   engineMode: "rules",
   rules: [],
   hookStatus: null,
+  codexHookStatus: null,
   cursorHookStatus: null,
   pathStatus: null,
   autoUninstallHooksOnExit: true,
@@ -221,6 +226,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
     }
 
     get().refreshHookStatus();
+    get().refreshCodexHookStatus();
     get().refreshCursorHookStatus();
     get().refreshPathStatus();
 
@@ -346,6 +352,21 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   uninstallHooks: async () => {
     const hookStatus = await invoke<HookStatus>("uninstall_hooks");
     set({ hookStatus });
+  },
+
+  refreshCodexHookStatus: async () => {
+    const codexHookStatus = await invoke<HookStatus>("get_codex_hook_status");
+    set({ codexHookStatus });
+  },
+
+  installCodexHooks: async () => {
+    const codexHookStatus = await invoke<HookStatus>("install_codex_hooks");
+    set({ codexHookStatus });
+  },
+
+  uninstallCodexHooks: async () => {
+    const codexHookStatus = await invoke<HookStatus>("uninstall_codex_hooks");
+    set({ codexHookStatus });
   },
 
   refreshCursorHookStatus: async () => {

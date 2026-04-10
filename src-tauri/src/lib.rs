@@ -65,6 +65,13 @@ pub fn run() {
                 Ok(_) => {}
                 Err(e) => eprintln!("[coach] setup: Claude hook sync failed: {e}"),
             }
+            match settings::sync_managed_codex_hooks(port, &mut settings.codex_hooks_user_enabled) {
+                Ok(added) if !added.is_empty() => {
+                    eprintln!("[coach] setup: synced Codex hooks: {added:?}");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[coach] setup: Codex hook sync failed: {e}"),
+            }
             match settings::sync_managed_cursor_hooks(port, &mut settings.cursor_hooks_user_enabled)
             {
                 Ok(added) if !added.is_empty() => {
@@ -118,6 +125,9 @@ pub fn run() {
             commands::get_hook_status,
             commands::install_hooks,
             commands::uninstall_hooks,
+            commands::get_codex_hook_status,
+            commands::install_codex_hooks,
+            commands::uninstall_codex_hooks,
             commands::get_cursor_hook_status,
             commands::install_cursor_hooks,
             commands::uninstall_cursor_hooks,

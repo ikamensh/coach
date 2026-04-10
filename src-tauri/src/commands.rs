@@ -225,6 +225,39 @@ pub async fn uninstall_hooks(
 }
 
 #[tauri::command]
+pub async fn get_codex_hook_status(
+    _state: tauri::State<'_, SharedState>,
+) -> Result<HookStatus, String> {
+    Ok(settings::check_codex_hook_status())
+}
+
+#[tauri::command]
+pub async fn install_codex_hooks(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+) -> Result<HookStatus, String> {
+    let mut s = state.write().await;
+    s.codex_hooks_user_enabled = true;
+    s.save();
+    settings::install_codex_hooks(s.port)?;
+    emit_snapshot(&app, &s)?;
+    Ok(settings::check_codex_hook_status())
+}
+
+#[tauri::command]
+pub async fn uninstall_codex_hooks(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+) -> Result<HookStatus, String> {
+    let mut s = state.write().await;
+    s.codex_hooks_user_enabled = false;
+    s.save();
+    settings::uninstall_codex_hooks()?;
+    emit_snapshot(&app, &s)?;
+    Ok(settings::check_codex_hook_status())
+}
+
+#[tauri::command]
 pub async fn get_cursor_hook_status(
     _state: tauri::State<'_, SharedState>,
 ) -> Result<HookStatus, String> {

@@ -11,6 +11,15 @@ const HOOK_DESCRIPTIONS: Record<string, string> = {
   SessionStart: "Detects /clear, /resume, /compact instantly so the session row swaps to the new conversation without waiting for the next tool call",
 };
 
+const CODEX_HOOK_DESCRIPTIONS: Record<string, string> = {
+  SessionStart: "Detects new conversations and /clear",
+  PermissionRequest: "Auto-approves tool use when you're away",
+  Stop: "When away, tells Codex to keep working with your priorities",
+  PreToolUse: "Tracks agent spawns for worktree badges",
+  PostToolUse: "Tracks session activity (observation only)",
+  UserPromptSubmit: "Marks user turns on the activity timeline",
+};
+
 const CURSOR_HOOK_DESCRIPTIONS: Record<string, string> = {
   sessionStart: "Session boundaries (new agent run / conversation)",
   beforeSubmitPrompt: "User prompt turns on the activity timeline",
@@ -99,11 +108,14 @@ function HookSection({
 
 export function HooksPane() {
   const hookStatus = useCoachStore((s) => s.hookStatus);
+  const codexHookStatus = useCoachStore((s) => s.codexHookStatus);
   const cursorHookStatus = useCoachStore((s) => s.cursorHookStatus);
   const pathStatus = useCoachStore((s) => s.pathStatus);
   const setView = useCoachStore((s) => s.setView);
   const installHooks = useCoachStore((s) => s.installHooks);
   const uninstallHooks = useCoachStore((s) => s.uninstallHooks);
+  const installCodexHooks = useCoachStore((s) => s.installCodexHooks);
+  const uninstallCodexHooks = useCoachStore((s) => s.uninstallCodexHooks);
   const installCursorHooks = useCoachStore((s) => s.installCursorHooks);
   const uninstallCursorHooks = useCoachStore((s) => s.uninstallCursorHooks);
   const installPath = useCoachStore((s) => s.installPath);
@@ -137,19 +149,12 @@ export function HooksPane() {
       <TopBar title="Setup" onBack={() => setView("main")} />
 
       <p className="text-sm text-zinc-500 dark:text-zinc-400">
-        Coach can integrate with{" "}
-        <span className="font-medium text-zinc-700 dark:text-zinc-300">
-          Claude Code
-        </span>{" "}
-        (HTTP hooks in <code className="font-mono text-xs">~/.claude/settings.json</code>) and{" "}
-        <span className="font-medium text-zinc-700 dark:text-zinc-300">
-          Cursor Agent
-        </span>{" "}
-        (a small shim script{" "}
-        <code className="font-mono text-xs">~/.cursor/coach-cursor-hook.sh</code>{" "}
-        referenced from <code className="font-mono text-xs">~/.cursor/hooks.json</code> —
-        Cursor's hook runner blocks raw <code className="font-mono text-xs">curl</code>{" "}
-        commands). Existing entries are preserved.
+        Coach integrates with{" "}
+        <span className="font-medium text-zinc-700 dark:text-zinc-300">Claude Code</span>,{" "}
+        <span className="font-medium text-zinc-700 dark:text-zinc-300">Codex CLI</span>, and{" "}
+        <span className="font-medium text-zinc-700 dark:text-zinc-300">Cursor Agent</span>{" "}
+        via hook scripts that forward events to Coach's local server.
+        Existing entries are preserved.
       </p>
 
       <label className="flex items-start gap-2 cursor-pointer select-none">
@@ -178,6 +183,18 @@ export function HooksPane() {
           onInstall={installHooks}
           onUninstall={uninstallHooks}
         />
+      )}
+
+      {codexHookStatus && (
+        <div className="border-t border-zinc-200 dark:border-zinc-800 pt-4 mt-2">
+          <HookSection
+            label="Codex CLI"
+            status={codexHookStatus}
+            descriptions={CODEX_HOOK_DESCRIPTIONS}
+            onInstall={installCodexHooks}
+            onUninstall={uninstallCodexHooks}
+          />
+        </div>
       )}
 
       {cursorHookStatus && (
