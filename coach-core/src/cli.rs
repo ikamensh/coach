@@ -43,8 +43,8 @@ COMMANDS:
     hooks cursor uninstall                 remove Coach-managed Cursor hook entries
 
     path install [--dir DIR]               install a `coach` shim on PATH
-    path uninstall                         remove the PATH shim
-    path status                            show PATH shim status
+    path uninstall [--dir DIR]             remove the PATH shim
+    path status [--dir DIR]                show PATH shim status
 
     config get [<key>]                     read settings
     config set priorities <a,b,c>          replace priorities list
@@ -326,12 +326,25 @@ fn cmd_path(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "uninstall" => {
-            let status = path_install::uninstall()?;
+            let dir_override = parse_named_string(&args[1..], "--dir")?;
+            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+            let dir = match dir_override {
+                Some(d) => std::path::PathBuf::from(d),
+                None => path_install::default_install_dir()?,
+            };
+            path_install::uninstall_at(&dir)?;
+            let status = path_install::status_at(&dir, &exe);
             println!("removed: {}", status.install_path);
             Ok(())
         }
         "status" => {
-            let status = path_install::status()?;
+            let dir_override = parse_named_string(&args[1..], "--dir")?;
+            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+            let dir = match dir_override {
+                Some(d) => std::path::PathBuf::from(d),
+                None => path_install::default_install_dir()?,
+            };
+            let status = path_install::status_at(&dir, &exe);
             println!("install path:    {}", status.install_path);
             println!("installed:       {}", status.installed);
             if let Some(t) = &status.target {
@@ -679,7 +692,7 @@ fn require_server(port: u16) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Coach is not running on port {port}. Start the GUI first."
+            "Coach is not running on port {port}. Start it with `coach serve` or launch the GUI."
         ))
     }
 }
@@ -810,5 +823,21 @@ mod tests {
     fn parse_named_u32_no_value_errors() {
         let args = vec!["--pid".to_string()];
         assert!(parse_named_u32(&args, "--pid").is_err());
+    }
+
+    /// `require_server` error message should mention both `coach serve` and the GUI,
+    /// so headless users aren't told to "Start the GUI first".
+    #[test]
+    fn require_server_error_mentions_serve_and_gui() {
+        // Use an unlikely port so nothing is actually listening.
+        let err = require_server(19999).unwrap_err();
+        assert!(
+            err.contains("coach serve"),
+            "error should mention `coach serve` for headless users: {err}"
+        );
+        assert!(
+            err.contains("GUI"),
+            "error should still mention the GUI option: {err}"
+        );
     }
 }

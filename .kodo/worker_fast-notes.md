@@ -8,7 +8,8 @@
 ## Verify
 
 - Strict clippy: `cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings`.
-- Rust tests: `cargo test` (repo root) — 209 passed, 21 ignored in a baseline run (2026-04-10); `cargo test --all-features` adds `pycoach_sidecar` when `uv` + sibling `ilya/pycoach` available.
+- Rust tests: `cargo test --workspace` (repo root) — **219** passed, **21** ignored (2026-04-10); `cargo test --all-features` adds `pycoach_sidecar` when `uv` + sibling `ilya/pycoach` available. Vitest: **`npm test`** — **35** tests, **3** files.
+- **Kodo run `20260410_135005`:** consolidated test report at **`~/.kodo/runs/20260410_135005/test-report.md`** (stages 1–6, fixes vs remaining findings).
 - Optional sidecar only: `cargo test --features pycoach --test pycoach_sidecar`.
 - Frontend: repo root `npm test`, `npm run build`.
 - **Discovery (Stage 1):** `.kodo/test-report.md` (setup + CLI smoke), `.kodo/test-coverage.md` (coverage matrix; Codex HTTP routes pending in tests).
@@ -28,7 +29,7 @@
 ### Hook install integrity (Stage 4, 2026-04-10)
 
 - **`hooks install` / `hooks cursor install`:** If Claude `settings.json` or Cursor `hooks.json` already exists but is **syntax-invalid JSON**, install **fails (exit 1)**, stderr explains parse error, **file bytes unchanged**, **no shim** written (validation runs **before** shim + merge — avoids orphaned `~/.coach/claude-hook.sh` / `coach-cursor-hook.sh`).
-- **Still not fixed (UX):** `path uninstall` only removes the **default** shim (`~/.local/bin/coach`); custom **`path install --dir`** shims remain — document in tester notes, not a hook-merge bug.
+- **`path status` / `path uninstall` (Stage 6):** **`--dir <DIR>`** inspects or removes the shim in that directory (pairs with **`path install --dir`**). Without **`--dir`**, behavior is the default install dir only (`~/.local/bin` on macOS).
 
 ## Prompts
 
@@ -39,7 +40,8 @@
 - **No `config list`:** `coach config list` → `usage: coach config <get|set>`. “List” settings with **`coach config get`** (full JSON) or **`coach config get all`**, or keyed **`priorities` / `model` / `coach-mode` / `port` / `rules`**.
 - **Reads vs writes:** **`config get` always loads `~/.coach/settings.json`** (`Settings::load`). **`config set`** uses **HTTP** to `/api/config/...` when `http://127.0.0.1:{port}/version` succeeds, else **writes the file** — tested with **daemon down** (file path only). If Coach is running, expect **`config get` to reflect disk**, not necessarily the same probe as `coach status` (HTTP snapshot).
 - **`coach-mode` output:** `config get coach-mode` prints **Rust `Debug`** (`Llm`, `Rules`); **`config set`** expects lowercase **`rules` \| `llm`**.
-- **`path status`:** **`matches_running`** is false if `~/.local/bin/coach` points at a **different** binary than the one you invoked (e.g. shim → `/Applications/Coach.app/...` vs workspace `target/release/coach`). **`path install --dir <dir>`** puts a symlink at `<dir>/coach` → `current_exe()`; **`path status`** still reports the **default** install dir only (`~/.local/bin` on macOS).
+- **`path status`:** **`matches_running`** is false if the shim under the chosen dir (default or **`--dir`**) points at a **different** binary than the one you invoked (e.g. shim → `/Applications/Coach.app/...` vs workspace `target/release/coach`). **`path install --dir <dir>`** puts a symlink at `<dir>/coach` → `current_exe()`; use **`path status --dir`** for that tree.
+- **Offline / daemon down:** `coach status` (and anything that **`require_server`**) errors with **`Start it with \`coach serve\` or launch the GUI`** — not “start the GUI first” only.
 - **E2E nits:** `coach config get <key> …` **ignores** trailing extra args (no error). **`coach path`** with no subcommand behaves like **`path status`** (undocumented). **`serve --port N`** **persists** `port` to `~/.coach/settings.json` before bind — can surprise one-off runs.
 
 ## Security / CLI (quick reference)

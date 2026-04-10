@@ -348,6 +348,50 @@ fn cli_path_install_creates_shim_in_chosen_dir() {
     }
 }
 
+/// Regression: `path uninstall --dir` must remove a shim previously
+/// installed with `path install --dir`, and `path status --dir` must
+/// reflect the change.
+#[test]
+fn cli_path_install_then_uninstall_roundtrip_with_custom_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let bin_dir = home.join("custom-bin");
+
+    // Install into custom dir.
+    let (code, _stdout, stderr) = run_coach(
+        &["path", "install", "--dir", bin_dir.to_str().unwrap()],
+        home,
+    );
+    assert_eq!(code, 0, "install failed: {stderr}");
+    let shim = bin_dir.join("coach");
+    assert!(shim.exists(), "shim must exist after install");
+
+    // Status with --dir must report installed.
+    let (code, stdout, stderr) = run_coach(
+        &["path", "status", "--dir", bin_dir.to_str().unwrap()],
+        home,
+    );
+    assert_eq!(code, 0, "status failed: {stderr}");
+    assert!(stdout.contains("installed:       true"), "status stdout: {stdout}");
+
+    // Uninstall from the same custom dir.
+    let (code, stdout, stderr) = run_coach(
+        &["path", "uninstall", "--dir", bin_dir.to_str().unwrap()],
+        home,
+    );
+    assert_eq!(code, 0, "uninstall failed: {stderr}");
+    assert!(stdout.contains("removed:"), "stdout: {stdout}");
+    assert!(!shim.exists(), "shim must be gone after uninstall");
+
+    // Status must now report not installed.
+    let (code, stdout, _) = run_coach(
+        &["path", "status", "--dir", bin_dir.to_str().unwrap()],
+        home,
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("installed:       false"), "status stdout: {stdout}");
+}
+
 // ── sessions list via CLI ──────────────────────────────────────────────
 
 /// Smoke test: `coach sessions list` runs to completion regardless of

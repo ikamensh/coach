@@ -2,20 +2,60 @@
 
 Tracked across `kodo test` runs.
 
-**Baseline run**: 2026-04-10 — 591 pass (211 Rust + 380 Vitest), 0 fail, 21 ignored (see `test-report.md` for details)
+**Baseline run**: 2026-04-10 — **254** pass (**219** Rust + **35** Vitest), 0 fail, **21** ignored (`cargo test --workspace` + `npm test`). *(Earlier docs listed inflated Vitest counts when `vitest` picked up duplicate `*.test.ts` under **`.claude/worktrees/`**; `vite.config.ts` excludes that path.)* **CLI E2E re-verify:** `cargo build --release -p coach`; isolated `HOME` + `settings.json` `{"port":1}` — `coach status` down prints **`Start it with \`coach serve\` or launch the GUI`**; `coach serve --port` then `coach status` exit 0; **`path status|uninstall --dir`** custom-dir roundtrip. **Stage 5 re-verify:** `npm test` green; `cargo test --workspace` **219** passed / **21** ignored.
 
 **CLI E2E (config + path)**: 2026-04-10 — `target/release/coach`; Coach daemon **not** on port 7700 (file-backed `config set`); settings restored from backup after mutations.
 
 **HTTP server E2E (binary, hooks + CLI)**: 2026-04-10 — `target/release/coach serve --port <PORT>` on localhost; **`curl`** to Claude `/hook/...`, Cursor `/cursor/hook/...`, Codex `/codex/hook/...`; verified with **`coach status`** + **`GET /api/state`**. **`coach sessions list`** exercised separately — lists **on-disk saved transcripts**, not hook server memory (see findings row).
 
 ## Test Entrypoints
-- **TS**: `npm run test` → vitest, 36 files (380 tests) in `src/components/*.test.ts`
-- **Rust**: `cargo test --workspace` → 211 tests across coach-core unit, cli_integration, hook_integration, scenario_replay
-- **Ignored**: 21 tests need live API keys or external processes (see test-report.md)
+- **TS**: `npm run test` → vitest, **3** files (**35** tests): `ActivityBar.test.ts`, `SessionList.test.ts`, `SettingsPane.test.ts` under `src/components/`. Vitest config excludes **`**/.claude/**`** so Claude Code worktrees do not duplicate tests.
+- **Rust**: `cargo test --workspace` → **219** tests (coach-core, hook_integration, cli_integration, scenario_replay, etc.), **21** ignored
+- **Ignored**: 21 Rust tests need live API keys or external processes (see test-report.md)
+
+## Stage 5 — Frontend (build + Vitest)
+
+**`package.json` scripts relevant to validation:** `build` (`tsc -b tsconfig.app.json && vite build`), `test` (`vitest run`), `dev` (Vite only — no Tauri). There is **no** `lint` script; type safety is **`tsc`** via `build`.
+
+**Test layout (repo):** only **`src/components/ActivityBar.test.ts`**, **`SessionList.test.ts`**, **`SettingsPane.test.ts`**. Vitest **`test.exclude`** in `vite.config.ts` includes **`**/.claude/**`** so duplicate trees under `.claude/worktrees/` are not collected.
+
+### Stage 5 re-check (2026-04-10, tester session — provider-capability UX)
+
+| Step | Result | Notes |
+|------|--------|--------|
+| `npm run build` | **pass** | `tsc -b` + Vite **~1.8s**; `dist/assets/index-vb_cAP9x.css` ~30.67 kB gzip ~5.98 kB; `index-BXCzk39j.js` ~250 kB gzip ~74.42 kB |
+| `npm test` | **pass** | **3** files, **35** tests, **~150ms** (Vitest 4.1.2) |
+
+**What Vitest actually runs (narrow scope — no component mount, no Tauri):**
+
+- **`ActivityBar.test.ts`**: imports **`activityOpacity`**, **`activityColor`** from `ActivityBar.tsx` (pure helpers).
+- **`SessionList.test.ts`**: **`topTools`** from `SessionList.tsx`; **`timeAgo`**, **`formatDuration`** from `utils/time.ts`.
+- **`SettingsPane.test.ts`**: **`PROVIDERS`** shape tests + **`observer-capable provider consistency`** vs duplicated **`BACKEND_OBSERVER_CAPABLE`** (mirrors `coach-core` `OBSERVER_CAPABLE_PROVIDERS`) — **not** a mounted `SettingsPane`, not `invoke` / `get_state`.
+
+**Implemented UX (code review + build; GUI not launched):** `CoachSnapshot` in **`src/types.ts`** includes **`observer_capable_providers`**. **`useCoachStore`** hydrates **`observerCapableProviders`** from **`get_state`** and **`coach-state-updated`**. **`SettingsPane`** labels non-capable providers **`(no observer)`** in the provider `<select>` and shows an amber warning (`data-testid="observer-warning"`) when **LLM** engine mode is selected and the current provider is not in the server list.
+
+**Not covered by `npm test` / `npm run build`:** full webview/Tauri runtime (`invoke`/`listen` integration), DOM visibility of the warning. **`tests/test_ui_smoke.py`** remains separate / manual.
+
+### Backend vs Settings UI — observer-capable providers (tester E2E, HTTP)
+
+**Source of truth (Rust):** `coach-core/src/settings/mod.rs` — `OBSERVER_CAPABLE_PROVIDERS` = **`openai`**, **`anthropic`**, **`google`**. **`openrouter` is not** observer-capable.
+
+**Settings dropdown (`SettingsPane.tsx`):** four static providers; options append **`(no observer)`** when `id` ∉ **`observer_capable_providers`** from snapshot. With **LLM** engine + non-capable provider, an amber line explains observer sessions are unavailable (`data-testid="observer-warning"`).
+
+**Alignment:** Backend and static catalog **agree on which providers exist**. **OpenRouter** is valid for rules / one-shot paths but **will not** run the accumulating observer chain (see `hook_integration::observer_does_not_fire_for_non_capable_provider`). **Google** is observer-capable in Rust. The Settings UI now surfaces capability via **`observer_capable_providers`** from state (not a hard-coded-only guess).
+
+**HTTP repro (release binary, ephemeral port):**
+
+1. `./target/release/coach serve --port 37891 &` — wait until listening.
+2. `curl -sS http://127.0.0.1:37891/api/state` — JSON includes `"observer_capable_providers":["openai","anthropic","google"]`. Same payload from `GET /state` (same handler).
+3. `curl -sS -X POST http://127.0.0.1:37891/api/config/model -H 'Content-Type: application/json' -d '{"provider":"openrouter","model":"qwen/qwen3.5-397b-a17b"}'` — **HTTP 200**, full snapshot; **`observer_capable_providers` unchanged**; **`model`** switches to OpenRouter (persists to **`~/.coach/settings.json`** — restore with `coach config set model <provider> <model>` if you did not intend to change the real profile).
+4. `kill` the `serve` process when done.
+
+**Stage 5 re-check finding:** build + Vitest green; Vitest asserts **PROVIDERS** ⊇ backend observer-capable set and that at least one provider is non-observer (OpenRouter). **Tauri GUI** not run in this pass (`tauri dev` / webview) — warning/`(no observer)` labels not visually confirmed.
 
 | Feature / Workflow | Last tested | Status | Findings |
 |--------------------|-------------|--------|----------|
-| Dev: `cargo build --release` → `target/release/coach` | 2026-04-10 | pass | Workspace output dir is repo `target/`, not `src-tauri/target/` |
+| Dev: `cargo build --release` → `target/release/coach` | 2026-04-10 | pass | `cargo build --release -p coach`; workspace `target/` at repo root |
 | Dev: `npm install` | 2026-04-10 | pass | `npm audit`: 1 high severity advisory |
 | CLI: coach --version | 2026-04-10 | pass | Existing test `version_subcommand_does_not_start_tauri` |
 | CLI: coach --help | 2026-04-10 | pass | Existing test `help_subcommand_does_not_start_tauri`; live text lists `hooks codex` + `hooks cursor` |
@@ -30,8 +70,11 @@ Tracked across `kodo test` runs.
 | CLI E2E: `config set` + disk check | 2026-04-10 | pass | **Daemon down:** `set priorities`, `set model`, `set coach-mode`, `set rule outdated_models off/on`, `set api-token openai ""` (clears). Verified `~/.coach/settings.json` after sets; restored from backup |
 | CLI E2E: invalid `config set` | 2026-04-10 | pass | Bad `coach-mode` / rule state → clear stderr + exit 1 |
 | CLI E2E: `path status` | 2026-04-10 | pass | Default shim `~/.local/bin/coach` → App bundle; **`matches_running: false`** vs workspace binary; **`on $PATH: true`** |
-| CLI E2E: `path install --dir <tmp>` | 2026-04-10 | pass | Symlink `…/coach` → `target/release/coach`; warns dir not on PATH; **`path status` unchanged** (reports default dir only) |
-| CLI E2E: `path uninstall` | 2026-04-10 | pass | With **`HOME=$(mktemp -d)`**, removes only **`$HOME/.local/bin/coach`**; **no `--dir`** — a shim from **`path install --dir`** is left behind unless removed manually |
+| CLI E2E: `path install --dir <tmp>` | 2026-04-10 | pass | Symlink `…/coach` → release binary; warns dir not on PATH |
+| CLI E2E: `path status --dir` / `path uninstall --dir` | 2026-04-10 | pass | Custom install dir: **`path status --dir`** reports that shim; **`path uninstall --dir`** removes it (default-dir **`path uninstall`** unchanged). Integration: **`cli_path_install_then_uninstall_roundtrip_with_custom_dir`** |
+| CLI E2E: `path uninstall` (default dir) | 2026-04-10 | pass | Removes **`$HOME/.local/bin/coach`** only. Second uninstall when missing → **exit 1** |
+| CLI E2E: `coach status` + headless `serve` | 2026-04-10 | pass | Isolated **`HOME`** + **`settings.json` `port`** on a **free** port: no daemon → **exit 1**; error text includes **`coach serve`** then **GUI**. **`coach serve --port`** → **`status` / `status --json`** exit **0**; after kill serve → **exit 1**. **Trap:** empty isolated `HOME` defaults port **7700** — may hit another running Coach on the host |
+| CLI E2E: `coach status --json` daemon down | 2026-04-10 | **behavior note** | **`--json` does not** emit JSON on failure — same plain-text error as non-JSON; exit **1** |
 | CLI E2E: hooks merge + uninstall (Claude + Cursor, binary) | 2026-04-10 | pass | **`HOME=$(mktemp -d)`**, **`target/release/coach`**. Valid dirty configs: **`shasum -a 256`** stable on **2nd** `hooks install` / `hooks cursor install`; uninstall preserves unrelated keys + user hooks. **Malformed:** syntax-invalid → **install exit 1**, file **unchanged**, **no shim**; uninstall → **exit 1**, file kept. Valid non-object root / `hooks` not object → **install exit 1**, file kept. See appendix **Hook E2E (dirty + malformed)** |
 | CLI: coach sessions list | 2026-04-10 | pass | Existing test handles missing projects dir |
 | CLI: coach replay | 2026-04-10 | pass | Existing test for unknown session error |
@@ -59,11 +102,14 @@ Tracked across `kodo test` runs.
 | Logging: file rotation | 2026-04-10 | pass | Unit tests for log rotation |
 | PID resolution | 2026-04-10 | pass | Unit test resolves_real_connection_to_child_pid |
 | Prompt loading | 2026-04-10 | pass | embedded_templates_are_non_empty |
-| Frontend: React build (`npm run build`) | 2026-04-10 | pass | tsc + vite; ~1.3s |
-| Frontend: ActivityBar component | 2026-04-10 | pass | Vitest |
-| Frontend: SessionList component | 2026-04-10 | pass | Vitest |
-| Frontend: SettingsPane component | 2026-04-10 | pass | Vitest |
-| Frontend: type alignment with Rust | not tested | pending | types.ts vs Rust snapshots |
+| Frontend: React build (`npm run build`) | 2026-04-10 | pass | tsc + vite; ~1.3–1.5s (see **Stage 5** row) |
+| Frontend: ActivityBar helpers | 2026-04-10 | pass | Vitest (`activityOpacity` / `activityColor`), not full component render |
+| Frontend: SessionList + `utils/time` | 2026-04-10 | pass | Vitest (`topTools`, `timeAgo`, `formatDuration`) |
+| Frontend: `PROVIDERS` + observer-capable consistency (`SettingsPane.test.ts`) | 2026-04-10 | pass | Shape + backend list alignment tests — not mounted Settings tree |
+| Frontend: Vitest scope | 2026-04-10 | **35 tests / 3 files** | `vite.config.ts` excludes `**/.claude/**` |
+| HTTP E2E: `observer_capable_providers` + model POST | 2026-04-10 | pass | `GET /api/state` / `GET /state`: `["openai","anthropic","google"]`; `POST /api/config/model` **`openrouter`** — same list. Settings UI reads list from IPC snapshot (**`src/types.ts`** includes field) |
+| Frontend: type alignment with Rust | 2026-04-10 | partial | **`observer_capable_providers`** on TS `CoachSnapshot`; no automated serde roundtrip test front↔back |
+| Frontend: Tauri / Settings UX | 2026-04-10 | partial | Logic wired in store + `SettingsPane`; **no** `tauri dev` / webview pass this run |
 | GUI rendering | blocked | n/a | Requires display server |
 | Real Claude Code integration | blocked | n/a | Requires claude CLI on PATH |
 | Real Cursor integration | blocked | n/a | Requires cursor-agent on PATH |
@@ -174,4 +220,4 @@ curl -sS -X POST "http://127.0.0.1:$PORT/codex/hook/post-tool-use" -H 'Content-T
 | Cursor `hooks.json` = `not json at all` | `hooks cursor install` | Exit **1**, **`refusing to overwrite … invalid JSON`**; file **unchanged**; **no** `coach-cursor-hook.sh` |
 | Any unparseable `settings.json` / `hooks.json` | `hooks uninstall` / `hooks cursor uninstall` | Exit **1**, serde error on stderr, **file unchanged** |
 
-**Separate check (`path install --dir`):** custom-dir shim survives **`path uninstall`** (no **`uninstall --dir`**).
+**Custom install dir:** use **`path uninstall --dir`** to remove a shim from **`path install --dir`**; verify with **`path status --dir`** (see integration test **`cli_path_install_then_uninstall_roundtrip_with_custom_dir`**).
