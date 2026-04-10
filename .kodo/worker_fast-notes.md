@@ -1,11 +1,17 @@
 # Coach — worker notes
 
+## Build
+
+- Workspace root: `coach/Cargo.toml` — artifacts land in **`coach/target/`**, not `src-tauri/target/`.
+- Release CLI binary: `cargo build --release` from `coach/` (or `src-tauri/`) → `target/release/coach`.
+
 ## Verify
 
 - Strict clippy: `cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings`.
-- Rust tests: `cargo test` ~184 passed, 17 ignored (default); `cargo test --all-features` ~186 passed, 17 ignored (adds `pycoach_sidecar` when `uv` + sibling `ilya/pycoach` available).
+- Rust tests: `cargo test` (repo root) — 209 passed, 21 ignored in a baseline run (2026-04-10); `cargo test --all-features` adds `pycoach_sidecar` when `uv` + sibling `ilya/pycoach` available.
 - Optional sidecar only: `cargo test --features pycoach --test pycoach_sidecar`.
 - Frontend: repo root `npm test`, `npm run build`.
+- **Discovery (Stage 1):** `.kodo/test-report.md` (setup + CLI smoke), `.kodo/test-coverage.md` (coverage matrix; Codex HTTP routes pending in tests).
 - **Kodo improve (Stage 3):** auto-fixes land as `chore: auto-fix issues found by kodo improve`; triage report is `improve-report.md` under `~/.kodo/runs/<run_id>/` (ensure Rust/npm counts in the report match actual `cargo test` / `npm test` output).
 
 ## Frontend / integration (Stage 2 review)
@@ -25,6 +31,7 @@
 
 ## Security / CLI (quick reference)
 
+- **Help text:** Only `coach`, `coach help`, `coach -h`, `coach --help` print usage. **`coach serve --help` does not** — extra args to `serve` are ignored unless `--port`; `--help` is ignored and the daemon **starts** (same for `coach serve` with stray flags).
 - Hook + REST surface binds **127.0.0.1** only (`server.rs` `start_server` / `serve_on_listener`, `lib.rs` `serve`). No auth on `/api/*` or hooks — any local process can call them.
 - **`coach config get`** (no key / `all`) prints full `Settings` JSON including **`api_tokens`** (`cli.rs` → `settings.rs` shape). Live HTTP snapshot omits raw tokens (`state.rs` `CoachSnapshot` uses `token_status` only).
 - Tokens on CLI: `config set api-token …` passes the secret in **argv** (visible in `ps`). Plaintext **`~/.coach/settings.json`** (`settings.rs` `save_to`).
