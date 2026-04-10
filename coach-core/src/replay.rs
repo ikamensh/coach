@@ -7,16 +7,15 @@
 //!   • `"away"`    — rules-mode: block the first Stop with the static
 //!                   `away_message`, pass subsequent ones (a stand-in for
 //!                   the live 15s cooldown)
-//!   • `"llm"`     — call `LlmCoach::evaluate_stop` per Stop event, exactly
-//!                   the stateless one-shot path the live coach falls
-//!                   back to when no provider chain is available
+//!   • `"llm"`     — runs the same code path as the live coach:
+//!                   `observe_tool_use` per tool event (building the chain),
+//!                   `evaluate_stop_chained` per Stop event
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::coach::{LlmCoach, StopContext};
-use crate::state::SharedState;
+use crate::coach::{ChainedStopInput, LlmCoach, ObserveToolUseInput};
+use crate::state::{CoachChain, SharedState};
 
 fn claude_projects_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
@@ -205,6 +204,36 @@ fn extract_topic_from_entry(entry: &serde_json::Value) -> String {
     String::new()
 }
 
+/// Extract the full text from a user message entry (no truncation).
+/// Used for feeding the observer the same `user_prompt` the live path sees.
+fn extract_user_prompt(entry: &serde_json::Value) -> Option<String> {
+    let content = entry
+        .pointer("/message/content")
+        .unwrap_or(&serde_json::Value::Null);
+
+    if let Some(text) = content.as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(arr) = content.as_array() {
+        for block in arr {
+            if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Truncate `s` to at most `max` *bytes*, appending `...` if shortened.
 /// Walks back to the nearest UTF-8 char boundary at or below `max` so we
 /// never panic by slicing inside a multi-byte codepoint — a real bug
@@ -255,15 +284,17 @@ pub fn find_session(session_id: &str) -> Option<PathBuf> {
 }
 
 /// Internal raw event extracted from the JSONL transcript before
-/// per-mode evaluation. `stop_reason` is `Some` only on Stop events;
-/// it's the field passed through to the LLM coach, matching what the
-/// live `run_stop` hook handler builds in `StopContext`.
+/// per-mode evaluation. Carries everything the live coach would see:
+/// tool input for the observer, user prompt for context, and stop_reason
+/// for stop evaluation.
 struct RawEvent {
     kind: String,
     tool_name: String,
+    tool_input: serde_json::Value,
     timestamp: String,
     summary: String,
     stop_reason: Option<String>,
+    user_prompt: Option<String>,
 }
 
 pub async fn replay_session(
@@ -304,16 +335,24 @@ pub async fn replay_session(
         .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("assistant"))
         .count();
 
-    // Snapshot priorities now and drop the read guard before any awaits.
-    // `evaluate_stop` reacquires its own short-lived read lock, so we
-    // must not be holding one when we call it.
+    // Snapshot priorities before any awaits — LLM calls below acquire
+    // their own short-lived read locks.
     let priorities: Vec<String> = state.read().await.priorities.clone();
 
-    // Extract hook events from the transcript.
+    // Extract hook events from the transcript, tracking the last user
+    // message so each event carries the same `user_prompt` the live
+    // observer would have seen.
     let mut events: Vec<RawEvent> = Vec::new();
+    let mut last_user_prompt: Option<String> = None;
 
     for msg in &messages {
-        if msg.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if msg_type == "user" {
+            last_user_prompt = extract_user_prompt(msg);
+            continue;
+        }
+        if msg_type != "assistant" {
             continue;
         }
 
@@ -327,13 +366,16 @@ pub async fn replay_session(
                     continue;
                 }
                 let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let tool_input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
                 let summary = tool_summary(block);
                 events.push(RawEvent {
                     kind: "PostToolUse".to_string(),
                     tool_name: tool.to_string(),
+                    tool_input,
                     timestamp: ts.clone(),
                     summary: format!("{}: {}", tool, summary),
                     stop_reason: None,
+                    user_prompt: last_user_prompt.clone(),
                 });
             }
         }
@@ -346,63 +388,88 @@ pub async fn replay_session(
             events.push(RawEvent {
                 kind: "Stop".to_string(),
                 tool_name: String::new(),
+                tool_input: serde_json::Value::Null,
                 timestamp: ts,
                 summary: "end_turn".to_string(),
                 stop_reason: Some(stop_reason.to_string()),
+                user_prompt: last_user_prompt.clone(),
             });
         }
     }
 
-    // Evaluate events. Running counters give the LLM the same
-    // `StopContext` shape the live coach builds — tool_counts,
-    // stop_count, stop_blocked_count — at each point in the timeline.
+    // Evaluate events through the same code path as the live coach:
+    //   • PostToolUse → observe_tool_use (builds the conversational chain)
+    //   • Stop → evaluate_stop_chained (decides using that chain)
+    // This mirrors server.rs observer_consumer + run_stop exactly.
     let llm_coach = LlmCoach::new(state.clone());
     let mut replay_events = Vec::new();
     let mut first_intervention: Option<usize> = None;
-    let mut tool_counts: HashMap<String, usize> = HashMap::new();
-    let mut stop_count: usize = 0;
-    let mut stop_blocked_count: usize = 0;
+    let mut chain = CoachChain::Empty;
     let mut rules_stop_blocked = false; // rules-mode "block first Stop only"
 
     for (i, ev) in events.iter().enumerate() {
-        if ev.kind == "PostToolUse" && !ev.tool_name.is_empty() {
-            *tool_counts.entry(ev.tool_name.clone()).or_insert(0) += 1;
-        }
-        if ev.kind == "Stop" {
-            stop_count += 1;
-        }
-
-        let (action, message) = if mode == "present" || ev.kind != "Stop" {
+        let (action, message) = if mode == "present" {
             (None, None)
-        } else if mode == "llm" {
-            let ctx = StopContext {
-                priorities: priorities.clone(),
-                cwd: if cwd.is_empty() { None } else { Some(cwd.clone()) },
-                tool_counts: tool_counts.clone(),
-                stop_count,
-                stop_blocked_count,
-                stop_reason: ev.stop_reason.clone(),
-            };
-            match llm_coach.evaluate_stop(ctx).await {
-                Ok(decision) if decision.allow => (None, None),
-                Ok(decision) => {
-                    stop_blocked_count += 1;
-                    let msg = decision
-                        .message
-                        .filter(|m| !m.trim().is_empty())
-                        .unwrap_or_else(|| crate::state::away_message(&priorities));
-                    (Some("blocked".to_string()), Some(msg))
+        } else if mode == "llm" && ev.kind == "PostToolUse" {
+            // Mirror observer_consumer: call observe_tool_use to build
+            // the chain and detect interventions.
+            match llm_coach
+                .observe_tool_use(ObserveToolUseInput {
+                    priorities: priorities.clone(),
+                    chain: chain.clone(),
+                    tool_name: ev.tool_name.clone(),
+                    tool_input: ev.tool_input.clone(),
+                    user_prompt: ev.user_prompt.clone(),
+                })
+                .await
+            {
+                Ok(result) => {
+                    chain = result.chain;
+                    if result.assessment.starts_with("INTERVENE:") {
+                        let msg = result.assessment.strip_prefix("INTERVENE:").unwrap().trim().to_string();
+                        (Some("intervention".to_string()), Some(msg))
+                    } else {
+                        (None, None)
+                    }
                 }
                 Err(e) => (
                     Some("error".to_string()),
                     Some(format!("[LLM error] {e}")),
                 ),
             }
+        } else if mode == "llm" && ev.kind == "Stop" {
+            // Mirror run_stop: evaluate using the accumulated chain.
+            match llm_coach
+                .evaluate_stop_chained(ChainedStopInput {
+                    priorities: priorities.clone(),
+                    chain: chain.clone(),
+                    stop_reason: ev.stop_reason.clone(),
+                })
+                .await
+            {
+                Ok(result) => {
+                    chain = result.chain;
+                    if result.decision.allow {
+                        (None, None)
+                    } else {
+                        let msg = result.decision
+                            .message
+                            .filter(|m| !m.trim().is_empty())
+                            .unwrap_or_else(|| crate::state::away_message(&priorities));
+                        (Some("blocked".to_string()), Some(msg))
+                    }
+                }
+                Err(e) => (
+                    Some("error".to_string()),
+                    Some(format!("[LLM error] {e}")),
+                ),
+            }
+        } else if ev.kind != "Stop" {
+            (None, None)
         } else if rules_stop_blocked {
             (None, None)
         } else {
             rules_stop_blocked = true;
-            stop_blocked_count += 1;
             (
                 Some("blocked".to_string()),
                 Some(crate::state::away_message(&priorities)),

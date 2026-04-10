@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "coach"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "coach-core",
  "reqwest 0.12.28",
