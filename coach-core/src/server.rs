@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::coach::{ChainedStopInput, LlmCoach, NameSessionInput, ObserveToolUseInput, StopContext};
+use crate::coach::{ChainedStopInput, LlmCoach, NameSessionInput, StopContext};
 use crate::settings::EngineMode;
 use crate::state::{CoachMode, SharedState};
 use crate::EventEmitter;
@@ -16,6 +16,8 @@ use crate::EventEmitter;
 mod api;
 mod codex;
 mod cursor;
+mod observer;
+mod rules;
 
 #[derive(Deserialize)]
 pub(crate) struct HookPayload {
@@ -459,7 +461,7 @@ pub(crate) async fn run_post_tool_use(
             session.event_count
         };
 
-        rule_message = check_rules(&coach.rules, &tool, &tool_input);
+        rule_message = rules::check_rules(&coach.rules, &tool, &tool_input);
 
         if let Some(ref msg) = rule_message {
             coach.log(
@@ -535,7 +537,7 @@ pub(crate) async fn run_post_tool_use(
         let coach_state = state.coach.clone();
         let emitter = state.emitter.clone();
         tokio::spawn(async move {
-            observer_consumer(coach_state, emitter, pid, rx).await;
+            observer::observer_consumer(coach_state, emitter, pid, rx).await;
         });
     }
 
@@ -543,7 +545,7 @@ pub(crate) async fn run_post_tool_use(
         let coach_state = state.coach.clone();
         let emitter = state.emitter.clone();
         tokio::spawn(async move {
-            run_session_namer(coach_state, emitter, pid, input).await;
+            observer::run_session_namer(coach_state, emitter, pid, input).await;
         });
     }
 
@@ -577,182 +579,7 @@ async fn handle_post_tool_use(
     run_post_tool_use(&state, pid, payload).await
 }
 
-/// Sequential observer consumer for one session. Reads chain from
-/// session state before each LLM call, so each observation builds on
-/// the previous one. Exits when the sender is dropped (session end or
-/// `/clear`).
-async fn observer_consumer(
-    coach: SharedState,
-    emitter: Arc<dyn EventEmitter>,
-    pid: u32,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::state::ObserverQueueItem>,
-) {
-    let llm_coach = LlmCoach::new(coach.clone());
-    while let Some(item) = rx.recv().await {
-        // Read the current chain — includes all previous observations.
-        let chain = {
-            let s = coach.read().await;
-            s.sessions.get(&pid)
-                .map(|sess| sess.coach.memory.chain.clone())
-                .unwrap_or_default()
-        };
 
-        let started = std::time::Instant::now();
-        match llm_coach
-            .observe_tool_use(ObserveToolUseInput {
-                priorities: item.priorities,
-                chain,
-                tool_name: item.tool_name,
-                tool_input: item.tool_input,
-                user_prompt: item.user_prompt,
-            })
-            .await
-        {
-            Ok(result) => {
-                let latency_ms = started.elapsed().as_millis() as u64;
-                let (assessment, intervention) = parse_intervention(&result.assessment);
-                let mut s = coach.write().await;
-                if let Some(sess) = s.sessions.get_mut(&pid) {
-                    sess.coach.record_success(latency_ms, result.usage, Some(result.chain));
-                    sess.coach.memory.last_assessment = Some(assessment.clone());
-                    sess.coach.memory.last_system_prompt = Some(result.system_prompt);
-                    sess.coach.memory.last_user_message = Some(result.user_message);
-                    if let Some(ref msg) = intervention {
-                        sess.coach.memory.pending_intervention = Some(msg.clone());
-                        sess.coach.telemetry.intervention_count += 1;
-                    }
-                }
-                s.log(pid, "Observer", "noted", Some(assessment));
-                if let Some(ref msg) = intervention {
-                    s.log(pid, "Observer", "intervention pending", Some(msg.clone()));
-                }
-                emit_update(&*emitter, &s);
-            }
-            Err(e) => {
-                eprintln!("[coach] observer call failed: {e}");
-                let mut s = coach.write().await;
-                if let Some(sess) = s.sessions.get_mut(&pid) {
-                    sess.coach.record_error(&e);
-                }
-                s.log(pid, "Observer", "error", Some(e));
-                emit_update(&*emitter, &s);
-            }
-        }
-    }
-}
-
-/// Parse an observer response for the INTERVENE: prefix.
-/// Returns (full assessment text, optional intervention message).
-fn parse_intervention(text: &str) -> (String, Option<String>) {
-    if let Some(rest) = text.strip_prefix("INTERVENE:") {
-        (text.to_string(), Some(rest.trim().to_string()))
-    } else {
-        (text.to_string(), None)
-    }
-}
-
-/// Periodic session-title generation. Stateless LLM call (fresh chain),
-/// fire-and-forget like the observer. On success, writes the cleaned
-/// title into coach memory. On failure, records the error so the
-/// telemetry panel reflects it — same shape as `observer_consumer`.
-async fn run_session_namer(
-    coach: SharedState,
-    emitter: Arc<dyn EventEmitter>,
-    pid: u32,
-    input: NameSessionInput,
-) {
-    let llm_coach = LlmCoach::new(coach.clone());
-    match llm_coach.name_session(input).await {
-        Ok(result) => {
-            let mut s = coach.write().await;
-            if let Some(sess) = s.sessions.get_mut(&pid) {
-                // Namer doesn't update the chain — pass 0 latency since
-                // it's a stateless call and latency isn't worth tracking.
-                sess.coach.record_success(0, result.usage, None);
-                sess.coach.memory.session_title = Some(result.title.clone());
-            }
-            s.log(pid, "Namer", "renamed", Some(result.title));
-            emit_update(&*emitter, &s);
-        }
-        Err(e) => {
-            eprintln!("[coach] name_session failed: {e}");
-            let mut s = coach.write().await;
-            if let Some(sess) = s.sessions.get_mut(&pid) {
-                sess.coach.record_error(&e);
-            }
-            s.log(pid, "Namer", "error", Some(e));
-            emit_update(&*emitter, &s);
-        }
-    }
-}
-
-fn check_rules(
-    rules: &[crate::settings::CoachRule],
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-) -> Option<String> {
-    let outdated_enabled = rules.iter().any(|r| r.id == "outdated_models" && r.enabled);
-    if !outdated_enabled {
-        return None;
-    }
-
-    let text = extract_checkable_text(tool_name, tool_input)?;
-    check_outdated_models(&text)
-}
-
-// ── Rule helpers (inlined from rules.rs) ──────────────────────────────
-
-struct ModelMapping {
-    outdated: &'static str,
-    suggestion: &'static str,
-}
-
-const OUTDATED_MODELS: &[ModelMapping] = &[
-    ModelMapping { outdated: "gemini-2.0-flash",   suggestion: "gemini-2.5-flash (stable) or gemini-3.0-flash" },
-    ModelMapping { outdated: "gemini-2-flash",      suggestion: "gemini-2.5-flash (stable) or gemini-3.0-flash" },
-    ModelMapping { outdated: "gemini-1.5-flash",    suggestion: "gemini-2.5-flash" },
-    ModelMapping { outdated: "gemini-1.5-pro",      suggestion: "gemini-2.5-pro" },
-    ModelMapping { outdated: "gemini-1.0",          suggestion: "gemini-2.5-flash" },
-    ModelMapping { outdated: "claude-3-5-sonnet",   suggestion: "claude-sonnet-4-6" },
-    ModelMapping { outdated: "claude-3.5-sonnet",   suggestion: "claude-sonnet-4-6" },
-    ModelMapping { outdated: "claude-3-opus",       suggestion: "claude-opus-4-6" },
-    ModelMapping { outdated: "claude-3-sonnet",     suggestion: "claude-sonnet-4-6" },
-    ModelMapping { outdated: "claude-3-haiku",      suggestion: "claude-haiku-4-5-20251001" },
-    ModelMapping { outdated: "gpt-4o",              suggestion: "gpt-4.1 or gpt-5.4" },
-    ModelMapping { outdated: "gpt-4-turbo",         suggestion: "gpt-4.1" },
-    ModelMapping { outdated: "gpt-3.5",             suggestion: "gpt-4.1-mini" },
-];
-
-fn check_outdated_models(content: &str) -> Option<String> {
-    let mut found: Vec<(&str, &str)> = Vec::new();
-    for m in OUTDATED_MODELS {
-        if content.contains(m.outdated) {
-            if !found.iter().any(|(_, s)| *s == m.suggestion) {
-                found.push((m.outdated, m.suggestion));
-            }
-        }
-    }
-    if found.is_empty() {
-        return None;
-    }
-    let details: Vec<String> = found
-        .iter()
-        .map(|(old, new)| format!("'{}' -> {}", old, new))
-        .collect();
-    Some(format!(
-        "Outdated model identifier detected: {}. Update to current versions.",
-        details.join("; ")
-    ))
-}
-
-fn extract_checkable_text(tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
-    match tool_name {
-        "Write" | "write" => tool_input.get("content").and_then(|v| v.as_str()).map(String::from),
-        "Edit" | "edit" => tool_input.get("new_string").and_then(|v| v.as_str()).map(String::from),
-        "Bash" | "bash" => tool_input.get("command").and_then(|v| v.as_str()).map(String::from),
-        _ => None,
-    }
-}
 
 async fn handle_get_state(
     AxumState(state): AxumState<AppState>,
@@ -933,76 +760,5 @@ mod tests {
         // Off-by-one around an interval boundary stays quiet.
         assert!(!should_request_title(TITLE_INTERVAL_EVENTS - 1));
         assert!(!should_request_title(TITLE_INTERVAL_EVENTS + 1));
-    }
-
-    // ── Rule engine tests (moved from rules.rs) ──────────────────────
-
-    #[test]
-    fn detects_outdated_gemini_model() {
-        let code = r#"client = genai.Client(model="gemini-2.0-flash")"#;
-        let msg = check_outdated_models(code);
-        assert!(msg.is_some());
-        assert!(msg.unwrap().contains("gemini-2.0-flash"));
-    }
-
-    #[test]
-    fn detects_outdated_claude_model() {
-        let code = r#"model: "claude-3-5-sonnet-20241022""#;
-        let msg = check_outdated_models(code);
-        assert!(msg.is_some());
-        assert!(msg.unwrap().contains("claude-3-5-sonnet"));
-    }
-
-    #[test]
-    fn detects_outdated_gpt_model() {
-        let code = r#"model="gpt-4o""#;
-        let msg = check_outdated_models(code);
-        assert!(msg.is_some());
-        assert!(msg.unwrap().contains("gpt-4o"));
-    }
-
-    #[test]
-    fn passes_current_models() {
-        let code = r#"
-            model = "gemini-2.5-flash"
-            other = "claude-sonnet-4-6"
-            gpt = "gpt-4.1"
-        "#;
-        assert!(check_outdated_models(code).is_none());
-    }
-
-    #[test]
-    fn multiple_outdated_in_one_file() {
-        let code = r#"
-            primary = "gemini-2.0-flash"
-            fallback = "gpt-4o"
-        "#;
-        let msg = check_outdated_models(code).unwrap();
-        assert!(msg.contains("gemini-2.0-flash"));
-        assert!(msg.contains("gpt-4o"));
-    }
-
-    #[test]
-    fn extract_write_content() {
-        let input = serde_json::json!({"file_path": "/a.py", "content": "x = 1"});
-        assert_eq!(extract_checkable_text("Write", &input), Some("x = 1".into()));
-    }
-
-    #[test]
-    fn extract_edit_new_string() {
-        let input = serde_json::json!({"old_string": "a", "new_string": "b"});
-        assert_eq!(extract_checkable_text("Edit", &input), Some("b".into()));
-    }
-
-    #[test]
-    fn extract_bash_command() {
-        let input = serde_json::json!({"command": "echo hi"});
-        assert_eq!(extract_checkable_text("Bash", &input), Some("echo hi".into()));
-    }
-
-    #[test]
-    fn extract_unknown_tool_returns_none() {
-        let input = serde_json::json!({"query": "test"});
-        assert!(extract_checkable_text("Grep", &input).is_none());
     }
 }

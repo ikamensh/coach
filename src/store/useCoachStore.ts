@@ -2,117 +2,19 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-type CoachMode = "present" | "away";
-type Theme = "light" | "dark" | "system";
-type TokenSource = "user" | "env" | "none";
-type EngineMode = "rules" | "llm";
-type CoachView = "main" | "settings" | "hooks" | "session" | "dev";
-
-interface CoachRule {
-  id: string;
-  enabled: boolean;
-}
-
-interface ActivityEntry {
-  timestamp: string;
-  hook_event: string;
-  action: string;
-  detail: string | null;
-}
-
-type SessionClient = "claude" | "cursor" | "codex";
-
-interface CoachUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cached_input_tokens: number;
-}
-
-interface SessionSnapshot {
-  /** OS PID — stable across /clear, the canonical identity for a window. */
-  pid: number;
-  /** Current conversation id — changes on /clear. */
-  session_id: string;
-  mode: CoachMode;
-  /** Launch directory of the window. Set once on first observation and frozen. */
-  cwd: string | null;
-  last_event: string;
-  event_count: number;
-  display_name: string;
-  started_at: string;
-  duration_secs: number;
-  tool_counts: Record<string, number>;
-  stop_count: number;
-  stop_blocked_count: number;
-  coach_last_assessment: string | null;
-  coach_last_error: string | null;
-  /** Periodic LLM-generated 4-words-or-fewer topic. Frontend prefers this over `display_name`. */
-  coach_session_title: string | null;
-  /// "empty" | "openai" | "anthropic" — which backend the chain is using.
-  coach_chain_kind: string;
-  /// Number of messages currently held in the coach's conversation.
-  coach_chain_messages: number;
-  /// Successful coach LLM calls (observer + chained stop).
-  coach_calls: number;
-  /// Failed coach LLM calls.
-  coach_errors: number;
-  coach_last_called_at: string | null;
-  coach_last_latency_ms: number | null;
-  coach_last_usage: CoachUsage | null;
-  coach_total_usage: CoachUsage;
-  activity: ActivityEntry[];
-  /** Number of Agent tool calls currently in-flight. */
-  active_agents: number;
-  client: SessionClient;
-  is_worktree: boolean;
-  intervention_muted: boolean;
-  pending_intervention: string | null;
-  intervention_count: number;
-  coach_last_system_prompt: string | null;
-  coach_last_user_message: string | null;
-}
-
-interface ModelConfig {
-  provider: string;
-  model: string;
-}
-
-interface TokenStatus {
-  source: TokenSource;
-  env_var?: string;
-}
-
-interface CoachSnapshot {
-  sessions: SessionSnapshot[];
-  priorities: string[];
-  port: number;
-  theme: Theme;
-  model: ModelConfig;
-  token_status: Record<string, TokenStatus>;
-  coach_mode: EngineMode;
-  rules: CoachRule[];
-  auto_uninstall_hooks_on_exit: boolean;
-}
-
-interface HookEntryStatus {
-  event: string;
-  url: string;
-  installed: boolean;
-}
-
-interface HookStatus {
-  installed: boolean;
-  path: string;
-  hooks: HookEntryStatus[];
-}
-
-interface PathStatus {
-  install_path: string;
-  installed: boolean;
-  target: string | null;
-  matches_current_exe: boolean;
-  on_path: boolean;
-}
+import type {
+  CoachMode,
+  CoachRule,
+  CoachSnapshot,
+  CoachView,
+  EngineMode,
+  HookStatus,
+  ModelConfig,
+  PathStatus,
+  SessionSnapshot,
+  Theme,
+  TokenStatus,
+} from "../types";
 
 interface CoachState {
   sessions: SessionSnapshot[];
@@ -184,7 +86,7 @@ function applyThemeClass(theme: Theme) {
   }
 }
 
-export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, SessionClient, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule, CoachView, CoachUsage };
+export type { TokenSource, TokenStatus, ModelConfig, SessionSnapshot, SessionClient, ActivityEntry, HookStatus, PathStatus, EngineMode, CoachRule, CoachView, CoachUsage } from "../types";
 
 export const useCoachStore = create<CoachStore>((set, get) => ({
   sessions: [],
