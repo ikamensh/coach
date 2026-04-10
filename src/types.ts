@@ -124,5 +124,6 @@ export interface CoachSnapshot {
   token_status: Record<string, TokenStatus>;
   coach_mode: EngineMode;
   rules: CoachRule[];
+  observer_capable_providers: string[];
   auto_uninstall_hooks_on_exit: boolean;
 }

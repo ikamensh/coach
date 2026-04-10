@@ -14,9 +14,9 @@
 - **Discovery (Stage 1):** `.kodo/test-report.md` (setup + CLI smoke), `.kodo/test-coverage.md` (coverage matrix; Codex HTTP routes pending in tests).
 - **Kodo improve (Stage 3):** auto-fixes land as `chore: auto-fix issues found by kodo improve`; triage report is `improve-report.md` under `~/.kodo/runs/<run_id>/` (ensure Rust/npm counts in the report match actual `cargo test` / `npm test` output).
 
-## Frontend / integration (Stage 2 review)
+## Frontend / integration
 
-- **Contract drift:** `CoachSnapshot` includes `observer_capable_providers` in Rust; TS types omit it — sync risk for consumers.
+- **`observer_capable_providers` (Stage 5):** TS `CoachSnapshot` + Zustand hydrate `observerCapableProviders` from `get_state` / `coach-state-updated`. `SettingsPane` labels non-capable providers `(no observer)` and warns in LLM mode when the selected provider cannot run observer sessions. Vitest excludes `**/.claude/**` so worktrees do not duplicate test files (`vite.config.ts`).
 - **Agents:** Claude + Cursor monitoring paths overlap; Cursor hook payload handling is defensive / shape-probing (brittle if hooks change).
 - **State:** Optimistic Zustand patches can lose to backend snapshot broadcasts → possible flicker or stale UI.
 - **Perf / history:** Whole-snapshot refresh churn, per-row timers, unbounded observer chain history — watch memory and render cost.

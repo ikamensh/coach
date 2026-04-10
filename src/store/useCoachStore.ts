@@ -29,6 +29,7 @@ interface CoachState {
   codexHookStatus: HookStatus | null;
   cursorHookStatus: HookStatus | null;
   pathStatus: PathStatus | null;
+  observerCapableProviders: string[];
   autoUninstallHooksOnExit: boolean;
   modelError: string | null;
   modelValidating: boolean;
@@ -101,6 +102,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   codexHookStatus: null,
   cursorHookStatus: null,
   pathStatus: null,
+  observerCapableProviders: [],
   autoUninstallHooksOnExit: true,
   modelError: null,
   modelValidating: false,
@@ -125,6 +127,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         tokenStatus: snapshot.token_status,
         engineMode: snapshot.coach_mode,
         rules: snapshot.rules,
+        observerCapableProviders: snapshot.observer_capable_providers,
         autoUninstallHooksOnExit: snapshot.auto_uninstall_hooks_on_exit,
         initialized: true,
       });
@@ -147,6 +150,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         tokenStatus: s.token_status,
         engineMode: s.coach_mode,
         rules: s.rules,
+        observerCapableProviders: s.observer_capable_providers,
         autoUninstallHooksOnExit: s.auto_uninstall_hooks_on_exit,
       });
     });

@@ -157,9 +157,16 @@ export function SettingsPane() {
   const setEngineMode = useCoachStore((s) => s.setEngineMode);
   const toggleRule = useCoachStore((s) => s.toggleRule);
 
+  const observerCapableProviders = useCoachStore(
+    (s) => s.observerCapableProviders,
+  );
+
   const selectedProvider = PROVIDERS.find((p) => p.id === model.provider);
   const models = selectedProvider?.models ?? [];
   const activeSource = tokenStatus[model.provider]?.source ?? "none";
+  const providerIsObserverCapable = observerCapableProviders.includes(
+    model.provider,
+  );
 
   return (
     <div className="flex flex-col gap-4 h-full">
@@ -186,6 +193,9 @@ export function SettingsPane() {
             {PROVIDERS.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.label}
+                {!observerCapableProviders.includes(p.id)
+                  ? " (no observer)"
+                  : ""}
               </option>
             ))}
           </select>
@@ -217,6 +227,16 @@ export function SettingsPane() {
         {modelError && !modelValidating && (
           <p className="text-xs text-red-600 dark:text-red-400 mt-1">
             {modelError}
+          </p>
+        )}
+        {!providerIsObserverCapable && engineMode === "llm" && (
+          <p
+            className="text-xs text-amber-600 dark:text-amber-400 mt-1"
+            data-testid="observer-warning"
+          >
+            {selectedProvider?.label ?? model.provider} does not support LLM
+            observer sessions. Switch to a supported provider or use Rules
+            engine mode.
           </p>
         )}
       </section>
