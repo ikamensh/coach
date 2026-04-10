@@ -34,6 +34,10 @@ COMMANDS:
     hooks install                          install Coach hooks into ~/.claude/settings.json
     hooks uninstall                        remove Coach hooks
 
+    hooks codex status                     show Codex CLI hooks (~/.codex/hooks.json)
+    hooks codex install                    install Coach hooks into Codex hooks.json
+    hooks codex uninstall                  remove Coach-managed Codex hook entries
+
     hooks cursor status                    show Cursor Agent hooks (~/.cursor/hooks.json)
     hooks cursor install                   add curl forwarders to Cursor hooks.json
     hooks cursor uninstall                 remove Coach-managed Cursor hook entries
@@ -183,6 +187,39 @@ fn cmd_mode(args: &[String]) -> Result<(), String> {
 
 fn cmd_hooks(args: &[String]) -> Result<(), String> {
     let port = configured_port();
+    if args.first().map(String::as_str) == Some("codex") {
+        let verb = args.get(1).map(String::as_str).unwrap_or("status");
+        return match verb {
+            "status" => {
+                let s = settings::check_codex_hook_status();
+                println!("hooks file: {}", s.path);
+                println!("all installed: {}", s.installed);
+                for h in &s.hooks {
+                    let mark = if h.installed { "✓" } else { "·" };
+                    println!("  {mark} {} → {}", h.event, h.url);
+                }
+                Ok(())
+            }
+            "install" => {
+                settings::install_codex_hooks(port)?;
+                let s = settings::check_codex_hook_status();
+                println!(
+                    "installed {} Codex hook(s) into {}",
+                    s.hooks.iter().filter(|h| h.installed).count(),
+                    s.path
+                );
+                Ok(())
+            }
+            "uninstall" => {
+                settings::uninstall_codex_hooks()?;
+                println!("removed coach Codex hooks from ~/.codex/hooks.json");
+                Ok(())
+            }
+            other => Err(format!(
+                "usage: coach hooks codex <status|install|uninstall>; got '{other}'"
+            )),
+        };
+    }
     if args.first().map(String::as_str) == Some("cursor") {
         let verb = args.get(1).map(String::as_str).unwrap_or("status");
         return match verb {
@@ -241,7 +278,7 @@ fn cmd_hooks(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "usage: coach hooks <status|install|uninstall> | hooks cursor <...>; got '{other}'"
+            "usage: coach hooks <status|install|uninstall> | hooks <codex|cursor> <...>; got '{other}'"
         )),
     }
 }

@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::state::SharedState;
+use crate::server::fake_pid_for_sid;
+use crate::state::{SessionClient, SharedState};
 use crate::EventEmitter;
 
 /// Minimal view of `~/.claude/sessions/<pid>.json`.
@@ -98,11 +99,134 @@ pub fn scan_live_sessions_in(dir: &Path) -> Vec<ClaudeSessionFile> {
         .collect()
 }
 
+// ── Codex CLI session scanning ──────────────────────────────────────────
+
+/// Active Codex thread discovered from the local SQLite databases.
+#[derive(Debug, Clone)]
+pub struct CodexSessionInfo {
+    pub thread_id: String,
+    pub real_pid: u32,
+    pub cwd: Option<String>,
+    pub thread_name: Option<String>,
+    pub created_at: i64, // Unix seconds
+}
+
+impl CodexSessionInfo {
+    pub fn started_at_utc(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp(self.created_at, 0).unwrap_or_else(Utc::now)
+    }
+}
+
+/// Extract the real OS PID from a Codex `process_uuid` field.
+/// Format: `pid:{real_pid}:{uuid}` → Some(real_pid).
+fn parse_codex_pid(process_uuid: &str) -> Option<u32> {
+    let rest = process_uuid.strip_prefix("pid:")?;
+    let pid_str = rest.split(':').next()?;
+    pid_str.parse().ok()
+}
+
+pub fn scan_codex_sessions() -> Vec<CodexSessionInfo> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return vec![],
+    };
+    let codex_dir = home.join(".codex");
+    scan_codex_sessions_in(
+        &codex_dir.join("logs_2.sqlite"),
+        &codex_dir.join("state_5.sqlite"),
+        &codex_dir.join("session_index.jsonl"),
+    )
+}
+
+/// Query Codex's SQLite databases for active sessions. Uses the `sqlite3`
+/// CLI for read-only access — no Rust SQLite dependency needed. Returns
+/// empty vec if `sqlite3` isn't available or the files don't exist.
+pub fn scan_codex_sessions_in(
+    logs_db: &Path,
+    state_db: &Path,
+    index_file: &Path,
+) -> Vec<CodexSessionInfo> {
+    if !logs_db.exists() || !state_db.exists() {
+        return vec![];
+    }
+
+    // Read nice thread names from session_index.jsonl (optional).
+    let thread_names = read_thread_names(index_file);
+
+    // One sqlite3 call with ATTACH to join logs (PID) and state (metadata).
+    let query = format!(
+        "ATTACH '{}' AS state; \
+         SELECT DISTINCT l.thread_id, l.process_uuid, s.cwd, s.created_at \
+         FROM (SELECT DISTINCT thread_id, process_uuid FROM logs \
+               WHERE ts > (strftime('%s','now') - 86400) AND thread_id IS NOT NULL) l \
+         JOIN state.threads s ON l.thread_id = s.id \
+         WHERE s.updated_at > (strftime('%s','now') - 600);",
+        state_db.display()
+    );
+
+    let output = match std::process::Command::new("sqlite3")
+        .arg("-separator")
+        .arg("|")
+        .arg(logs_db)
+        .arg(&query)
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return vec![],
+    };
+
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            if parts.len() < 4 {
+                return None;
+            }
+            let thread_id = parts[0].to_string();
+            let real_pid = parse_codex_pid(parts[1])?;
+            if !is_pid_alive(real_pid) {
+                return None;
+            }
+            let cwd = if parts[2].is_empty() {
+                None
+            } else {
+                Some(parts[2].to_string())
+            };
+            let created_at: i64 = parts[3].parse().ok()?;
+            let thread_name = thread_names.get(&thread_id).cloned();
+            Some(CodexSessionInfo {
+                thread_id,
+                real_pid,
+                cwd,
+                thread_name,
+                created_at,
+            })
+        })
+        .collect()
+}
+
+/// Read `session_index.jsonl` for human-friendly thread names.
+fn read_thread_names(path: &Path) -> HashMap<String, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let id = v.get("id")?.as_str()?.to_string();
+            let name = v.get("thread_name")?.as_str()?.to_string();
+            Some((id, name))
+        })
+        .collect()
+}
+
+// ── Scanner loop ────────────────────────────────────────────────────────
+
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Periodically refresh the session list from `~/.claude/sessions/*.json`.
-/// Emits `EVENT_STATE_UPDATED` via the provided `EventEmitter` when changes
-/// are detected.
+/// Periodically refresh sessions from Claude Code files and Codex SQLite.
 pub async fn run_session_scanner(state: SharedState, emitter: std::sync::Arc<dyn EventEmitter>) {
     sync_sessions(&state, &*emitter).await;
 
@@ -119,25 +243,46 @@ pub async fn sync_sessions(state: &SharedState, emitter: &dyn EventEmitter) {
         Some(h) => h,
         None => return,
     };
+
+    // Claude Code
     let sessions_dir = home.join(".claude").join("sessions");
     let projects_dir = home.join(".claude").join("projects");
-    let live = scan_live_sessions_in(&sessions_dir);
-    sync_sessions_with(state, emitter, &live, &projects_dir).await;
+    let claude_live = scan_live_sessions_in(&sessions_dir);
+
+    // Codex CLI
+    let codex_live = scan_codex_sessions();
+
+    sync_all_sessions_with(state, emitter, &claude_live, &projects_dir, &codex_live).await;
 }
 
-/// Testable core: accepts the session list and projects directory.
-pub async fn sync_sessions_with(
+/// Unified sync: handles Claude and Codex discovery + cleanup.
+pub async fn sync_all_sessions_with(
     state: &SharedState,
     emitter: &dyn EventEmitter,
-    live: &[ClaudeSessionFile],
+    claude_live: &[ClaudeSessionFile],
     projects_dir: &Path,
+    codex_live: &[CodexSessionInfo],
 ) {
-    let live_pids: HashSet<u32> = live.iter().map(|s| s.pid).collect();
+    // Build unified live PID set.
+    let mut live_pids: HashSet<u32> = claude_live.iter().map(|s| s.pid).collect();
+    for cs in codex_live {
+        live_pids.insert(fake_pid_for_sid(&cs.thread_id));
+    }
 
     let mut coach = state.write().await;
     let mut changed = false;
 
-    for session in live {
+    // Keep hook-created sessions (Cursor, etc.) that are still active.
+    // Without this, remove_dead_pids would evict them between scan cycles.
+    let recent_cutoff = std::time::Instant::now() - Duration::from_secs(30);
+    for (pid, sess) in &coach.sessions {
+        if sess.last_event > recent_cutoff {
+            live_pids.insert(*pid);
+        }
+    }
+
+    // ── Claude Code sessions ────────────────────────────────────────
+    for session in claude_live {
         let created = coach.register_discovered_pid(
             session.pid,
             session.cwd.as_deref(),
@@ -147,50 +292,36 @@ pub async fn sync_sessions_with(
             coach.log(session.pid, "Scanner", "process discovered", session.cwd.clone());
             changed = true;
         }
+        bootstrap_claude_session(&mut coach, session, projects_dir, &mut changed);
+    }
 
-        // Bootstrap: replay JSONL through the same record_tool /
-        // record_agent methods that live hooks use.
-        let needs_bootstrap = coach.sessions.get(&session.pid)
-            .is_some_and(|s| !s.bootstrapped);
-        if needs_bootstrap {
-            // Prefer the hook's session_id (current conversation) over
-            // the session file's (may be stale after /clear).
-            let effective_sid = coach.sessions.get(&session.pid)
-                .filter(|s| !s.current_session_id.is_empty())
-                .map(|s| s.current_session_id.clone())
-                .unwrap_or_else(|| session.session_id.clone());
-            let effective_session = ClaudeSessionFile {
-                session_id: effective_sid.clone(),
-                ..session.clone()
-            };
-            if let Some(jsonl_path) = jsonl_path_for(&effective_session, projects_dir) {
-                let sess = coach.sessions.get_mut(&session.pid).unwrap();
-                match replay_jsonl(&jsonl_path, sess) {
-                    Ok(total) => {
-                        sess.bootstrapped_session_id = Some(effective_sid.clone());
-                        sess.bootstrapped = true;
-                        let agents = sess.active_agents;
-                        coach.log(
-                            session.pid,
-                            "Scanner",
-                            "bootstrapped from JSONL",
-                            Some(format!("{total} tools, {agents} active agents")),
-                        );
-                        changed = true;
-                    }
-                    Err(e) => {
-                        eprintln!("[coach] JSONL bootstrap failed for pid {}: {e}", session.pid);
-                    }
-                }
-            } else {
-                // No JSONL found — mark as bootstrapped to avoid retrying.
-                if let Some(sess) = coach.sessions.get_mut(&session.pid) {
-                    sess.bootstrapped = true;
-                }
+    // ── Codex CLI sessions ──────────────────────────────────────────
+    for session in codex_live {
+        let pid = fake_pid_for_sid(&session.thread_id);
+        let created = coach.register_discovered_pid(
+            pid,
+            session.cwd.as_deref(),
+            session.started_at_utc(),
+        );
+        if created {
+            coach.log(
+                pid,
+                "Scanner",
+                "codex session discovered",
+                session.cwd.clone(),
+            );
+            changed = true;
+        }
+        coach.mark_client(pid, SessionClient::Codex);
+        // Set thread name as session title if we have one and coach hasn't set its own.
+        if let (Some(name), Some(sess)) = (&session.thread_name, coach.sessions.get_mut(&pid)) {
+            if sess.telemetry.session_title.is_none() {
+                sess.telemetry.session_title = Some(name.clone());
             }
         }
     }
 
+    // ── Cleanup ─────────────────────────────────────────────────────
     let dead = coach.remove_dead_pids(&live_pids);
     if !dead.is_empty() {
         changed = true;
@@ -198,6 +329,70 @@ pub async fn sync_sessions_with(
 
     if changed {
         emitter.emit_state_update(&coach.snapshot());
+    }
+}
+
+/// Testable core: Claude-only sync. Delegates to `sync_all_sessions_with`
+/// with an empty Codex list so existing tests keep working.
+pub async fn sync_sessions_with(
+    state: &SharedState,
+    emitter: &dyn EventEmitter,
+    live: &[ClaudeSessionFile],
+    projects_dir: &Path,
+) {
+    sync_all_sessions_with(state, emitter, live, projects_dir, &[]).await;
+}
+
+/// Bootstrap a Claude Code session from its JSONL conversation log.
+fn bootstrap_claude_session(
+    coach: &mut crate::state::CoachState,
+    session: &ClaudeSessionFile,
+    projects_dir: &Path,
+    changed: &mut bool,
+) {
+    let needs_bootstrap = coach
+        .sessions
+        .get(&session.pid)
+        .is_some_and(|s| !s.bootstrapped);
+    if !needs_bootstrap {
+        return;
+    }
+    // Prefer the hook's session_id (current conversation) over
+    // the session file's (may be stale after /clear).
+    let effective_sid = coach
+        .sessions
+        .get(&session.pid)
+        .filter(|s| !s.current_session_id.is_empty())
+        .map(|s| s.current_session_id.clone())
+        .unwrap_or_else(|| session.session_id.clone());
+    let effective_session = ClaudeSessionFile {
+        session_id: effective_sid.clone(),
+        ..session.clone()
+    };
+    if let Some(jsonl_path) = jsonl_path_for(&effective_session, projects_dir) {
+        let sess = coach.sessions.get_mut(&session.pid).unwrap();
+        match replay_jsonl(&jsonl_path, sess) {
+            Ok(total) => {
+                sess.bootstrapped_session_id = Some(effective_sid.clone());
+                sess.bootstrapped = true;
+                let agents = sess.active_agents;
+                coach.log(
+                    session.pid,
+                    "Scanner",
+                    "bootstrapped from JSONL",
+                    Some(format!("{total} tools, {agents} active agents")),
+                );
+                *changed = true;
+            }
+            Err(e) => {
+                eprintln!("[coach] JSONL bootstrap failed for pid {}: {e}", session.pid);
+            }
+        }
+    } else {
+        // No JSONL found — mark as bootstrapped to avoid retrying.
+        if let Some(sess) = coach.sessions.get_mut(&session.pid) {
+            sess.bootstrapped = true;
+        }
     }
 }
 
@@ -860,4 +1055,166 @@ mod tests {
         }
     }
 
+    // ── Codex scanner tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_codex_pid_extracts_real_pid() {
+        assert_eq!(parse_codex_pid("pid:54433:2ccb4866-b48f-4a09-a0bd-3f5669c49816"), Some(54433));
+        assert_eq!(parse_codex_pid("pid:1:abc"), Some(1));
+    }
+
+    #[test]
+    fn parse_codex_pid_rejects_malformed() {
+        assert_eq!(parse_codex_pid(""), None);
+        assert_eq!(parse_codex_pid("not-a-pid"), None);
+        assert_eq!(parse_codex_pid("pid:"), None);
+        assert_eq!(parse_codex_pid("pid:abc:def"), None);
+    }
+
+    #[test]
+    fn read_thread_names_parses_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session_index.jsonl");
+        let lines = [
+            r#"{"id":"aaa-111","thread_name":"Fix auth bug","updated_at":"2026-04-10T06:13:22Z"}"#,
+            r#"{"id":"bbb-222","thread_name":"Add tests","updated_at":"2026-04-10T06:14:00Z"}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let names = read_thread_names(&path);
+        assert_eq!(names.get("aaa-111").unwrap(), "Fix auth bug");
+        assert_eq!(names.get("bbb-222").unwrap(), "Add tests");
+    }
+
+    #[test]
+    fn read_thread_names_returns_empty_on_missing_file() {
+        assert!(read_thread_names(Path::new("/nonexistent/index.jsonl")).is_empty());
+    }
+
+    /// Codex sessions discovered by the scanner get registered with fake
+    /// PIDs (matching what hooks produce) and marked as Codex clients.
+    #[tokio::test]
+    async fn sync_registers_codex_sessions() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+
+        let codex_sessions = vec![CodexSessionInfo {
+            thread_id: "codex-thread-001".to_string(),
+            real_pid: std::process::id(), // use our own PID so it's "alive"
+            cwd: Some("/tmp/codex-project".to_string()),
+            thread_name: Some("Fix auth".to_string()),
+            created_at: 1775801533,
+        }];
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        sync_all_sessions_with(
+            &state,
+            &emitter,
+            &scan_live_sessions_in(sessions_dir.path()),
+            projects_dir.path(),
+            &codex_sessions,
+        )
+        .await;
+
+        let coach = state.read().await;
+        let pid = fake_pid_for_sid("codex-thread-001");
+        let sess = coach.sessions.get(&pid).expect("codex session should exist");
+        assert_eq!(sess.client, SessionClient::Codex);
+        assert_eq!(sess.cwd, Some("/tmp/codex-project".into()));
+        assert_eq!(
+            sess.telemetry.session_title.as_deref(),
+            Some("Fix auth"),
+            "thread_name should seed the session title"
+        );
+    }
+
+    /// When a hook creates a Codex session first, the scanner should
+    /// mark it as Codex and set the title without resetting state.
+    #[tokio::test]
+    async fn sync_codex_adopts_hook_created_session() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let thread_id = "hook-then-scan";
+        let pid = fake_pid_for_sid(thread_id);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        // Hook creates session first.
+        {
+            let mut coach = state.write().await;
+            coach.apply_hook_event(pid, thread_id, Some("/tmp/hook-cwd"));
+            let sess = coach.sessions.get_mut(&pid).unwrap();
+            sess.record_tool("Bash");
+        }
+
+        let codex_sessions = vec![CodexSessionInfo {
+            thread_id: thread_id.to_string(),
+            real_pid: std::process::id(),
+            cwd: Some("/tmp/hook-cwd".to_string()),
+            thread_name: Some("Hook task".to_string()),
+            created_at: 1775801533,
+        }];
+
+        sync_all_sessions_with(
+            &state,
+            &emitter,
+            &scan_live_sessions_in(sessions_dir.path()),
+            projects_dir.path(),
+            &codex_sessions,
+        )
+        .await;
+
+        let coach = state.read().await;
+        let sess = coach.sessions.get(&pid).unwrap();
+        assert_eq!(sess.client, SessionClient::Codex);
+        assert_eq!(sess.event_count, 1, "hook tool count preserved");
+        assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
+        assert_eq!(
+            sess.telemetry.session_title.as_deref(),
+            Some("Hook task"),
+        );
+    }
+
+    /// Hook-created sessions survive scanner cleanup if they had recent activity.
+    #[tokio::test]
+    async fn recent_hook_sessions_survive_cleanup() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        // Create a hook session (Cursor-style fake PID, no scanner file).
+        let cursor_pid = fake_pid_for_sid("cursor-session-xyz");
+        {
+            let mut coach = state.write().await;
+            coach.apply_hook_event(cursor_pid, "cursor-session-xyz", Some("/tmp/cursor"));
+        }
+
+        // Run scanner with no Claude or Codex sessions — the hook session
+        // should survive because it was just active.
+        sync_all_sessions_with(
+            &state,
+            &emitter,
+            &scan_live_sessions_in(sessions_dir.path()),
+            projects_dir.path(),
+            &[],
+        )
+        .await;
+
+        let coach = state.read().await;
+        assert!(
+            coach.sessions.contains_key(&cursor_pid),
+            "recently active hook session should not be evicted"
+        );
+    }
 }

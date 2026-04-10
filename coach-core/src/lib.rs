@@ -63,6 +63,13 @@ pub async fn serve(port_override: Option<u16>) -> Result<(), String> {
         }
     }
     if let Ok(added) =
+        settings::sync_managed_codex_hooks(port, &mut settings.codex_hooks_user_enabled)
+    {
+        if !added.is_empty() {
+            eprintln!("[coach serve] synced Codex hooks: {added:?}");
+        }
+    }
+    if let Ok(added) =
         settings::sync_managed_cursor_hooks(port, &mut settings.cursor_hooks_user_enabled)
     {
         if !added.is_empty() {

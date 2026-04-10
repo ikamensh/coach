@@ -14,6 +14,7 @@ use crate::state::{CoachMode, SharedState};
 use crate::EventEmitter;
 
 mod api;
+mod codex;
 mod cursor;
 
 #[derive(Deserialize)]
@@ -784,6 +785,12 @@ fn build_router(
         .route("/hook/post-tool-use", post(handle_post_tool_use))
         .route("/hook/user-prompt-submit", post(handle_user_prompt_submit))
         .route("/hook/session-start", post(handle_session_start))
+        .route("/codex/hook/permission-request", post(codex::permission_request))
+        .route("/codex/hook/stop", post(codex::stop))
+        .route("/codex/hook/pre-tool-use", post(codex::pre_tool_use))
+        .route("/codex/hook/post-tool-use", post(codex::post_tool_use))
+        .route("/codex/hook/user-prompt-submit", post(codex::user_prompt_submit))
+        .route("/codex/hook/session-start", post(codex::session_start))
         .route("/cursor/hook/session-start", post(cursor::session_start))
         .route(
             "/cursor/hook/before-submit-prompt",
