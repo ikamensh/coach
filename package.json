@@ -1,6 +1,6 @@
 {
   "name": "coach",
-  "version": "0.1.65",
+  "version": "0.1.66",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,7 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "install-app": "echo \"Building Coach v$npm_package_version\" && tauri build && rm -rf /Applications/Coach.app && cp -R src-tauri/target/release/bundle/macos/Coach.app /Applications/Coach.app && mdimport /Applications/Coach.app && ln -sf /Applications/Coach.app/Contents/MacOS/Coach ~/.local/bin/coach && coach --version"
+    "install-app": "echo \"Building Coach v$npm_package_version\" && tauri build && pkill -x coach || true && rm -rf /Applications/Coach.app && cp -R target/release/bundle/macos/Coach.app /Applications/Coach.app && mdimport /Applications/Coach.app && ln -sf /Applications/Coach.app/Contents/MacOS/coach ~/.local/bin/coach && coach --version"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
