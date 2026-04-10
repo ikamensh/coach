@@ -7,7 +7,7 @@
 //!   • `"away"`    — rules-mode: block the first Stop with the static
 //!                   `away_message`, pass subsequent ones (a stand-in for
 //!                   the live 15s cooldown)
-//!   • `"llm"`     — call `llm::evaluate_stop` per Stop event, exactly
+//!   • `"llm"`     — call `LlmCoach::evaluate_stop` per Stop event, exactly
 //!                   the stateless one-shot path the live coach falls
 //!                   back to when no provider chain is available
 
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::coach::{LlmCoach, StopContext};
 use crate::state::SharedState;
 
 fn claude_projects_dir() -> Option<PathBuf> {
@@ -355,6 +356,7 @@ pub async fn replay_session(
     // Evaluate events. Running counters give the LLM the same
     // `StopContext` shape the live coach builds — tool_counts,
     // stop_count, stop_blocked_count — at each point in the timeline.
+    let llm_coach = LlmCoach::new(state.clone());
     let mut replay_events = Vec::new();
     let mut first_intervention: Option<usize> = None;
     let mut tool_counts: HashMap<String, usize> = HashMap::new();
@@ -373,7 +375,7 @@ pub async fn replay_session(
         let (action, message) = if mode == "present" || ev.kind != "Stop" {
             (None, None)
         } else if mode == "llm" {
-            let ctx = crate::llm::StopContext {
+            let ctx = StopContext {
                 priorities: priorities.clone(),
                 cwd: if cwd.is_empty() { None } else { Some(cwd.clone()) },
                 tool_counts: tool_counts.clone(),
@@ -381,7 +383,7 @@ pub async fn replay_session(
                 stop_blocked_count,
                 stop_reason: ev.stop_reason.clone(),
             };
-            match crate::llm::evaluate_stop(state, &ctx).await {
+            match llm_coach.evaluate_stop(ctx).await {
                 Ok(decision) if decision.allow => (None, None),
                 Ok(decision) => {
                     stop_blocked_count += 1;

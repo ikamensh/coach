@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod coach;
 pub mod llm;
 pub mod logging;
 pub mod path_install;
