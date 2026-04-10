@@ -354,7 +354,7 @@ pub async fn set_intervention_muted(
 ) -> Result<(), String> {
     let mut s = state.write().await;
     if let Some(session) = s.sessions.get_mut(&pid) {
-        session.intervention_muted = muted;
+        session.coach.intervention_muted = muted;
     }
     emit_snapshot(&app, &s)?;
     Ok(())
