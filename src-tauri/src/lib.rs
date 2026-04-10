@@ -143,10 +143,18 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Coach")
-        .run(|_app_handle, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::Reopen { .. } => {
+                if let Some(w) = app_handle.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+            tauri::RunEvent::Exit => {
                 eprintln!("[coach] exiting, running hook cleanup");
                 settings::cleanup_hooks_on_exit();
             }
+            _ => {}
         });
 }
