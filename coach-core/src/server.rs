@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::coach::{ChainedStopInput, LlmCoach, StopContext};
 use crate::settings::EngineMode;
 use crate::state::{CoachMode, SharedState};
 use crate::EventEmitter;
@@ -262,7 +263,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
         }
 
         let prev_chain = session.telemetry.chain.clone();
-        let ctx = crate::llm::StopContext {
+        let ctx = StopContext {
             priorities,
             cwd: session.cwd.clone(),
             tool_counts: session.tool_counts.clone(),
@@ -278,19 +279,18 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
     //     observer's chain so the model uses everything observed so far.
     //   • One-shot fallback: any other provider — sends only the digest.
     if coach_mode == EngineMode::Llm {
+        let llm_coach = LlmCoach::new(state.coach.clone());
         let started = std::time::Instant::now();
         let chained = if provider_capable {
-            match crate::llm::evaluate_stop_chained(
-                &state.coach,
-                &ctx.priorities,
-                &prev_chain,
-                ctx.stop_reason.as_deref(),
-            )
-            .await
+            match llm_coach
+                .evaluate_stop_chained(ChainedStopInput {
+                    priorities: ctx.priorities.clone(),
+                    chain: prev_chain,
+                    stop_reason: ctx.stop_reason.clone(),
+                })
+                .await
             {
-                Ok((decision, new_chain, usage)) => {
-                    Some(Ok((decision, Some(new_chain), Some(usage))))
-                }
+                Ok(result) => Some(Ok((result.decision, Some(result.chain), Some(result.usage)))),
                 Err(e) => Some(Err(e)),
             }
         } else {
@@ -299,9 +299,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
 
         let result = match chained {
             Some(r) => r,
-            None => crate::llm::evaluate_stop(&state.coach, &ctx)
-                .await
-                .map(|d| (d, None, None)),
+            None => llm_coach.evaluate_stop(ctx).await.map(|d| (d, None, None)),
         };
 
         match result {
