@@ -237,6 +237,38 @@ pub struct SessionState {
     pub bootstrapped_session_id: Option<String>,
 }
 
+impl SessionState {
+    /// Record a completed tool invocation. Used by both PostToolUse hooks
+    /// and JSONL bootstrap replay so counts are identical either way.
+    pub fn record_tool(&mut self, name: &str) {
+        *self.tool_counts.entry(name.to_string()).or_insert(0) += 1;
+        self.event_count += 1;
+    }
+
+    pub fn record_agent_start(&mut self) {
+        self.active_agents += 1;
+    }
+
+    pub fn record_agent_end(&mut self) {
+        self.active_agents = self.active_agents.saturating_sub(1);
+    }
+
+    /// Reset conversation-scoped state. Called on `/clear`, stale bootstrap
+    /// discard, and session-id mismatch.
+    pub fn reset_conversation(&mut self) {
+        self.event_count = 0;
+        self.tool_counts.clear();
+        self.active_agents = 0;
+        self.stop_count = 0;
+        self.stop_blocked_count = 0;
+        self.last_stop_blocked = None;
+        self.telemetry = CoachTelemetry::new();
+        self.activity.clear();
+        self.bootstrapped = false;
+        self.bootstrapped_session_id = None;
+    }
+}
+
 /// Item enqueued for the per-session observer consumer.
 pub struct ObserverQueueItem {
     pub priorities: Vec<String>,
@@ -364,28 +396,22 @@ impl CoachState {
         self.to_settings().save();
     }
 
-    /// Process a hook event for a known PID. This is the canonical mutation
-    /// for hook handlers — it handles three cases:
+    /// Session lifecycle: create, adopt, or reset.
     ///
     /// 1. **No session for this PID yet** → create one.
-    /// 2. **PID has a session and `session_id` matches** → bump counters.
-    /// 3. **PID has a session under a different `session_id`** → this is a
-    ///    `/clear` (or `/resume` / `/compact`). Replace the conversation:
-    ///    new id, fresh `started_at`, counters reset to 0, activity cleared,
-    ///    coach response chain reset. PID, mode, cwd, display_name
-    ///    are preserved because they describe the **window**.
+    /// 2. **PID has a session and `session_id` matches** → touch timestamps.
+    /// 3. **PID has a session under a different `session_id`** → `/clear`
+    ///    (or `/resume` / `/compact`): reset conversation-scoped state.
     ///
-    /// Returns a mutable reference to the session for callers that want to
-    /// poke at it further (e.g. set tool_counts).
+    /// Does NOT increment event_count — callers record tool activity via
+    /// `record_tool` / `record_agent_start` / `record_agent_end`, keeping
+    /// counts identical whether events arrive live or via JSONL replay.
     pub fn apply_hook_event(
         &mut self,
         pid: u32,
         session_id: &str,
         cwd: Option<&str>,
     ) -> &mut SessionState {
-        // Index the session_id → pid mapping so subsequent hooks skip the
-        // lsof lookup. Safe to overwrite — same session_id never moves
-        // between PIDs.
         self.session_id_to_pid.insert(session_id.to_string(), pid);
 
         let default_mode = self.default_mode;
@@ -395,41 +421,26 @@ impl CoachState {
             Some(sess) if sess.current_session_id == session_id => {
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
-                sess.event_count += 1;
                 adopt_cwd_if_unset(sess, cwd);
             }
             Some(sess) if sess.current_session_id.is_empty() => {
-                // First hook for a scanner-discovered placeholder. If
-                // bootstrap loaded data for this same conversation, keep
-                // it and increment; otherwise discard stale bootstrap data.
+                // First hook for a scanner-discovered placeholder.
                 sess.current_session_id = session_id.to_string();
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
-                if sess.bootstrapped_session_id.as_deref() == Some(session_id) {
-                    sess.event_count += 1;
-                } else {
-                    sess.event_count = 1;
-                    sess.tool_counts.clear();
-                    sess.active_agents = 0;
+                if sess.bootstrapped_session_id.as_deref() != Some(session_id) {
+                    // Stale bootstrap — wipe and re-bootstrap from correct JSONL.
+                    sess.reset_conversation();
                 }
                 adopt_cwd_if_unset(sess, cwd);
             }
             Some(sess) => {
-                // /clear: new conversation in the same window. Reset
-                // conversation-scoped state, keep window-scoped state.
+                // /clear: new conversation in the same window.
                 sess.current_session_id = session_id.to_string();
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
-                sess.event_count = 1;
                 sess.started_at = now;
-                sess.tool_counts.clear();
-                sess.active_agents = 0;
-                sess.stop_count = 0;
-                sess.stop_blocked_count = 0;
-                sess.last_stop_blocked = None;
-                sess.telemetry = CoachTelemetry::new();
-                sess.activity.clear();
-                sess.bootstrapped_session_id = None;
+                sess.reset_conversation();
                 adopt_cwd_if_unset(sess, cwd);
             }
             None => {
@@ -443,7 +454,7 @@ impl CoachState {
                         cwd: cwd.map(String::from),
                         last_event: Instant::now(),
                         last_event_time: now,
-                        event_count: 1,
+                        event_count: 0,
                         last_stop_blocked: None,
                         started_at: now,
                         display_name,
@@ -648,35 +659,36 @@ mod tests {
         let sess = state.sessions.get(&42).unwrap();
         assert_eq!(sess.pid, 42);
         assert_eq!(sess.current_session_id, "conv-1");
-        assert_eq!(sess.event_count, 1);
+        assert_eq!(sess.event_count, 0);
         assert_eq!(sess.mode, CoachMode::Away);
         assert_eq!(sess.cwd, Some("/tmp".into()));
-        // Cache should be primed.
         assert_eq!(state.session_id_to_pid.get("conv-1"), Some(&42));
+
+        // record_tool is how event_count grows — same path as bootstrap.
+        let sess = state.sessions.get_mut(&42).unwrap();
+        sess.record_tool("Bash");
+        assert_eq!(sess.event_count, 1);
+        assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
     }
 
-    /// Same (pid, session_id) on a second hook bumps the counter and
-    /// preserves user-set fields like mode. The launch cwd is frozen on
-    /// first observation — a later hook from a different cwd (e.g. after
-    /// a `cd` in a Bash tool) must NOT drift the window's identity.
+    /// Same (pid, session_id) on a second hook touches timestamps but
+    /// does not change event_count. Only record_tool does that.
     #[test]
     fn apply_hook_event_increments_existing_session() {
         let mut state = test_state();
         state.apply_hook_event(42, "conv-1", Some("/a"));
-        // Flip mode to Away to verify it's preserved.
         state.sessions.get_mut(&42).unwrap().mode = CoachMode::Away;
 
         state.apply_hook_event(42, "conv-1", Some("/b"));
 
         let sess = state.sessions.get(&42).unwrap();
-        assert_eq!(sess.event_count, 2);
+        assert_eq!(sess.event_count, 0, "apply_hook_event doesn't touch event_count");
         assert_eq!(sess.cwd, Some("/a".into()), "launch cwd is frozen");
         assert_eq!(sess.mode, CoachMode::Away, "mode survives hook updates");
     }
 
     /// /clear: same PID, new session_id. Counters reset, started_at moves
     /// forward, activity is wiped, but pid/mode/cwd persist.
-    /// This is the core regression test for the original bug.
     #[test]
     fn apply_hook_event_resets_on_clear() {
         let mut state = test_state();
@@ -684,8 +696,8 @@ mod tests {
         {
             let s = state.sessions.get_mut(&42).unwrap();
             s.mode = CoachMode::Away;
-            s.event_count = 17;
-            s.tool_counts.insert("Bash".into(), 9);
+            s.record_tool("Bash");
+            s.record_tool("Bash");
             s.stop_count = 3;
             s.stop_blocked_count = 2;
             s.telemetry.chain = CoachChain::ServerId { id: "resp_old".into() };
@@ -697,27 +709,22 @@ mod tests {
             });
         }
         let original_started = state.sessions.get(&42).unwrap().started_at;
-
-        // Sleep a touch so started_at differs measurably.
         std::thread::sleep(std::time::Duration::from_millis(2));
 
         state.apply_hook_event(42, "new", Some("/projects/coach"));
 
         let sess = state.sessions.get(&42).unwrap();
-        // Conversation-scoped: reset
         assert_eq!(sess.current_session_id, "new");
-        assert_eq!(sess.event_count, 1);
+        assert_eq!(sess.event_count, 0);
         assert!(sess.tool_counts.is_empty());
         assert_eq!(sess.stop_count, 0);
         assert_eq!(sess.stop_blocked_count, 0);
         assert_eq!(sess.telemetry.chain, CoachChain::Empty, "/clear must reset chain");
         assert!(sess.activity.is_empty());
         assert!(sess.started_at > original_started);
-        // Window-scoped: preserved
         assert_eq!(sess.pid, 42);
         assert_eq!(sess.mode, CoachMode::Away, "mode is window-scoped");
         assert_eq!(sess.cwd, Some("/projects/coach".into()), "cwd preserved");
-        // Cache: BOTH ids point at the same PID (lookup safety)
         assert_eq!(state.session_id_to_pid.get("old"), Some(&42));
         assert_eq!(state.session_id_to_pid.get("new"), Some(&42));
     }
@@ -736,7 +743,7 @@ mod tests {
 
         let sess = state.sessions.get(&42).unwrap();
         assert_eq!(sess.current_session_id, "conv-X");
-        assert_eq!(sess.event_count, 1);
+        assert_eq!(sess.event_count, 0, "no tools recorded yet");
         assert_eq!(
             sess.started_at, scanner_started,
             "scanner started_at must survive the first hook"

@@ -47,16 +47,12 @@ const CLAUDE_SHIM_FILENAME: &str = "claude-hook.sh";
 
 /// (Claude Code event name, URL slug under `/hook/`).
 const CLAUDE_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
     ("PermissionRequest", "permission-request"),
     ("Stop", "stop"),
     ("PreToolUse", "pre-tool-use"),
     ("PostToolUse", "post-tool-use"),
     ("UserPromptSubmit", "user-prompt-submit"),
-    // NOTE: SessionStart not included — Claude Code 2.1.92+ silently
-    // drops hooks for it. `/clear` is detected lazily on the next tool
-    // call via session_id-mismatch in `state::apply_hook_event`.
-    // The HTTP route in server.rs stays wired up for Cursor's
-    // `sessionStart` hook — see `CURSOR_HOOK_EVENTS`.
 ];
 
 /// Body of the shim script for the given Coach port.

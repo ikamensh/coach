@@ -452,8 +452,8 @@ async fn clear_replaces_session_in_same_window() {
     let sessions = snap["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1, "no duplicate row after /clear");
     assert_eq!(sessions[0]["session_id"], "after-clear");
-    // SessionStart counts as one event in the new conversation.
-    assert_eq!(sessions[0]["event_count"], 1);
+    // apply_hook_event resets counters; event_count stays 0 until record_tool.
+    assert_eq!(sessions[0]["event_count"], 0);
     let tool_counts = sessions[0]["tool_counts"].as_object().unwrap();
     assert!(tool_counts.is_empty(), "tool counts reset on /clear");
     // PID is still the same window.
@@ -1609,7 +1609,7 @@ async fn command_hook_updates_scanner_session_not_ghost() {
 
     let s = state.read().await;
     assert_eq!(
-        s.sessions[&claude_pid].event_count, 1,
+        s.sessions[&claude_pid].current_session_id, "conv-1",
         "scanner session should receive the hook event"
     );
     assert!(

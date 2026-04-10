@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -148,10 +148,8 @@ pub async fn sync_sessions_with(
             changed = true;
         }
 
-        // Bootstrap from JSONL on first scan for sessions that haven't
-        // been bootstrapped yet. This covers both scanner-first and
-        // hook-first discovery: hooks create the session with empty
-        // tool_counts, the scanner fills it in from history.
+        // Bootstrap: replay JSONL through the same record_tool /
+        // record_agent methods that live hooks use.
         let needs_bootstrap = coach.sessions.get(&session.pid)
             .is_some_and(|s| !s.bootstrapped);
         if needs_bootstrap {
@@ -166,21 +164,17 @@ pub async fn sync_sessions_with(
                 ..session.clone()
             };
             if let Some(jsonl_path) = jsonl_path_for(&effective_session, projects_dir) {
-                match bootstrap_from_jsonl(&jsonl_path) {
-                    Ok(boot) => {
-                        if let Some(sess) = coach.sessions.get_mut(&session.pid) {
-                            sess.bootstrapped_session_id = Some(effective_sid.clone());
-                            sess.tool_counts = boot.tool_counts;
-                            sess.active_agents = boot.active_agents;
-                            sess.event_count = boot.total_tools;
-                            sess.bootstrapped = true;
-                        }
+                let sess = coach.sessions.get_mut(&session.pid).unwrap();
+                match replay_jsonl(&jsonl_path, sess) {
+                    Ok(total) => {
+                        sess.bootstrapped_session_id = Some(effective_sid.clone());
+                        sess.bootstrapped = true;
+                        let agents = sess.active_agents;
                         coach.log(
                             session.pid,
                             "Scanner",
                             "bootstrapped from JSONL",
-                            Some(format!("{} tools, {} active agents",
-                                boot.total_tools, boot.active_agents)),
+                            Some(format!("{total} tools, {agents} active agents")),
                         );
                         changed = true;
                     }
@@ -217,24 +211,17 @@ fn jsonl_path_for(session: &ClaudeSessionFile, projects_dir: &Path) -> Option<Pa
 }
 
 /// State bootstrapped from a JSONL conversation log.
-#[derive(Debug, Clone)]
-pub struct BootstrapState {
-    pub tool_counts: HashMap<String, usize>,
-    pub active_agents: usize,
-    pub total_tools: usize,
-}
-
-/// Parse a Claude Code JSONL to extract tool counts and active agent count.
-///
-/// Agent tool_use blocks that don't yet have a matching tool_result are
-/// counted as active agents.
-pub fn bootstrap_from_jsonl(path: &Path) -> Result<BootstrapState, String> {
+/// Replay a JSONL conversation log into a session, using the same
+/// `record_tool` / `record_agent_start` / `record_agent_end` methods
+/// that live hooks use. Returns the number of tool events replayed.
+pub fn replay_jsonl(
+    path: &Path,
+    session: &mut crate::state::SessionState,
+) -> Result<usize, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
 
-    let mut tool_counts: HashMap<String, usize> = HashMap::new();
     let mut agent_tool_ids: HashSet<String> = HashSet::new();
-    let mut agent_results: HashSet<String> = HashSet::new();
 
     for line in content.lines() {
         let entry: serde_json::Value = match serde_json::from_str(line) {
@@ -251,8 +238,9 @@ pub fn bootstrap_from_jsonl(path: &Path) -> Result<BootstrapState, String> {
                     for block in blocks {
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                                *tool_counts.entry(name.to_string()).or_default() += 1;
+                                session.record_tool(name);
                                 if name == "Agent" {
+                                    session.record_agent_start();
                                     if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
                                         agent_tool_ids.insert(id.to_string());
                                     }
@@ -270,8 +258,8 @@ pub fn bootstrap_from_jsonl(path: &Path) -> Result<BootstrapState, String> {
                     for block in blocks {
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                             if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
-                                if agent_tool_ids.contains(id) {
-                                    agent_results.insert(id.to_string());
+                                if agent_tool_ids.remove(id) {
+                                    session.record_agent_end();
                                 }
                             }
                         }
@@ -282,14 +270,7 @@ pub fn bootstrap_from_jsonl(path: &Path) -> Result<BootstrapState, String> {
         }
     }
 
-    let total_tools: usize = tool_counts.values().sum();
-    let active_agents = agent_tool_ids.len().saturating_sub(agent_results.len());
-
-    Ok(BootstrapState {
-        tool_counts,
-        active_agents,
-        total_tools,
-    })
+    Ok(session.event_count)
 }
 
 #[cfg(test)]
@@ -437,7 +418,35 @@ mod tests {
         assert_eq!(sessions[0].kind, "interactive");
     }
 
-    /// bootstrap_from_jsonl extracts tool counts and active agent count.
+    /// Helper: create a blank SessionState for replay tests.
+    fn blank_session() -> crate::state::SessionState {
+        use std::collections::{HashMap, VecDeque};
+        use std::time::Instant;
+        crate::state::SessionState {
+            pid: 0,
+            current_session_id: String::new(),
+            mode: crate::state::CoachMode::Present,
+            cwd: None,
+            last_event: Instant::now(),
+            last_event_time: chrono::Utc::now(),
+            event_count: 0,
+            last_stop_blocked: None,
+            started_at: chrono::Utc::now(),
+            display_name: String::new(),
+            tool_counts: HashMap::new(),
+            stop_count: 0,
+            stop_blocked_count: 0,
+            telemetry: crate::state::CoachTelemetry::new(),
+            activity: VecDeque::new(),
+            active_agents: 0,
+            client: crate::state::SessionClient::Claude,
+            is_worktree: false,
+            bootstrapped: false,
+            bootstrapped_session_id: None,
+        }
+    }
+
+    /// replay_jsonl extracts tool counts and active agent count.
     #[test]
     fn bootstrap_counts_tools_and_active_agents() {
         let dir = TempDir::new().unwrap();
@@ -453,11 +462,12 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).unwrap();
 
-        let boot = bootstrap_from_jsonl(&path).unwrap();
-        assert_eq!(boot.tool_counts.get("Bash"), Some(&2));
-        assert_eq!(boot.tool_counts.get("Agent"), Some(&1));
-        assert_eq!(boot.active_agents, 1);
-        assert_eq!(boot.total_tools, 3);
+        let mut sess = blank_session();
+        let total = replay_jsonl(&path, &mut sess).unwrap();
+        assert_eq!(sess.tool_counts.get("Bash"), Some(&2));
+        assert_eq!(sess.tool_counts.get("Agent"), Some(&1));
+        assert_eq!(sess.active_agents, 1);
+        assert_eq!(total, 3);
     }
 
     /// When an Agent's tool_result appears, it's no longer active.
@@ -472,12 +482,13 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).unwrap();
 
-        let boot = bootstrap_from_jsonl(&path).unwrap();
-        assert_eq!(boot.active_agents, 0);
-        assert_eq!(boot.tool_counts.get("Agent"), Some(&1));
+        let mut sess = blank_session();
+        replay_jsonl(&path, &mut sess).unwrap();
+        assert_eq!(sess.active_agents, 0);
+        assert_eq!(sess.tool_counts.get("Agent"), Some(&1));
     }
 
-    /// Bootstrap against a real JSONL from the current session, if available.
+    /// Replay against a real JSONL from the current session, if available.
     #[test]
     fn bootstrap_reads_real_session() {
         let home = match dirs::home_dir() {
@@ -490,8 +501,9 @@ mod tests {
         for session in sessions.iter().take(1) {
             if let Some(path) = jsonl_path_for(session, &projects_dir) {
                 if path.exists() {
-                    let boot = bootstrap_from_jsonl(&path);
-                    assert!(boot.is_ok(), "failed to parse {}: {:?}", path.display(), boot.err());
+                    let mut sess = blank_session();
+                    let result = replay_jsonl(&path, &mut sess);
+                    assert!(result.is_ok(), "failed to parse {}: {:?}", path.display(), result.err());
                 }
             }
         }
@@ -710,9 +722,92 @@ mod tests {
             let mut coach = state.write().await;
             let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
             assert_eq!(sess.current_session_id, real_sid);
-            assert_eq!(sess.event_count, 1);
+            assert_eq!(sess.event_count, 0, "stale data discarded, no tools yet");
             assert!(sess.tool_counts.is_empty(),
                 "stale bootstrap tool_counts must be cleared");
+        }
+    }
+
+    /// End-to-end /clear → Coach restart scenario.
+    ///
+    /// Reproduces the production bug: session file has stale sessionId
+    /// (from before /clear). Scanner bootstraps from the stale JSONL,
+    /// then the first hook arrives with the real sessionId. The stale
+    /// data gets discarded — but the scanner must RE-BOOTSTRAP from
+    /// the correct JSONL on the next cycle so the session shows full
+    /// history, not event_count=1.
+    #[tokio::test]
+    async fn clear_then_reload_rebootstraps_from_correct_jsonl() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let my_pid = std::process::id();
+        let stale_sid = "pre-clear-conversation";
+        let real_sid = "post-clear-conversation";
+        let cwd = "/tmp/clear-reload-test";
+
+        // Session file still has the stale sessionId (Claude Code
+        // doesn't always update it immediately after /clear).
+        write_session_file_full(sessions_dir.path(), my_pid, stale_sid, cwd);
+
+        // JSONL for the OLD conversation (before /clear).
+        write_jsonl(projects_dir.path(), cwd, stale_sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"old1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"old1","content":"ok"}]}}"#,
+        ]);
+        // JSONL for the NEW conversation (after /clear) — this is the
+        // one with real work that should be displayed.
+        write_jsonl(projects_dir.path(), cwd, real_sid, &[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Edit","input":{}},{"type":"tool_use","id":"t3","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"},{"type":"tool_result","tool_use_id":"t3","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t4","name":"Write","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t4","content":"ok"}]}}"#,
+        ]);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+        let live = scan_live_sessions_in(sessions_dir.path());
+
+        // ── Step 1: Scanner bootstraps from stale JSONL ──
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+        {
+            let coach = state.read().await;
+            let sess = coach.sessions.get(&my_pid).unwrap();
+            assert_eq!(sess.tool_counts.get("Bash"), Some(&1), "stale bootstrap loaded");
+            assert_eq!(sess.event_count, 1);
+        }
+
+        // ── Step 2: First hook with real session_id → discard stale ──
+        {
+            let mut coach = state.write().await;
+            let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
+            assert_eq!(sess.event_count, 0, "stale data discarded");
+            assert!(sess.tool_counts.is_empty());
+        }
+
+        // ── Step 3: Scanner runs again → should re-bootstrap ──
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+        {
+            let coach = state.read().await;
+            let sess = coach.sessions.get(&my_pid).unwrap();
+            assert_eq!(sess.event_count, 4,
+                "re-bootstrap from correct JSONL: Read + Edit + Bash + Write = 4 events");
+            assert_eq!(sess.tool_counts.get("Read"), Some(&1));
+            assert_eq!(sess.tool_counts.get("Edit"), Some(&1));
+            assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
+            assert_eq!(sess.tool_counts.get("Write"), Some(&1));
+        }
+
+        // ── Step 4: Subsequent hooks don't change event_count (record_tool does) ──
+        {
+            let mut coach = state.write().await;
+            let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
+            assert_eq!(sess.event_count, 4, "apply_hook_event doesn't touch event_count");
+            sess.record_tool("Bash");
+            assert_eq!(sess.event_count, 5);
         }
     }
 
@@ -748,14 +843,18 @@ mod tests {
             assert_eq!(sess.event_count, 2);
         }
 
-        // Hook with same session_id — bootstrap data preserved.
+        // Hook with same session_id — bootstrap data preserved,
+        // event_count unchanged until record_tool is called.
         {
             let mut coach = state.write().await;
             let sess = coach.apply_hook_event(my_pid, sid, Some(cwd));
-            assert_eq!(sess.event_count, 3,
-                "bootstrap event_count should be incremented, not reset");
+            assert_eq!(sess.event_count, 2,
+                "bootstrap counts preserved, hook doesn't increment");
             assert_eq!(sess.tool_counts.get("Read"), Some(&1));
             assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
+            sess.record_tool("Edit");
+            assert_eq!(sess.event_count, 3);
         }
     }
+
 }

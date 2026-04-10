@@ -138,7 +138,6 @@ pub(crate) async fn run_permission_request(
 
     let mut coach = state.coach.write().await;
     let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
-    *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
     let mode = session.mode;
 
     if mode == CoachMode::Away {
@@ -414,7 +413,7 @@ pub(crate) async fn run_pre_tool_use(
     if tool == "Agent" {
         let mut coach = state.coach.write().await;
         let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
-        session.active_agents += 1;
+        session.record_agent_start();
         coach.log(pid, "PreToolUse", "agent starting", None);
         emit_update(&*state.emitter, &coach);
     }
@@ -450,9 +449,9 @@ pub(crate) async fn run_post_tool_use(
         let mut coach = state.coach.write().await;
         let event_count = {
             let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
-            *session.tool_counts.entry(tool.clone()).or_insert(0) += 1;
+            session.record_tool(&tool);
             if tool == "Agent" {
-                session.active_agents = session.active_agents.saturating_sub(1);
+                session.record_agent_end();
             }
             session.event_count
         };
