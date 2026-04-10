@@ -314,20 +314,29 @@ fn install_nested_hooks(
         .and_then(|f| f.to_str())
         .unwrap_or("");
 
-    // 1. Write the shim script so the command is on disk before the JSON.
+    // 1. Validate the existing config file *before* writing anything to
+    //    disk so a failed install leaves no orphaned shim behind.
+    let mut settings: serde_json::Value = match std::fs::read_to_string(config_path) {
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            format!(
+                "refusing to overwrite {} — it contains invalid JSON: {}",
+                config_path.display(),
+                e
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.to_string()),
+    };
+
+    // 2. Write the shim script so the command is on disk before the JSON.
     if let Some(parent) = shim_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(shim_path, shim_content).map_err(|e| e.to_string())?;
     crate::path_install::make_executable(shim_path)?;
 
-    // 2. Merge hook entries into the config file, preserving user entries.
+    // 3. Merge hook entries into the config file, preserving user entries.
     let expected = expected_commands(shim_path, events);
-
-    let mut settings: serde_json::Value = std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::json!({}));
 
     let settings_obj = settings
         .as_object_mut()
@@ -678,7 +687,23 @@ pub fn install_cursor_hooks_at(
     hooks_path: &std::path::Path,
     shim_path: &std::path::Path,
 ) -> Result<(), String> {
-    // 1. Write the shim script first so the executable referenced by
+    // 1. Validate the existing config file *before* writing anything to
+    //    disk so a failed install leaves no orphaned shim behind.
+    let mut settings: serde_json::Value = match std::fs::read_to_string(hooks_path) {
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            format!(
+                "refusing to overwrite {} — it contains invalid JSON: {}",
+                hooks_path.display(),
+                e
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::json!({ "version": 1, "hooks": {} })
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+
+    // 2. Write the shim script so the executable referenced by
     //    hooks.json is on disk by the time the JSON is written.
     if let Some(parent) = shim_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -686,14 +711,9 @@ pub fn install_cursor_hooks_at(
     std::fs::write(shim_path, cursor_shim_script(port)).map_err(|e| e.to_string())?;
     crate::path_install::make_executable(shim_path)?;
 
-    // 2. Merge our hook entries into hooks.json, preserving any existing
+    // 3. Merge our hook entries into hooks.json, preserving any existing
     //    user entries (e.g. gleaner-cursor-upload).
     let expected = expected_cursor_hook_commands(shim_path);
-
-    let mut settings: serde_json::Value = std::fs::read_to_string(hooks_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({ "version": 1, "hooks": {} }));
 
     let settings_obj = settings
         .as_object_mut()
@@ -1371,5 +1391,117 @@ mod tests {
         assert!(!check_hook_status_at(7700, &claude, &claude_shim).installed);
         assert_eq!(std::fs::read_to_string(&codex).unwrap(), codex_before);
         assert_eq!(std::fs::read_to_string(&cursor_hooks).unwrap(), cursor_before);
+    }
+
+    // ── Invalid JSON safety: install must not overwrite corrupt files ────
+
+    #[test]
+    fn install_nested_hooks_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let shim = test_shim(dir.path());
+
+        let garbage = "{ not valid json !!}";
+        std::fs::write(&path, garbage).unwrap();
+
+        let result = install_hooks_at(7700, &path, &shim);
+        assert!(result.is_err(), "install must fail on invalid JSON");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("invalid JSON"),
+            "error should mention invalid JSON, got: {err}"
+        );
+
+        // Original file must be preserved byte-for-byte.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+        // No orphaned shim script left behind.
+        assert!(!shim.exists(), "shim must not be created on failed install");
+    }
+
+    #[test]
+    fn install_cursor_hooks_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        let shim = dir.path().join("coach-cursor-hook.sh");
+
+        let garbage = "{trailing comma,}";
+        std::fs::write(&hooks_path, garbage).unwrap();
+
+        let result = install_cursor_hooks_at(7700, &hooks_path, &shim);
+        assert!(result.is_err(), "install must fail on invalid JSON");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("invalid JSON"),
+            "error should mention invalid JSON, got: {err}"
+        );
+
+        // Original file must be preserved byte-for-byte.
+        assert_eq!(std::fs::read_to_string(&hooks_path).unwrap(), garbage);
+        // No orphaned shim script left behind.
+        assert!(!shim.exists(), "shim must not be created on failed install");
+    }
+
+    /// Failed install on invalid JSON must not leave an orphaned shim
+    /// even when the shim's parent directory didn't previously exist.
+    #[test]
+    fn install_nested_no_shim_left_behind_on_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let shim_dir = dir.path().join("new_subdir");
+        let shim = shim_dir.join(CLAUDE_SHIM_FILENAME);
+
+        std::fs::write(&config, "NOT JSON").unwrap();
+        assert!(!shim_dir.exists());
+
+        let result = install_hooks_at(7700, &config, &shim);
+        assert!(result.is_err());
+        assert!(!shim.exists(), "shim must not exist after failed install");
+    }
+
+    /// Failed Cursor install on invalid JSON must not leave an orphaned shim.
+    #[test]
+    fn install_cursor_no_shim_left_behind_on_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        let shim_dir = dir.path().join("new_subdir");
+        let shim = shim_dir.join("coach-cursor-hook.sh");
+
+        std::fs::write(&hooks_path, "[invalid}").unwrap();
+        assert!(!shim_dir.exists());
+
+        let result = install_cursor_hooks_at(7700, &hooks_path, &shim);
+        assert!(result.is_err());
+        assert!(!shim.exists(), "shim must not exist after failed install");
+    }
+
+    #[test]
+    fn install_nested_hooks_still_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let shim = test_shim(dir.path());
+
+        // File does not exist — install should succeed and create it.
+        assert!(!path.exists());
+        install_hooks_at(7700, &path, &shim).unwrap();
+        assert!(path.exists());
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(content.get("hooks").is_some());
+    }
+
+    #[test]
+    fn install_cursor_hooks_still_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        let shim = dir.path().join("coach-cursor-hook.sh");
+
+        assert!(!hooks_path.exists());
+        install_cursor_hooks_at(7700, &hooks_path, &shim).unwrap();
+        assert!(hooks_path.exists());
+
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(content.get("hooks").is_some());
     }
 }

@@ -31,7 +31,8 @@ Tracked across `kodo test` runs.
 | CLI E2E: invalid `config set` | 2026-04-10 | pass | Bad `coach-mode` / rule state → clear stderr + exit 1 |
 | CLI E2E: `path status` | 2026-04-10 | pass | Default shim `~/.local/bin/coach` → App bundle; **`matches_running: false`** vs workspace binary; **`on $PATH: true`** |
 | CLI E2E: `path install --dir <tmp>` | 2026-04-10 | pass | Symlink `…/coach` → `target/release/coach`; warns dir not on PATH; **`path status` unchanged** (reports default dir only) |
-| CLI E2E: `path uninstall` | not run | n/a | Would remove **default** shim only — skipped to avoid touching user `~/.local/bin` |
+| CLI E2E: `path uninstall` | 2026-04-10 | pass | With **`HOME=$(mktemp -d)`**, removes only **`$HOME/.local/bin/coach`**; **no `--dir`** — a shim from **`path install --dir`** is left behind unless removed manually |
+| CLI E2E: hooks merge + uninstall (Claude + Cursor, binary) | 2026-04-10 | pass | **`HOME=$(mktemp -d)`**, **`target/release/coach`**. Valid dirty configs: **`shasum -a 256`** stable on **2nd** `hooks install` / `hooks cursor install`; uninstall preserves unrelated keys + user hooks. **Malformed:** syntax-invalid → **install exit 1**, file **unchanged**, **no shim**; uninstall → **exit 1**, file kept. Valid non-object root / `hooks` not object → **install exit 1**, file kept. See appendix **Hook E2E (dirty + malformed)** |
 | CLI: coach sessions list | 2026-04-10 | pass | Existing test handles missing projects dir |
 | CLI: coach replay | 2026-04-10 | pass | Existing test for unknown session error |
 | CLI: coach path install | 2026-04-10 | pass | Existing test creates shim |
@@ -53,6 +54,7 @@ Tracked across `kodo test` runs.
 | Rule engine: outdated models | 2026-04-10 | pass | post_tool_use_triggers_outdated_models_rule |
 | LLM observer | 2026-04-10 | pass | observer_fires_in_llm_mode_and_records_failure |
 | Settings: load/save | 2026-04-10 | pass | Unit tests for serde roundtrip |
+| Settings: corrupt/malformed JSON recovery (CLI + `serve`, release binary) | 2026-04-10 | pass | Truncated / non-JSON / empty / wrong-type → warning + defaults; `{}` silent defaults; read-only leaves file corrupt; `config set` + `serve` rewrite file. **Data loss** of prior fields on recovery without backup; see `tester-notes` |
 | Hook installation: merge logic | 2026-04-10 | pass | install_hooks_at tested |
 | Logging: file rotation | 2026-04-10 | pass | Unit tests for log rotation |
 | PID resolution | 2026-04-10 | pass | Unit test resolves_real_connection_to_child_pid |
@@ -146,3 +148,30 @@ curl -sS -X POST "http://127.0.0.1:$PORT/codex/hook/post-tool-use" -H 'Content-T
 ```
 
 **Verify:** `curl -sS "http://127.0.0.1:$PORT/api/state" | python3 -m json.tool` — expect `client` **claude** / **cursor** / **codex** on respective sessions. **`coach sessions list`** unchanged by these calls (different subsystem).
+
+## Appendix: PATH shim + Claude/Cursor hook files (binary E2E, 2026-04-10)
+
+**Goal:** Safe E2E without touching the real home directory.
+
+### A — Dirty valid configs + idempotency + selective uninstall
+
+1. `export HOME="$(mktemp -d)"`; `mkdir -p "$HOME/.coach" "$HOME/.claude" "$HOME/.cursor"`.
+2. Seed **`$HOME/.claude/settings.json`** with e.g. `"someUserSetting"`, `"permissions"`, and extra **`hooks.PostToolUse`** / **`SessionStart`** entries using nested `{"hooks":[{"type":"command","command":"…"}]}` (non-Coach commands).
+3. Seed **`$HOME/.cursor/hooks.json`** with `"version":1`, a custom top-level key (e.g. **`gleanerMeta`**), and user **`hooks.afterShellExecution`** / **`sessionStart`** `command` arrays.
+4. From repo root: **`./target/release/coach path install`** (optional repeat — idempotent shim).
+5. **`./target/release/coach hooks install`** twice — `shasum -a 256 "$HOME/.claude/settings.json"` **unchanged** on second run.
+6. **`./target/release/coach hooks cursor install`** twice — `shasum -a 256 "$HOME/.cursor/hooks.json"` **unchanged** on second run.
+7. **`./target/release/coach hooks uninstall`** then **`hooks cursor uninstall`** — confirm unrelated keys and user hook commands remain; Coach shim files removed from **`$HOME/.coach/`** and **`$HOME/.cursor/`**.
+8. **`./target/release/coach path uninstall`** — removes **`$HOME/.local/bin/coach`** only.
+
+### B — Malformed files (same binary, isolated `HOME`)
+
+| Precondition | Command | Expected |
+|--------------|---------|----------|
+| Claude `settings.json` = `{ "almost":"json` (invalid) | `hooks install` | Exit **1**, **`refusing to overwrite … invalid JSON`**; file **unchanged**; **no** `~/.coach/claude-hook.sh` |
+| Claude `settings.json` = `[1,2,3]` | `hooks install` | Exit **1**, message **`config file is not a JSON object`**, file **unchanged** |
+| Claude `{"hooks":"nope","keep":true}` | `hooks install` | Exit **1**, **`hooks is not an object`**, file **unchanged** |
+| Cursor `hooks.json` = `not json at all` | `hooks cursor install` | Exit **1**, **`refusing to overwrite … invalid JSON`**; file **unchanged**; **no** `coach-cursor-hook.sh` |
+| Any unparseable `settings.json` / `hooks.json` | `hooks uninstall` / `hooks cursor uninstall` | Exit **1**, serde error on stderr, **file unchanged** |
+
+**Separate check (`path install --dir`):** custom-dir shim survives **`path uninstall`** (no **`uninstall --dir`**).

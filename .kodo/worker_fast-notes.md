@@ -25,6 +25,11 @@
 
 - `hooks_user_enabled` and `cursor_hooks_user_enabled` record install intent; they survive `auto_uninstall_hooks_on_exit` (default true). Startup `sync_managed_*` reinstalls from intent and migrates legacy “hooks on disk, flag false” once.
 
+### Hook install integrity (Stage 4, 2026-04-10)
+
+- **`hooks install` / `hooks cursor install`:** If Claude `settings.json` or Cursor `hooks.json` already exists but is **syntax-invalid JSON**, install **fails (exit 1)**, stderr explains parse error, **file bytes unchanged**, **no shim** written (validation runs **before** shim + merge — avoids orphaned `~/.coach/claude-hook.sh` / `coach-cursor-hook.sh`).
+- **Still not fixed (UX):** `path uninstall` only removes the **default** shim (`~/.local/bin/coach`); custom **`path install --dir`** shims remain — document in tester notes, not a hook-merge bug.
+
 ## Prompts
 
 - Templates live in `src-tauri/prompts/*.txt`, embedded via `prompts.rs`. Override at dev time: `COACH_PROMPTS_DIR` → read fresh each call; missing file errors (no silent fallback).

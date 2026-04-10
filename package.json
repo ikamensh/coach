@@ -1,6 +1,6 @@
 {
   "name": "coach",
-  "version": "0.1.72",
+  "version": "0.1.74",
   "private": true,
   "scripts": {
     "dev": "vite",

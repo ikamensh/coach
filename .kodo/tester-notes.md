@@ -5,7 +5,7 @@
 - **Binary:** Workspace outputs `coach` at **`/coach/target/release/coach`** (or `target/debug/coach` after `cargo test`). Not under `src-tauri/target/` alone — use workspace root `target/`.
 - **Rust:** `cargo test --workspace` — **211** passed, **21** ignored (e.g. coach-core 164+15, hook_integration 29+2, cli 17, scenario_replay 1+4). Use `--workspace`; bare `cargo test` from repo root can be misleading if you only read the last `test result` line.
 - **Node:** `npm test` — Vitest **380** tests, 36 files. `npm run build` — green (~1.5s Vite).
-- **CLI:** `./target/release/coach --version` matches workspace `0.1.70`.
+- **CLI:** `./target/release/coach --version` matches workspace (e.g. `0.1.74`).
 
 ## UX gotchas (reconfirmed)
 
@@ -53,9 +53,34 @@ Binary: `./target/release/coach` from repo root.
 - **`coach status` when server down:** message says “Start the **GUI** first” — headless `serve` is enough; wording is slightly misleading.
 - **`status` text output:** `model:` line shows extra quotes (`"openai" / "gpt-4.1-nano"`) because values are printed from JSON — cosmetic only.
 
+## External hooks + PATH shim (binary E2E, tightened 2026-04-10)
+
+Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.coach/`, **`~/.local/bin/coach`** all under that tree.
+
+**Dirty but valid JSON (realistic pre-existing configs):** `coach path install` then **`coach hooks install`** twice — second run leaves **`settings.json` SHA-256 unchanged**; **`coach hooks cursor install`** twice — second run leaves **`hooks.json` SHA-256 unchanged**. `hooks uninstall` / **`hooks cursor uninstall`** remove only Coach-managed hook entries and shim scripts (`~/.coach/claude-hook.sh`, `~/.cursor/coach-cursor-hook.sh`); unrelated top-level keys (`someUserSetting`, `permissions`), nested non-Coach Claude `command` hooks, and Cursor extras (`gleanerMeta`, user `command` rows) **remain**.
+
+**Malformed / edge cases (`install_nested_hooks` / `install_cursor_hooks_at` in `hooks.rs`):**
+
+| Case | `hooks install` / `hooks cursor install` | `hooks uninstall` / `hooks cursor uninstall` |
+|------|--------------------------------------------|---------------------------------------------|
+| **Syntax-invalid JSON** (truncated `{`, `not json`) | **Exit 1** — `refusing to overwrite … — it contains invalid JSON: …`; **config file bytes unchanged**; **no new shim** (`~/.coach/claude-hook.sh` / `~/.cursor/coach-cursor-hook.sh`) — parse runs **before** any shim write (**E2E 2026-04-10**, `target/release/coach` **0.1.74**, isolated `HOME`). | **Exit 1** — parse error; **file unchanged** |
+| **Valid JSON, root not an object** (e.g. `[1,2,3]`) | **Exit 1** — `config file is not a JSON object` (Claude); **file unchanged** | Same — **unchanged** if still invalid |
+| **Root object but `"hooks"` not an object** (e.g. `"hooks":"nope"`) | **Exit 1** — `hooks is not an object`; **file unchanged** | Needs parseable `hooks` object — **fails** if still wrong |
+
+**Gaps / nits**
+
+- **`path uninstall` has no `--dir`.** Custom-dir shim from **`path install --dir`** survives **`path uninstall`** (only default `~/.local/bin/coach`). **Reconfirmed 2026-04-10** vs **`target/release/coach` 0.1.74**: after `path install` + `path install --dir $CUSTOM`, `path uninstall` removes only `$HOME/.local/bin/coach`; **`$CUSTOM/coach` symlink remains** (see Stage 4 E2E report).
+- **Success messages** show literal `~/.claude/…` while **`HOME` override** shows different paths on disk (cosmetic).
+
+## Stage 4 — syntax-invalid hook JSON (fixed 2026-04-10)
+
+- **Previous bug:** parse failure was treated as empty `{}` → install **overwrote** corrupt JSON with valid merged output (**exit 0**).
+- **Current behavior:** `install_nested_hooks` / `install_cursor_hooks_at` validate existing JSON **before** writing shims or configs — **exit 1**, stderr cites parse error; **config bytes preserved**; **no orphaned shims** on that failure path.
+- **Regression E2E:** `cargo build --release -p coach` then isolated `HOME` + invalid configs — **exit 1**, SHA unchanged, no `~/.coach` (Claude case) / no `coach-cursor-hook.sh` (Cursor case); fresh `HOME` first install — **exit 0**, both JSON files and both shims created.
+
 ## Discovery docs
 
-- **`.kodo/test-report.md`** — setup commands, CLI verbatim help, smoke table, baselines **209 / 21** + **380** Vitest; artifact path `target/release/coach` at repo root — **accurate**.
+- **`.kodo/test-report.md`** — setup commands, CLI verbatim help, smoke table, baselines **209 / 21** + **380** Vitest; artifact path `target/release/coach` at repo root — **accurate**. **Note:** its `serve --help` quirk is **fixed** in current tree (see `test-coverage.md`).
 - **`.kodo/test-coverage.md`** — Rust + Vitest baselines in that file; Codex/Cursor/Claude **HTTP** also covered by **2026-04-10 manual binary E2E** (see coverage rows).
 
 ## Optional / not run here
@@ -63,6 +88,15 @@ Binary: `./target/release/coach` from repo root.
 - **`tauri dev` / full GUI:** long-lived; blocked without display server.
 - **`cargo test -- --ignored`:** needs API keys / external processes.
 - **`pycoach` feature:** separate feature flag; not default.
+
+## Settings file corruption (`~/.coach/settings.json`, E2E 2026-04-10)
+
+- **Binary:** `coach/target/release/coach` (0.1.74).
+- **Implementation:** `Settings::load_from` — parse error → `eprintln!` warning + **`Settings::default()`**; missing file → defaults **without** warning (`read` error).
+- **Read-only (`config get`, etc.):** corrupt file **stays on disk** unchanged; stderr shows serde error; values shown are **full defaults** (not a partial merge).
+- **`{}`:** valid JSON — deserializes with serde defaults for missing fields → **no warning** (differs from syntax-invalid files).
+- **Repair (writes valid JSON):** `coach serve --port P` (saves after load); `coach config set …` with **no** daemon on `configured_port()` (file path); `coach config set …` with daemon up (HTTP → `CoachState::save()`). Any save **replaces the whole file** — prior settings that only existed in the corrupt blob are **not recoverable** unless the user kept a backup.
+- **Nits:** `config set` with corrupt file can **print the parse warning twice** (`configured_port()` + inner `Settings::load()`). While corrupt, **`configured_port()` is 7700**, so `hooks install` / server probe use default port — can mismatch a custom port that was only in the broken file.
 
 ## Misc
 
