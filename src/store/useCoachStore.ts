@@ -68,6 +68,8 @@ interface SessionSnapshot {
   intervention_muted: boolean;
   pending_intervention: string | null;
   intervention_count: number;
+  coach_last_system_prompt: string | null;
+  coach_last_user_message: string | null;
 }
 
 interface ModelConfig {

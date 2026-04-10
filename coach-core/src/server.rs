@@ -615,6 +615,8 @@ async fn observer_consumer(
                 if let Some(sess) = s.sessions.get_mut(&pid) {
                     sess.coach.record_success(latency_ms, result.usage, Some(result.chain));
                     sess.coach.memory.last_assessment = Some(assessment.clone());
+                    sess.coach.memory.last_system_prompt = Some(result.system_prompt);
+                    sess.coach.memory.last_user_message = Some(result.user_message);
                     if let Some(ref msg) = intervention {
                         sess.coach.memory.pending_intervention = Some(msg.clone());
                         sess.coach.telemetry.intervention_count += 1;

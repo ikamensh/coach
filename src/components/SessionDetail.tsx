@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useCoachStore } from "../store/useCoachStore";
 import { formatDuration, formatTime, timeAgo } from "../utils/time";
 import { abbreviateCwd } from "../utils/path";
@@ -254,6 +254,14 @@ export function SessionDetail() {
                 </div>
               </div>
             )}
+
+            {/* Last prompt sent to the LLM — collapsible for prompt iteration. */}
+            {session.coach_last_user_message && (
+              <PromptSection
+                system={session.coach_last_system_prompt}
+                user={session.coach_last_user_message}
+              />
+            )}
           </div>
         ) : engineMode === "rules" ? (
           <div className="text-xs text-zinc-600 dark:text-zinc-400 bg-zinc-50 dark:bg-zinc-800/30 border border-zinc-200/60 dark:border-zinc-700/40 rounded px-3 py-2">
@@ -359,6 +367,46 @@ export function SessionDetail() {
           </div>
         )}
       </section>
+    </div>
+  );
+}
+
+function PromptSection({ system, user }: { system: string | null; user: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="border-t border-amber-200/40 dark:border-amber-500/10 pt-2">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors flex items-center gap-1"
+      >
+        <span className="inline-block transition-transform" style={{ transform: open ? "rotate(90deg)" : undefined }}>
+          ▸
+        </span>
+        Last prompt
+      </button>
+      {open && (
+        <div className="mt-1 space-y-2">
+          {system && (
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-0.5">
+                System
+              </div>
+              <pre className="text-[11px] text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-words bg-zinc-100 dark:bg-zinc-800/50 rounded px-2 py-1.5 max-h-48 overflow-y-auto">
+                {system}
+              </pre>
+            </div>
+          )}
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-0.5">
+              User
+            </div>
+            <pre className="text-[11px] text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-words bg-zinc-100 dark:bg-zinc-800/50 rounded px-2 py-1.5 max-h-48 overflow-y-auto">
+              {user}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

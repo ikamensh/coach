@@ -15,6 +15,10 @@ pub struct ObserveToolUseOutput {
     pub assessment: String,
     pub chain: CoachChain,
     pub usage: CoachUsage,
+    /// The system prompt sent to the LLM for this observation.
+    pub system_prompt: String,
+    /// The user message sent to the LLM for this observation.
+    pub user_message: String,
 }
 
 /// Continue an existing coach conversation when evaluating a Stop hook.
@@ -58,12 +62,15 @@ impl LlmCoach {
             &input.tool_input,
             input.user_prompt.as_deref(),
         )?;
+        let system = crate::llm::coach_system_prompt(&input.priorities)?;
         let (assessment, chain, usage) =
             crate::llm::observe_event(&self.state, &input.priorities, &input.chain, &event).await?;
         Ok(ObserveToolUseOutput {
             assessment,
             chain,
             usage,
+            system_prompt: system,
+            user_message: event,
         })
     }
 

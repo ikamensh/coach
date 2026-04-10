@@ -103,6 +103,10 @@ pub struct CoachMemory {
     pub session_title: Option<String>,
     pub pending_intervention: Option<String>,
     pub last_user_prompt: Option<String>,
+    /// The system prompt sent to the LLM on the last observer call.
+    pub last_system_prompt: Option<String>,
+    /// The user message sent to the LLM on the last observer call.
+    pub last_user_message: Option<String>,
 }
 
 impl CoachMemory {
@@ -114,6 +118,8 @@ impl CoachMemory {
             session_title: None,
             pending_intervention: None,
             last_user_prompt: None,
+            last_system_prompt: None,
+            last_user_message: None,
         }
     }
 }
