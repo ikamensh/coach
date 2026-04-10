@@ -115,6 +115,40 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 - **Repair (writes valid JSON):** `coach serve --port P` (saves after load); `coach config set …` with **no** daemon on `configured_port()` (file path); `coach config set …` with daemon up (HTTP → `CoachState::save()`). Any save **replaces the whole file** — prior settings that only existed in the corrupt blob are **not recoverable** unless the user kept a backup.
 - **Nits:** `config set` with corrupt file can **print the parse warning twice** (`configured_port()` + inner `Settings::load()`). While corrupt, **`configured_port()` is 7700**, so `hooks install` / server probe use default port — can mismatch a custom port that was only in the broken file.
 
+## Linux ARM64 build verification (Debian 12 VPS)
+
+**VPS:** `root@46.225.111.102` (hostname `openclaw-1`), Debian 12, aarch64 (`6.1.0-44-arm64`), Rust 1.94.1, Node 22.22.0, npm 10.9.4.
+
+**Transfer:** `rsync -avz` excluding `target/`, `node_modules/`, `.claude/`, `.kodo/`, `dist/`, `.git/`.
+
+### Re-verify 2026-04-10 (E2E after `RunEvent::Reopen` fix)
+
+Synced workspace → VPS; ran **`npm install`** (up to date, 111 packages, 1 npm audit advisory), **`npm run build`** (Vite ~1.7s, `dist/` produced), **`cargo clean`** (full wipe ~6.3 GiB) then **`cargo build --release -p coach`** — **~3m 12s**, **0 errors**. **`./target/release/coach --version`** → `coach 0.1.76`; **`file`** → ELF 64-bit **ARM aarch64** PIE. **`npm test`** — 35 passed (3 files). **Not re-run:** `cargo test --workspace` on VPS this pass (was green on prior VPS pass).
+
+### Historical: bug fixed — `RunEvent::Reopen` is macOS-only
+
+`tauri::RunEvent::Reopen` exists only on macOS (Tauri 2). Unconditional match arm broke Linux builds (`E0599`). **Fix:** `#[cfg(target_os = "macos")]` on that arm; `_app_handle` on non-macOS. `src-tauri/src/lib.rs` ~146–154.
+
+### Exact commands for repro
+
+```bash
+# Transfer (from macOS, repo root)
+rsync -avz --exclude 'target/' --exclude 'node_modules/' --exclude '.claude/' \
+  --exclude '.kodo/' --exclude 'dist/' --exclude '.git/' \
+  ./ root@46.225.111.102:/root/coach/
+
+# On VPS
+ssh root@46.225.111.102
+cd /root/coach
+npm install
+npm run build
+# optional cold compile: cargo clean && cargo build --release -p coach
+cargo build --release -p coach
+./target/release/coach --version
+cargo test --workspace   # optional full Rust suite on VPS
+npm test
+```
+
 ## Misc
 
 - `npm audit` advisories are separate from functional tests.

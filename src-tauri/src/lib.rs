@@ -143,9 +143,10 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Coach")
-        .run(|app_handle, event| match event {
+        .run(|_app_handle, event| match event {
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
-                if let Some(w) = app_handle.get_webview_window("main") {
+                if let Some(w) = _app_handle.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.unminimize();
                     let _ = w.set_focus();

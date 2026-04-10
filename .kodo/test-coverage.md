@@ -110,6 +110,12 @@ Tracked across `kodo test` runs.
 | HTTP E2E: `observer_capable_providers` + model POST | 2026-04-10 | pass | `GET /api/state` / `GET /state`: `["openai","anthropic","google"]`; `POST /api/config/model` **`openrouter`** — same list. Settings UI reads list from IPC snapshot (**`src/types.ts`** includes field) |
 | Frontend: type alignment with Rust | 2026-04-10 | partial | **`observer_capable_providers`** on TS `CoachSnapshot`; no automated serde roundtrip test front↔back |
 | Frontend: Tauri / Settings UX | 2026-04-10 | partial | Logic wired in store + `SettingsPane`; **no** `tauri dev` / webview pass this run |
+| **Linux ARM64: `npm run build`** | 2026-04-10 | **pass** | Debian 12, Node 22.22.0, `tsc -b` + Vite **~1.56s**; `dist/assets/index-DRR5y358.css` ~30.65 kB, `index-ByFNAYfX.js` ~250.58 kB |
+| **Linux ARM64: `cargo build --release -p coach`** | 2026-04-10 | **pass (fixed)** | Debian 12, Rust 1.94.1, aarch64. Initial failure: `RunEvent::Reopen` is macOS-only — fixed with `#[cfg(target_os = "macos")]`. Clean build after fix (~42s first, ~29s incremental). Zero warnings. |
+| **Linux ARM64: `coach --version`** | 2026-04-10 | **pass** | `coach 0.1.76` — matches workspace version |
+| **Linux ARM64: `coach --help`** | 2026-04-10 | **pass** | Full CLI usage printed correctly |
+| **Linux ARM64: `cargo test --workspace`** | 2026-04-10 | **pass** | **219 passed**, 0 failed, **21 ignored** (identical to macOS) |
+| **Linux ARM64: `npm test`** | 2026-04-10 | **pass** | **35 tests**, 3 files, ~489ms (Vitest 4.1.2) |
 | GUI rendering | blocked | n/a | Requires display server |
 | Real Claude Code integration | blocked | n/a | Requires claude CLI on PATH |
 | Real Cursor integration | blocked | n/a | Requires cursor-agent on PATH |

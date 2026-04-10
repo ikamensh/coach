@@ -4,6 +4,7 @@
 
 - Workspace root: `coach/Cargo.toml` — artifacts land in **`coach/target/`**, not `src-tauri/target/`.
 - Release CLI binary: `cargo build --release` from `coach/` (or `src-tauri/`) → `target/release/coach`.
+- **Linux:** `tauri::RunEvent::Reopen` is **macOS-only** (Tauri 2). Unconditional `match` arms break non-macOS builds (`E0599`); gate with `#[cfg(target_os = "macos")]` in `src-tauri/src/lib.rs` run handler.
 
 ## Verify
 
