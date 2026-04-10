@@ -179,7 +179,7 @@ impl SessionCoachState {
             memory: CoachMemory::new(),
             telemetry: CoachTelemetry::new(),
             observer_tx: None,
-            intervention_muted: false,
+            intervention_muted: true,
         }
     }
 
