@@ -1,6 +1,6 @@
 [package]
 name = "coach-core"
-version = "0.1.42"
+version.workspace = true
 edition = "2021"
 
 [features]
