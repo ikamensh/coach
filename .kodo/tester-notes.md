@@ -115,15 +115,29 @@ Isolate with **`export HOME="$(mktemp -d)"`** — `~/.claude/settings.json`, `~/
 - **Repair (writes valid JSON):** `coach serve --port P` (saves after load); `coach config set …` with **no** daemon on `configured_port()` (file path); `coach config set …` with daemon up (HTTP → `CoachState::save()`). Any save **replaces the whole file** — prior settings that only existed in the corrupt blob are **not recoverable** unless the user kept a backup.
 - **Nits:** `config set` with corrupt file can **print the parse warning twice** (`configured_port()` + inner `Settings::load()`). While corrupt, **`configured_port()` is 7700**, so `hooks install` / server probe use default port — can mismatch a custom port that was only in the broken file.
 
-## Linux ARM64 build verification (Debian 12 VPS)
+## Linux ARM64 — Debian 12 VPS
 
-**VPS:** `root@46.225.111.102` (hostname `openclaw-1`), Debian 12, aarch64 (`6.1.0-44-arm64`), Rust 1.94.1, Node 22.22.0, npm 10.9.4.
+### Stage 2 verification (2026-04-10, re-run)
 
-**Transfer:** `rsync -avz` excluding `target/`, `node_modules/`, `.claude/`, `.kodo/`, `dist/`, `.git/`.
+**Host:** `root@46.225.111.102` (`openclaw-1`), **6.1.0-44-arm64**, Rust **1.94.1**. Sync: **`rsync -avz --delete`** excluding `target/`, `node_modules/`, `.claude/`, `dist/`, `.git/` (include `.kodo/` if you want notes parity).
 
-### Re-verify 2026-04-10 (E2E after `RunEvent::Reopen` fix)
+**Authoritative clean env (no API keys leaking from login shell):**
 
-Synced workspace → VPS; ran **`npm install`** (up to date, 111 packages, 1 npm audit advisory), **`npm run build`** (Vite ~1.7s, `dist/` produced), **`cargo clean`** (full wipe ~6.3 GiB) then **`cargo build --release -p coach`** — **~3m 12s**, **0 errors**. **`./target/release/coach --version`** → `coach 0.1.76`; **`file`** → ELF 64-bit **ARM aarch64** PIE. **`npm test`** — 35 passed (3 files). **Not re-run:** `cargo test --workspace` on VPS this pass (was green on prior VPS pass).
+```bash
+ssh root@46.225.111.102 'bash -lc "cd /root/coach && export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin && env -i HOME=/root USER=root PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin RUST_BACKTRACE=1 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GOOGLE_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY cargo test --workspace"'
+```
+
+**`cargo test --workspace`:** **219** passed, **0** failed, **21** ignored — per-crate: `coach_lib` **0**; `coach` **0**; `cli_integration` **18**; `pycoach_sidecar` **0**; coach-core unit **171** + **15** ign; `hook_integration` **29** + **2** ign; `scenario_replay` **1** + **4** ign; doc-tests **0**.
+
+**`observer_does_not_fire_in_rules_mode` — wrong test setup, not a product bug.** Production gates the observer queue on `coach_mode == Llm` + capable provider (`server.rs` `run_post_tool_use`). The test must set **`coach_mode = EngineMode::Rules`** because `Settings::default()` is **Llm**. Extra check: **`OPENAI_API_KEY=sk-fake… cargo test -p coach-core observer_does_not_fire_in_rules_mode -- --exact`** still **pass** — confirms Rules mode, not missing keys/timing.
+
+**Linux-specific checks:** **`pid_resolver::tests::resolves_real_connection_to_child_pid`** (**netstat2** / **`/proc/net/tcp`**) — **pass** in suite.
+
+**`npm test`:** **35** passed (3 files) — not re-run this session; prior baseline unchanged unless `package.json` shifts.
+
+### Historical: E2E after `RunEvent::Reopen` fix
+
+Earlier pass: **`npm run build`**, **`cargo build --release -p coach`**, **`file`** → ELF **aarch64** PIE; version numbers drift with releases — use **`coach --version`** on the artifact under test.
 
 ### Historical: bug fixed — `RunEvent::Reopen` is macOS-only
 

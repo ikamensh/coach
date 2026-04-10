@@ -4,6 +4,10 @@ Tracked across `kodo test` runs.
 
 **Baseline run**: 2026-04-10 — **254** pass (**219** Rust + **35** Vitest), 0 fail, **21** ignored (`cargo test --workspace` + `npm test`). *(Earlier docs listed inflated Vitest counts when `vitest` picked up duplicate `*.test.ts` under **`.claude/worktrees/`**; `vite.config.ts` excludes that path.)* **CLI E2E re-verify:** `cargo build --release -p coach`; isolated `HOME` + `settings.json` `{"port":1}` — `coach status` down prints **`Start it with \`coach serve\` or launch the GUI`**; `coach serve --port` then `coach status` exit 0; **`path status|uninstall --dir`** custom-dir roundtrip. **Stage 5 re-verify:** `npm test` green; `cargo test --workspace` **219** passed / **21** ignored.
 
+**Authoritative cross-platform run** (2026-04-10): `cargo test --workspace` — **219 passed, 0 failed, 21 ignored** on **both macOS (local) and Debian 12 ARM64 VPS** (`root@46.225.111.102`). Breakdown: coach-core 171+15ign, cli_integration 18, hook_integration 29+2ign, scenario_replay 1+4ign.
+
+**`observer_does_not_fire_in_rules_mode` resolution**: **Incorrect test setup, not a product bug.** The test asserted that rules mode does not fire the observer, but never set `coach_mode = EngineMode::Rules` — `Settings::default()` is `EngineMode::Llm`. The test passed incidentally on macOS (observer spawns in Llm mode but fails quickly without API keys, no activity entry within 150ms). On VPS with API keys in env, the observer could actually fire and the test would fail. **Fix:** set `coach_mode = EngineMode::Rules` on the test server state before the hook call (`coach-core/tests/hook_integration.rs`).
+
 **CLI E2E (config + path)**: 2026-04-10 — `target/release/coach`; Coach daemon **not** on port 7700 (file-backed `config set`); settings restored from backup after mutations.
 
 **HTTP server E2E (binary, hooks + CLI)**: 2026-04-10 — `target/release/coach serve --port <PORT>` on localhost; **`curl`** to Claude `/hook/...`, Cursor `/cursor/hook/...`, Codex `/codex/hook/...`; verified with **`coach status`** + **`GET /api/state`**. **`coach sessions list`** exercised separately — lists **on-disk saved transcripts**, not hook server memory (see findings row).
@@ -114,7 +118,7 @@ Tracked across `kodo test` runs.
 | **Linux ARM64: `cargo build --release -p coach`** | 2026-04-10 | **pass (fixed)** | Debian 12, Rust 1.94.1, aarch64. Initial failure: `RunEvent::Reopen` is macOS-only — fixed with `#[cfg(target_os = "macos")]`. Clean build after fix (~42s first, ~29s incremental). Zero warnings. |
 | **Linux ARM64: `coach --version`** | 2026-04-10 | **pass** | `coach 0.1.76` — matches workspace version |
 | **Linux ARM64: `coach --help`** | 2026-04-10 | **pass** | Full CLI usage printed correctly |
-| **Linux ARM64: `cargo test --workspace`** | 2026-04-10 | **pass** | **219 passed**, 0 failed, **21 ignored** (identical to macOS) |
+| **Linux ARM64: `cargo test --workspace`** | 2026-04-10 | **pass** | Debian 12 aarch64 (`openclaw-1`), Rust **1.94.1**. **219** passed, 0 failed, **21** ignored — `cli_integration` **18**; `coach_core` **171** + **15** ign; `hook_integration` **29** + **2** ign; `scenario_replay` **1** + **4** ign. **Stage 2 probes:** `pid_resolver::resolves_real_connection_to_child_pid` (netstat2 / **`/proc/net/tcp`**) **ok**; scanner + hook integration tests **ok**; isolated `HOME` **`path install` → `path status` → `path uninstall`** for **`~/.local/bin/coach`** **ok**. **`hook_integration::observer_does_not_fire_in_rules_mode`** required **`coach_mode = Rules`** in-test because default `Settings` is **`EngineMode::Llm`** — fixed same session. |
 | **Linux ARM64: `npm test`** | 2026-04-10 | **pass** | **35 tests**, 3 files, ~489ms (Vitest 4.1.2) |
 | GUI rendering | blocked | n/a | Requires display server |
 | Real Claude Code integration | blocked | n/a | Requires claude CLI on PATH |

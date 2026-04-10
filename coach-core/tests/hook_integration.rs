@@ -916,6 +916,10 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
 #[tokio::test]
 async fn observer_does_not_fire_in_rules_mode() {
     let (base, state) = start_test_server().await;
+    {
+        let mut s = state.write().await;
+        s.coach_mode = coach_core::settings::EngineMode::Rules;
+    }
     let client = reqwest::Client::new();
 
     client

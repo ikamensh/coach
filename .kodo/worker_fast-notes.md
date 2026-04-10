@@ -9,7 +9,7 @@
 ## Verify
 
 - Strict clippy: `cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings`.
-- Rust tests: `cargo test --workspace` (repo root) — **219** passed, **21** ignored (2026-04-10); `cargo test --all-features` adds `pycoach_sidecar` when `uv` + sibling `ilya/pycoach` available. Vitest: **`npm test`** — **35** tests, **3** files.
+- Rust tests: `cargo test --workspace` (repo root) — **219** passed, **21** ignored (2026-04-10); `cargo test --all-features` adds `pycoach_sidecar` when `uv` + sibling `ilya/pycoach` available. Vitest: **`npm test`** — **35** tests, **3** files. **Linux parity (Stage 2):** same counts on Debian 12 ARM64 — `hook_integration::observer_does_not_fire_in_rules_mode` must set `coach_mode = Rules` in-test (`Settings::default()` is `Llm`, or env API keys can make the observer fire and flake).
 - **Kodo run `20260410_135005`:** consolidated test report at **`~/.kodo/runs/20260410_135005/test-report.md`** (stages 1–6, fixes vs remaining findings).
 - Optional sidecar only: `cargo test --features pycoach --test pycoach_sidecar`.
 - Frontend: repo root `npm test`, `npm run build`.
