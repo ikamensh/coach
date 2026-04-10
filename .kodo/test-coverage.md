@@ -4,6 +4,8 @@ Tracked across `kodo test` runs.
 
 **Baseline run**: 2026-04-10 — 589 pass, 0 fail, 21 ignored (see `test-report.md` for details)
 
+**CLI E2E (config + path)**: 2026-04-10 — `target/release/coach`; Coach daemon **not** on port 7700 (file-backed `config set`); settings restored from backup after mutations.
+
 ## Test Entrypoints
 - **TS**: `npm run test` → vitest, 36 files (380 tests) in `src/components/*.test.ts`
 - **Rust**: `cargo test --workspace` → 209 tests across coach-core unit, cli_integration, hook_integration, scenario_replay
@@ -20,7 +22,14 @@ Tracked across `kodo test` runs.
 | CLI: coach hooks install/uninstall (Claude) | 2026-04-10 | pass | Existing test `cli_hooks_install_matches_install_hooks_at` |
 | CLI: coach hooks codex status/install/uninstall | 2026-04-10 | pass | `check_codex_hook_status` / install paths in `cli.rs`; HTTP Codex routes in `server.rs` |
 | CLI: coach hooks cursor install/uninstall | 2026-04-10 | pass | Existing test covers cursor hooks |
-| CLI: coach config get/set | 2026-04-10 | pass | Existing tests cover priorities, idempotency, preservation |
+| CLI: coach config get/set | 2026-04-10 | pass | Unit/integration tests; see **E2E row** below |
+| CLI E2E: `config get` / `get all` / keys | 2026-04-10 | pass | Full JSON includes `api_tokens` (empty here). Keys: priorities (numbered lines), `model`, `coach-mode` (**Debug:** `Llm`/`Rules`), `port`, `rules`. Unknown key → error exit 1 |
+| CLI E2E: `config list` | 2026-04-10 | n/a | **Not a command** — `coach config list` → `usage: coach config <get|set>` |
+| CLI E2E: `config set` + disk check | 2026-04-10 | pass | **Daemon down:** `set priorities`, `set model`, `set coach-mode`, `set rule outdated_models off/on`, `set api-token openai ""` (clears). Verified `~/.coach/settings.json` after sets; restored from backup |
+| CLI E2E: invalid `config set` | 2026-04-10 | pass | Bad `coach-mode` / rule state → clear stderr + exit 1 |
+| CLI E2E: `path status` | 2026-04-10 | pass | Default shim `~/.local/bin/coach` → App bundle; **`matches_running: false`** vs workspace binary; **`on $PATH: true`** |
+| CLI E2E: `path install --dir <tmp>` | 2026-04-10 | pass | Symlink `…/coach` → `target/release/coach`; warns dir not on PATH; **`path status` unchanged** (reports default dir only) |
+| CLI E2E: `path uninstall` | not run | n/a | Would remove **default** shim only — skipped to avoid touching user `~/.local/bin` |
 | CLI: coach sessions list | 2026-04-10 | pass | Existing test handles missing projects dir |
 | CLI: coach replay | 2026-04-10 | pass | Existing test for unknown session error |
 | CLI: coach path install | 2026-04-10 | pass | Existing test creates shim |
@@ -51,3 +60,52 @@ Tracked across `kodo test` runs.
 | Real Cursor integration | blocked | n/a | Requires cursor-agent on PATH |
 | LLM observer with real API | blocked | n/a | Requires ANTHROPIC_API_KEY |
 | UI smoke test | blocked | n/a | Requires macOS WindowServer |
+
+## Appendix: CLI config / path E2E transcript (2026-04-10)
+
+Binary: `/Users/ikamen/ai-workspace/ilya/coach/target/release/coach`. Shell: zsh on macOS. **`cp ~/.coach/settings.json /tmp/coach-settings.e2e.bak`** before mutations; **`cp` backup back** after.
+
+```text
+$ coach config list
+coach: usage: coach config <get|set>; got 'list'
+# exit 1
+
+$ coach config get not_a_key
+coach: unknown config key 'not_a_key'
+# exit 1
+
+$ coach config set priorities "E2E-first,E2E-second,E2E-third"
+priorities = ["E2E-first", "E2E-second", "E2E-third"]
+
+$ coach config get priorities
+1. E2E-first
+2. E2E-second
+3. E2E-third
+
+$ coach config set coach-mode rules
+coach-mode = rules
+
+$ coach config get coach-mode
+Rules
+
+$ coach config set coach-mode llm
+coach-mode = llm
+
+$ coach config get coach-mode
+Llm
+
+$ coach config set rule outdated_models off
+rule outdated_models = off
+
+$ coach path status
+install path:    /Users/ikamen/.local/bin/coach
+installed:       true
+target:          /Applications/Coach.app/Contents/MacOS/coach
+matches_running: false
+on $PATH:        true
+
+$ coach path install --dir /var/folders/.../tmp.XXXX
+installed: /var/folders/.../tmp.XXXX/coach
+target:    /Users/ikamen/ai-workspace/ilya/coach/target/release/coach
+⚠  /var/folders/.../tmp.XXXX is not on $PATH.
+```

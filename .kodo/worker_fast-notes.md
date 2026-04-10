@@ -29,6 +29,14 @@
 
 - Templates live in `src-tauri/prompts/*.txt`, embedded via `prompts.rs`. Override at dev time: `COACH_PROMPTS_DIR` → read fresh each call; missing file errors (no silent fallback).
 
+## CLI config & path (E2E, release binary)
+
+- **No `config list`:** `coach config list` → `usage: coach config <get|set>`. “List” settings with **`coach config get`** (full JSON) or **`coach config get all`**, or keyed **`priorities` / `model` / `coach-mode` / `port` / `rules`**.
+- **Reads vs writes:** **`config get` always loads `~/.coach/settings.json`** (`Settings::load`). **`config set`** uses **HTTP** to `/api/config/...` when `http://127.0.0.1:{port}/version` succeeds, else **writes the file** — tested with **daemon down** (file path only). If Coach is running, expect **`config get` to reflect disk**, not necessarily the same probe as `coach status` (HTTP snapshot).
+- **`coach-mode` output:** `config get coach-mode` prints **Rust `Debug`** (`Llm`, `Rules`); **`config set`** expects lowercase **`rules` \| `llm`**.
+- **`path status`:** **`matches_running`** is false if `~/.local/bin/coach` points at a **different** binary than the one you invoked (e.g. shim → `/Applications/Coach.app/...` vs workspace `target/release/coach`). **`path install --dir <dir>`** puts a symlink at `<dir>/coach` → `current_exe()`; **`path status`** still reports the **default** install dir only (`~/.local/bin` on macOS).
+- **E2E nits:** `coach config get <key> …` **ignores** trailing extra args (no error). **`coach path`** with no subcommand behaves like **`path status`** (undocumented). **`serve --port N`** **persists** `port` to `~/.coach/settings.json` before bind — can surprise one-off runs.
+
 ## Security / CLI (quick reference)
 
 - **Help text:** Only `coach`, `coach help`, `coach -h`, `coach --help` print usage. **`coach serve --help` does not** — extra args to `serve` are ignored unless `--port`; `--help` is ignored and the daemon **starts** (same for `coach serve` with stray flags).
