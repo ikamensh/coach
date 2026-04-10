@@ -39,7 +39,7 @@
 
 ## Security / CLI (quick reference)
 
-- **Help text:** Only `coach`, `coach help`, `coach -h`, `coach --help` print usage. **`coach serve --help` does not** — extra args to `serve` are ignored unless `--port`; `--help` is ignored and the daemon **starts** (same for `coach serve` with stray flags).
+- **Help text:** Top-level `coach`, `coach help`, `coach -h`, `coach --help` print full usage. **`coach serve --help` / `-h` / trailing `help`** print `serve`-specific help and exit 0 without binding (regression tests in `cli.rs`).
 - Hook + REST surface binds **127.0.0.1** only (`server.rs` `start_server` / `serve_on_listener`, `lib.rs` `serve`). No auth on `/api/*` or hooks — any local process can call them.
 - **`coach config get`** (no key / `all`) prints full `Settings` JSON including **`api_tokens`** (`cli.rs` → `settings.rs` shape). Live HTTP snapshot omits raw tokens (`state.rs` `CoachSnapshot` uses `token_status` only).
 - Tokens on CLI: `config set api-token …` passes the secret in **argv** (visible in `ps`). Plaintext **`~/.coach/settings.json`** (`settings.rs` `save_to`).

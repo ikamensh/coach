@@ -2,13 +2,15 @@
 
 Tracked across `kodo test` runs.
 
-**Baseline run**: 2026-04-10 — 589 pass, 0 fail, 21 ignored (see `test-report.md` for details)
+**Baseline run**: 2026-04-10 — 591 pass (211 Rust + 380 Vitest), 0 fail, 21 ignored (see `test-report.md` for details)
 
 **CLI E2E (config + path)**: 2026-04-10 — `target/release/coach`; Coach daemon **not** on port 7700 (file-backed `config set`); settings restored from backup after mutations.
 
+**HTTP server E2E (binary, hooks + CLI)**: 2026-04-10 — `target/release/coach serve --port <PORT>` on localhost; **`curl`** to Claude `/hook/...`, Cursor `/cursor/hook/...`, Codex `/codex/hook/...`; verified with **`coach status`** + **`GET /api/state`**. **`coach sessions list`** exercised separately — lists **on-disk saved transcripts**, not hook server memory (see findings row).
+
 ## Test Entrypoints
 - **TS**: `npm run test` → vitest, 36 files (380 tests) in `src/components/*.test.ts`
-- **Rust**: `cargo test --workspace` → 209 tests across coach-core unit, cli_integration, hook_integration, scenario_replay
+- **Rust**: `cargo test --workspace` → 211 tests across coach-core unit, cli_integration, hook_integration, scenario_replay
 - **Ignored**: 21 tests need live API keys or external processes (see test-report.md)
 
 | Feature / Workflow | Last tested | Status | Findings |
@@ -17,7 +19,7 @@ Tracked across `kodo test` runs.
 | Dev: `npm install` | 2026-04-10 | pass | `npm audit`: 1 high severity advisory |
 | CLI: coach --version | 2026-04-10 | pass | Existing test `version_subcommand_does_not_start_tauri` |
 | CLI: coach --help | 2026-04-10 | pass | Existing test `help_subcommand_does_not_start_tauri`; live text lists `hooks codex` + `hooks cursor` |
-| CLI: coach serve --help | 2026-04-10 | quirk | Does **not** show help — starts headless daemon (`serve` only parses `--port`) |
+| CLI: coach serve --help | 2026-04-10 | **fixed** | Was starting daemon; now prints help and exits 0. Regression tests: `serve_help_does_not_start_daemon`, `wants_help_detects_flags` |
 | CLI: coach serve (headless daemon) | 2026-04-10 | pass | Existing tests cover start, port collision, port release |
 | CLI: coach hooks install/uninstall (Claude) | 2026-04-10 | pass | Existing test `cli_hooks_install_matches_install_hooks_at` |
 | CLI: coach hooks codex status/install/uninstall | 2026-04-10 | pass | `check_codex_hook_status` / install paths in `cli.rs`; HTTP Codex routes in `server.rs` |
@@ -38,7 +40,12 @@ Tracked across `kodo test` runs.
 | HTTP: /hook/stop | 2026-04-10 | pass | Blocks then allows on cooldown |
 | HTTP: /hook/user-prompt-submit | 2026-04-10 | pass | Records activity, truncates long prompts |
 | HTTP: Cursor hooks | 2026-04-10 | pass | cursor_after_shell_tracks_session |
-| HTTP: Codex hooks (`/codex/hook/...`) | not tested | pending | Routes exist in `server.rs`; no dedicated hook_integration test found |
+| HTTP: Codex hooks (`/codex/hook/...`) | 2026-04-10 | **manual E2E pass** | Binary `serve` + `curl` post-tool-use, session-start, user-prompt-submit; `client: "codex"` in `/api/state`; integration tests still optional |
+| HTTP E2E: malformed / wrong method | 2026-04-10 | pass | Bad JSON / empty POST → **400**; GET on hook path → **405** |
+| HTTP E2E: empty JSON `{}` | 2026-04-10 | pass | Codex/Cursor: **200**; Claude `{}` resolves `session_id` to **`"unknown"`** |
+| HTTP E2E: concurrent hooks | 2026-04-10 | pass | `xargs -P10` parallel Codex `user-prompt-submit` — activity entries match; `event_count` unchanged (tool-only counter) |
+| HTTP E2E: daemon restart | 2026-04-10 | partial | Hook state not persisted (expected); fresh daemon may show **scanner-imported** sessions immediately — not an empty slate on active dev host |
+| CLI vs HTTP: `sessions list` vs `status` | 2026-04-10 | **distinct** | `sessions list` = replay file index; **`status`** = live hook state |
 | Session tracking: multiple sessions | 2026-04-10 | pass | multiple_sessions_tracked_independently |
 | Session tracking: /clear replacement | 2026-04-10 | pass | clear_replaces_session_in_same_window |
 | Session tracking: scanner discovery | 2026-04-10 | pass | scanner_discovers_real_sessions |
@@ -109,3 +116,33 @@ installed: /var/folders/.../tmp.XXXX/coach
 target:    /Users/ikamen/ai-workspace/ilya/coach/target/release/coach
 ⚠  /var/folders/.../tmp.XXXX is not on $PATH.
 ```
+
+## Appendix: HTTP hook server E2E (binary, 2026-04-10)
+
+`PORT` was an ephemeral localhost port (e.g. 37882). **`./target/release/coach serve --port $PORT`** in background; **`coach status`** after (settings file updated to same `PORT`).
+
+**Claude (lsof peer PID):**
+```text
+curl -sS -X POST "http://127.0.0.1:$PORT/hook/session-start" -H 'Content-Type: application/json' \
+  -d '{"session_id":"e2e-claude-1","source":"startup","cwd":"/tmp/e2e-claude"}'
+curl -sS -X POST "http://127.0.0.1:$PORT/hook/post-tool-use" -H 'Content-Type: application/json' \
+  -d '{"session_id":"e2e-claude-1","tool_name":"Read","cwd":"/tmp/e2e-claude"}'
+```
+
+**Cursor (synthetic PID):**
+```text
+curl -sS -X POST "http://127.0.0.1:$PORT/cursor/hook/session-start" -H 'Content-Type: application/json' \
+  -d '{"sessionId":"e2e-cursor-1","cwd":"/tmp/e2e-cursor"}'
+curl -sS -X POST "http://127.0.0.1:$PORT/cursor/hook/after-shell" -H 'Content-Type: application/json' \
+  -d '{"sessionId":"e2e-cursor-1","command":"pwd","cwd":"/tmp/e2e-cursor"}'
+```
+
+**Codex (synthetic PID):**
+```text
+curl -sS -X POST "http://127.0.0.1:$PORT/codex/hook/session-start" -H 'Content-Type: application/json' \
+  -d '{"session_id":"e2e-codex-1","source":"startup","cwd":"/tmp/e2e-codex"}'
+curl -sS -X POST "http://127.0.0.1:$PORT/codex/hook/post-tool-use" -H 'Content-Type: application/json' \
+  -d '{"session_id":"e2e-codex-1","tool_name":"Write","cwd":"/tmp/e2e-codex"}'
+```
+
+**Verify:** `curl -sS "http://127.0.0.1:$PORT/api/state" | python3 -m json.tool` — expect `client` **claude** / **cursor** / **codex** on respective sessions. **`coach sessions list`** unchanged by these calls (different subsystem).

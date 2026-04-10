@@ -123,6 +123,14 @@ fn run(result: Result<(), String>) -> i32 {
 /// exits. Errors from `crate::serve` (notably bind failures) propagate
 /// here so the process exits non-zero with a readable message.
 fn cmd_serve(args: &[String]) -> Result<(), String> {
+    if wants_help(args) {
+        println!("coach serve — run the daemon headless (no GUI / no tray)\n");
+        println!("USAGE:  coach serve [--port N]\n");
+        println!("OPTIONS:");
+        println!("    --port N    listen on port N (default: from settings, usually 7700)");
+        println!("    --help, -h  show this help");
+        return Ok(());
+    }
     let port_override = parse_named_u32(args, "--port")?.map(|p| p as u16);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -591,6 +599,11 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
 
 // ── helpers: argv parsing ───────────────────────────────────────────────
 
+/// Returns true if the arg slice contains `-h`, `--help`, or `help`.
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-h" || a == "--help" || a == "help")
+}
+
 fn parse_named_u32(args: &[String], name: &str) -> Result<Option<u32>, String> {
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -761,6 +774,26 @@ mod tests {
     }
 
     /// parse_named_u32 finds the value after the named flag.
+    /// `coach serve --help` must print help and exit 0, not start the daemon.
+    /// Regression: previously `--help` was silently ignored by the `--port`
+    /// parser and the server would start, blocking indefinitely.
+    #[test]
+    fn serve_help_does_not_start_daemon() {
+        assert_eq!(dispatch_with_args(vec!["serve".into(), "--help".into()]), Some(0));
+        assert_eq!(dispatch_with_args(vec!["serve".into(), "-h".into()]), Some(0));
+        assert_eq!(dispatch_with_args(vec!["serve".into(), "help".into()]), Some(0));
+    }
+
+    #[test]
+    fn wants_help_detects_flags() {
+        assert!(wants_help(&["--help".into()]));
+        assert!(wants_help(&["-h".into()]));
+        assert!(wants_help(&["help".into()]));
+        assert!(wants_help(&["--port".into(), "8080".into(), "--help".into()]));
+        assert!(!wants_help(&["--port".into(), "8080".into()]));
+        assert!(!wants_help(&[]));
+    }
+
     #[test]
     fn parse_named_u32_basic() {
         let args = vec!["--pid".to_string(), "1234".to_string()];

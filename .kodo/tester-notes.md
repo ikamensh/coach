@@ -3,14 +3,26 @@
 ## Environment (verified 2026-04-10)
 
 - **Binary:** Workspace outputs `coach` at **`/coach/target/release/coach`** (or `target/debug/coach` after `cargo test`). Not under `src-tauri/target/` alone — use workspace root `target/`.
-- **Rust:** `cargo test --workspace` — **209** passed, **21** ignored (breakdown per crate: e.g. coach-core 162+15, hook_integration 29+2, cli 17, scenario_replay 1+4). Use `--workspace`; bare `cargo test` from repo root can be misleading if you only read the last `test result` line.
+- **Rust:** `cargo test --workspace` — **211** passed, **21** ignored (e.g. coach-core 164+15, hook_integration 29+2, cli 17, scenario_replay 1+4). Use `--workspace`; bare `cargo test` from repo root can be misleading if you only read the last `test result` line.
 - **Node:** `npm test` — Vitest **380** tests, 36 files. `npm run build` — green (~1.5s Vite).
 - **CLI:** `./target/release/coach --version` matches workspace `0.1.70`.
 
 ## UX gotchas (reconfirmed)
 
-- **No per-subcommand help:** only top-level `coach`, `help`, `-h`, `--help` print usage.
-- **`coach serve --help`** does **not** show help — it starts the headless daemon on default port 7700; stderr shows `[coach serve] listening...`. Kill the process if triggered during testing.
+- **No global subcommand-specific help** for most verbs (except `serve` now handles `--help` / `-h` / `help` — prints usage and exits 0 without binding).
+- **Top-level** `coach`, `help`, `-h`, `--help` print full CLI usage.
+
+## HTTP hook server E2E (binary, 2026-04-10)
+
+- **Binary:** `coach/target/release/coach`; **`coach serve --port <PORT>`** persists `port` in `~/.coach/settings.json` so **`coach status`** targets the same daemon.
+- **Claude routes** (`/hook/...`): use **TCP peer PID resolution** (curl works; stderr logs `resolved sid … → pid …`). Missing `session_id` in JSON becomes **`"unknown"`** (still HTTP 200 if PID resolves).
+- **Cursor** (`/cursor/hook/...`) and **Codex** (`/codex/hook/...`): **synthetic PID** from `session_id` / Cursor payload fields — no `ConnectInfo` dependency; good for scripted curls.
+- **Live state:** verify with **`coach status`** or **`curl http://127.0.0.1:$PORT/api/state`**. **`coach sessions list`** lists **saved transcript files** under projects — **not** the same as in-memory hook sessions (do not use it to validate HTTP tracking).
+- **Malformed body:** non-JSON or empty POST body → **400** + axum JSON parse error text; **GET** on a hook route → **405**.
+- **Codex/Cursor `{}`:** accepted (**200**, empty `{}` response) — synthetic PID for `"unknown"` / empty keys.
+- **Concurrent hooks:** `xargs -P10` + multiple `UserPromptSubmit` on one Codex session — activity log shows all lines; **`event_count` stayed 0** (by design: only tool `record_tool` bumps it; see `state/mod.rs` tests).
+- **Daemon restart:** in-memory sessions **cleared** on exit; after restart, **`/api/state` session count can still be ≥1** almost immediately because the **filesystem scanner** can attach a **real** local session (e.g. existing Claude Code window) — do not expect a stable “empty” baseline on dev machines.
+- **Shell note:** spawning **many background `curl &` with `wait`** in one line sometimes wedged the tool runner; **`xargs -P`** was reliable for parallel POSTs.
 
 ## Daemon lifecycle (CLI, verified 2026-04-10)
 
@@ -44,7 +56,7 @@ Binary: `./target/release/coach` from repo root.
 ## Discovery docs
 
 - **`.kodo/test-report.md`** — setup commands, CLI verbatim help, smoke table, baselines **209 / 21** + **380** Vitest; artifact path `target/release/coach` at repo root — **accurate**.
-- **`.kodo/test-coverage.md`** — **589** = 209 + 380; Codex **HTTP** routes marked pending in hook_integration — confirmed no `codex` string in `coach-core/tests/hook_integration.rs` (routes exist in `server.rs`).
+- **`.kodo/test-coverage.md`** — Rust + Vitest baselines in that file; Codex/Cursor/Claude **HTTP** also covered by **2026-04-10 manual binary E2E** (see coverage rows).
 
 ## Optional / not run here
 
