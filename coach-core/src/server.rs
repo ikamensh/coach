@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::coach::{ChainedStopInput, LlmCoach, StopContext};
+use crate::coach::{ChainedStopInput, LlmCoach, NameSessionInput, ObserveToolUseInput, StopContext};
 use crate::settings::EngineMode;
 use crate::state::{CoachMode, SharedState};
 use crate::EventEmitter;
@@ -472,31 +472,25 @@ pub(crate) async fn run_post_tool_use(
                 .contains(&coach.model.provider.as_str());
 
         if llm_active {
-            match crate::llm::build_observer_event(&tool, &tool_input) {
-                Ok(event) => {
-                    let priorities = coach.priorities.clone();
-                    let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
-                    if session.telemetry.observer_tx.is_none() {
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                        session.telemetry.observer_tx = Some(tx);
-                        consumer_rx = Some(rx);
-                    }
-                    let _ = session.telemetry.observer_tx.as_ref().unwrap().send(
-                        crate::state::ObserverQueueItem { priorities, event },
-                    );
-                }
-                Err(e) => {
-                    eprintln!("[coach] observer event prompt failed: {e}");
-                    if let Some(s) = coach.sessions.get_mut(&pid) {
-                        s.telemetry.record_error(&e);
-                    }
-                }
+            let priorities = coach.priorities.clone();
+            let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
+            if session.telemetry.observer_tx.is_none() {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                session.telemetry.observer_tx = Some(tx);
+                consumer_rx = Some(rx);
             }
+            let _ = session.telemetry.observer_tx.as_ref().unwrap().send(
+                crate::state::ObserverQueueItem {
+                    priorities,
+                    tool_name: tool.clone(),
+                    tool_input: tool_input.clone(),
+                },
+            );
         }
 
         namer_input = if llm_active && should_request_title(event_count) {
             let session = coach.sessions.get(&pid).expect("apply_hook_event populated");
-            Some(crate::llm::NameSessionInput {
+            Some(NameSessionInput {
                 priorities: coach.priorities.clone(),
                 cwd: session.cwd.clone(),
                 tool_counts: session.tool_counts.clone(),
@@ -559,6 +553,7 @@ async fn observer_consumer(
     pid: u32,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::state::ObserverQueueItem>,
 ) {
+    let llm_coach = LlmCoach::new(coach.clone());
     while let Some(item) = rx.recv().await {
         // Read the current chain — includes all previous observations.
         let chain = {
@@ -569,22 +564,24 @@ async fn observer_consumer(
         };
 
         let started = std::time::Instant::now();
-        match crate::llm::observe_event(
-            &coach,
-            &item.priorities,
-            &chain,
-            &item.event,
-        )
-        .await
+        match llm_coach
+            .observe_tool_use(ObserveToolUseInput {
+                priorities: item.priorities,
+                chain,
+                tool_name: item.tool_name,
+                tool_input: item.tool_input,
+            })
+            .await
         {
-            Ok((text, new_chain, usage)) => {
+            Ok(result) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let mut s = coach.write().await;
                 if let Some(sess) = s.sessions.get_mut(&pid) {
-                    sess.telemetry.record_success(latency_ms, usage, Some(new_chain));
-                    sess.telemetry.last_assessment = Some(text.clone());
+                    sess.telemetry
+                        .record_success(latency_ms, result.usage, Some(result.chain));
+                    sess.telemetry.last_assessment = Some(result.assessment.clone());
                 }
-                s.log(pid, "Observer", "noted", Some(text));
+                s.log(pid, "Observer", "noted", Some(result.assessment));
                 emit_update(&*emitter, &s);
             }
             Err(e) => {
@@ -609,18 +606,19 @@ async fn run_session_namer(
     coach: SharedState,
     emitter: Arc<dyn EventEmitter>,
     pid: u32,
-    input: crate::llm::NameSessionInput,
+    input: NameSessionInput,
 ) {
-    match crate::llm::name_session(&coach, &input).await {
-        Ok((title, usage)) => {
+    let llm_coach = LlmCoach::new(coach.clone());
+    match llm_coach.name_session(input).await {
+        Ok(result) => {
             let mut s = coach.write().await;
             if let Some(sess) = s.sessions.get_mut(&pid) {
                 // Namer doesn't update the chain — pass 0 latency since
                 // it's a stateless call and latency isn't worth tracking.
-                sess.telemetry.record_success(0, usage, None);
-                sess.telemetry.session_title = Some(title.clone());
+                sess.telemetry.record_success(0, result.usage, None);
+                sess.telemetry.session_title = Some(result.title.clone());
             }
-            s.log(pid, "Namer", "renamed", Some(title));
+            s.log(pid, "Namer", "renamed", Some(result.title));
             emit_update(&*emitter, &s);
         }
         Err(e) => {

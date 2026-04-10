@@ -272,7 +272,8 @@ impl SessionState {
 /// Item enqueued for the per-session observer consumer.
 pub struct ObserverQueueItem {
     pub priorities: Vec<String>,
-    pub event: String,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
 }
 
 pub struct CoachState {

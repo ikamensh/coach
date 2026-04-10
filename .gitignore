@@ -4,6 +4,7 @@ target/
 src-tauri/target/
 *.tsbuildinfo
 .DS_Store
+.idea/
 
 # Per-machine Claude Code state (settings.local.json, worktrees, etc.)
 .claude/
