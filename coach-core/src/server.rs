@@ -209,12 +209,9 @@ pub(crate) async fn run_user_prompt_submit(
 ) -> Json<HookResponse> {
     let sid = session_id(&payload);
     let mut coach = state.coach.write().await;
-    let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
-
-    // Store the user's prompt so the observer can compare user intent
-    // against agent behavior when checking for misunderstandings.
-    if let Some(ref prompt) = payload.prompt {
-        session.last_user_prompt = Some(prompt.clone());
+    {
+        let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
+        session.coach.memory.last_user_prompt = payload.prompt.clone();
     }
 
     // Truncate the prompt for the activity log — full text is overkill for
@@ -269,7 +266,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
             return Json(serde_json::json!({}));
         }
 
-        let prev_chain = session.telemetry.chain.clone();
+        let prev_chain = session.coach.memory.chain.clone();
         let ctx = StopContext {
             priorities,
             cwd: session.cwd.clone(),
@@ -315,7 +312,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                 let mut coach = state.coach.write().await;
                 if let Some(s) = coach.sessions.get_mut(&pid) {
                     let u = usage.unwrap_or_default();
-                    s.telemetry.record_success(latency_ms, u, new_chain);
+                    s.coach.record_success(latency_ms, u, new_chain);
                 }
                 coach.log(pid, "Stop", "allowed (LLM)", None);
                 emit_update(&*state.emitter, &coach);
@@ -332,7 +329,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                     s.last_stop_blocked = Some(std::time::Instant::now());
                     s.stop_blocked_count += 1;
                     let u = usage.unwrap_or_default();
-                    s.telemetry.record_success(latency_ms, u, new_chain);
+                    s.coach.record_success(latency_ms, u, new_chain);
                 }
                 coach.log(pid, "Stop", "blocked (LLM)", Some(message.clone()));
                 emit_update(&*state.emitter, &coach);
@@ -345,7 +342,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                 eprintln!("[coach] LLM evaluate_stop failed, falling back: {e}");
                 let mut coach = state.coach.write().await;
                 if let Some(s) = coach.sessions.get_mut(&pid) {
-                    s.telemetry.record_error(&e);
+                    s.coach.record_error(&e);
                 }
                 emit_update(&*state.emitter, &coach);
                 drop(coach);
@@ -479,7 +476,10 @@ pub(crate) async fn run_post_tool_use(
         // Always consumed (cleared); only included in the response when unmuted.
         let (pending, muted) = {
             let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
-            (session.pending_intervention.take(), session.intervention_muted)
+            (
+                session.coach.memory.pending_intervention.take(),
+                session.coach.intervention_muted,
+            )
         };
         intervention_to_deliver = match pending {
             Some(msg) if !muted => {
@@ -500,18 +500,17 @@ pub(crate) async fn run_post_tool_use(
         if llm_active {
             let priorities = coach.priorities.clone();
             let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
-            let user_prompt = session.last_user_prompt.clone();
-            if session.telemetry.observer_tx.is_none() {
+            if session.coach.observer_tx.is_none() {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                session.telemetry.observer_tx = Some(tx);
+                session.coach.observer_tx = Some(tx);
                 consumer_rx = Some(rx);
             }
-            let _ = session.telemetry.observer_tx.as_ref().unwrap().send(
+            let _ = session.coach.observer_tx.as_ref().unwrap().send(
                 crate::state::ObserverQueueItem {
                     priorities,
                     tool_name: tool.clone(),
                     tool_input: tool_input.clone(),
-                    user_prompt,
+                    user_prompt: session.coach.memory.last_user_prompt.clone(),
                 },
             );
         }
@@ -522,7 +521,7 @@ pub(crate) async fn run_post_tool_use(
                 priorities: coach.priorities.clone(),
                 cwd: session.cwd.clone(),
                 tool_counts: session.tool_counts.clone(),
-                last_assessment: session.telemetry.last_assessment.clone(),
+                last_assessment: session.coach.memory.last_assessment.clone(),
             })
         } else {
             None
@@ -594,7 +593,7 @@ async fn observer_consumer(
         let chain = {
             let s = coach.read().await;
             s.sessions.get(&pid)
-                .map(|sess| sess.telemetry.chain.clone())
+                .map(|sess| sess.coach.memory.chain.clone())
                 .unwrap_or_default()
         };
 
@@ -614,12 +613,11 @@ async fn observer_consumer(
                 let (assessment, intervention) = parse_intervention(&result.assessment);
                 let mut s = coach.write().await;
                 if let Some(sess) = s.sessions.get_mut(&pid) {
-                    sess.telemetry
-                        .record_success(latency_ms, result.usage, Some(result.chain));
-                    sess.telemetry.last_assessment = Some(assessment.clone());
+                    sess.coach.record_success(latency_ms, result.usage, Some(result.chain));
+                    sess.coach.memory.last_assessment = Some(assessment.clone());
                     if let Some(ref msg) = intervention {
-                        sess.pending_intervention = Some(msg.clone());
-                        sess.telemetry.intervention_count += 1;
+                        sess.coach.memory.pending_intervention = Some(msg.clone());
+                        sess.coach.telemetry.intervention_count += 1;
                     }
                 }
                 s.log(pid, "Observer", "noted", Some(assessment));
@@ -632,7 +630,7 @@ async fn observer_consumer(
                 eprintln!("[coach] observer call failed: {e}");
                 let mut s = coach.write().await;
                 if let Some(sess) = s.sessions.get_mut(&pid) {
-                    sess.telemetry.record_error(&e);
+                    sess.coach.record_error(&e);
                 }
                 s.log(pid, "Observer", "error", Some(e));
                 emit_update(&*emitter, &s);
@@ -653,9 +651,8 @@ fn parse_intervention(text: &str) -> (String, Option<String>) {
 
 /// Periodic session-title generation. Stateless LLM call (fresh chain),
 /// fire-and-forget like the observer. On success, writes the cleaned
-/// title to `telemetry.session_title`. On failure, surfaces the error in
-/// `telemetry.last_error` and increments `telemetry.errors` so the
-/// telemetry panel reflects it — same shape as `run_observer`.
+/// title into coach memory. On failure, records the error so the
+/// telemetry panel reflects it — same shape as `observer_consumer`.
 async fn run_session_namer(
     coach: SharedState,
     emitter: Arc<dyn EventEmitter>,
@@ -669,8 +666,8 @@ async fn run_session_namer(
             if let Some(sess) = s.sessions.get_mut(&pid) {
                 // Namer doesn't update the chain — pass 0 latency since
                 // it's a stateless call and latency isn't worth tracking.
-                sess.telemetry.record_success(0, result.usage, None);
-                sess.telemetry.session_title = Some(result.title.clone());
+                sess.coach.record_success(0, result.usage, None);
+                sess.coach.memory.session_title = Some(result.title.clone());
             }
             s.log(pid, "Namer", "renamed", Some(result.title));
             emit_update(&*emitter, &s);
@@ -679,7 +676,7 @@ async fn run_session_namer(
             eprintln!("[coach] name_session failed: {e}");
             let mut s = coach.write().await;
             if let Some(sess) = s.sessions.get_mut(&pid) {
-                sess.telemetry.record_error(&e);
+                sess.coach.record_error(&e);
             }
             s.log(pid, "Namer", "error", Some(e));
             emit_update(&*emitter, &s);

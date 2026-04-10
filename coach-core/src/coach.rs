@@ -53,7 +53,11 @@ impl LlmCoach {
         &self,
         input: ObserveToolUseInput,
     ) -> Result<ObserveToolUseOutput, String> {
-        let event = crate::llm::build_observer_event(&input.tool_name, &input.tool_input, input.user_prompt.as_deref())?;
+        let event = crate::llm::build_observer_event(
+            &input.tool_name,
+            &input.tool_input,
+            input.user_prompt.as_deref(),
+        )?;
         let (assessment, chain, usage) =
             crate::llm::observe_event(&self.state, &input.priorities, &input.chain, &event).await?;
         Ok(ObserveToolUseOutput {
@@ -111,6 +115,7 @@ mod tests {
         state.write().await.mock_session_send = Some(Arc::new(|_system, user| {
             assert!(user.contains("Edit"));
             assert!(user.contains("hello"));
+            assert!(user.contains("keep the session list stable"));
             Ok((
                 "Focused on a small edit".to_string(),
                 crate::state::CoachUsage {
@@ -128,7 +133,7 @@ mod tests {
                 chain: CoachChain::Empty,
                 tool_name: "Edit".into(),
                 tool_input: serde_json::json!({ "new_string": "hello" }),
-                user_prompt: None,
+                user_prompt: Some("keep the session list stable".into()),
             })
             .await
             .unwrap();

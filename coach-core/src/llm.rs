@@ -168,15 +168,16 @@ pub fn build_observer_event(
     user_prompt: Option<&str>,
 ) -> Result<String, String> {
     let input_pretty = serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".into());
+    let user_prompt = user_prompt.unwrap_or("(not available)");
     let template = crate::prompts::load("observer_event")?;
-    let mut rendered = crate::prompts::render(
+    Ok(crate::prompts::render(
         &template,
-        &[("tool_name", tool_name), ("tool_input", &input_pretty)],
-    );
-    if let Some(prompt) = user_prompt {
-        rendered = format!("User asked: {prompt}\n{rendered}");
-    }
-    Ok(rendered)
+        &[
+            ("tool_name", tool_name),
+            ("tool_input", &input_pretty),
+            ("user_prompt", user_prompt),
+        ],
+    ))
 }
 
 /// Build a History chain from a mock response, so tests see
@@ -693,10 +694,11 @@ mod tests {
     #[test]
     fn build_observer_event_includes_tool_and_input() {
         let input = serde_json::json!({"file_path": "/a.py", "content": "print(1)"});
-        let event = build_observer_event("Write", &input, None).unwrap();
+        let event = build_observer_event("Write", &input, Some("stabilize the UI")).unwrap();
         assert!(event.contains("Write"));
         assert!(event.contains("/a.py"));
         assert!(event.contains("print(1)"));
+        assert!(event.contains("stabilize the UI"));
     }
 
     /// Observer event must serialize Null inputs without panicking
@@ -706,6 +708,7 @@ mod tests {
         let event = build_observer_event("NoInput", &serde_json::Value::Null, None).unwrap();
         assert!(event.contains("NoInput"));
         assert!(event.contains("null"));
+        assert!(event.contains("(not available)"));
     }
 
     // ── Session abstraction ─────────────────────────────────────────────

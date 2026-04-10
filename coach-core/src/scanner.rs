@@ -315,8 +315,8 @@ pub async fn sync_all_sessions_with(
         coach.mark_client(pid, SessionClient::Codex);
         // Set thread name as session title if we have one and coach hasn't set its own.
         if let (Some(name), Some(sess)) = (&session.thread_name, coach.sessions.get_mut(&pid)) {
-            if sess.telemetry.session_title.is_none() {
-                sess.telemetry.session_title = Some(name.clone());
+            if sess.coach.memory.session_title.is_none() {
+                sess.coach.memory.session_title = Some(name.clone());
             }
         }
     }
@@ -631,16 +631,13 @@ mod tests {
             tool_counts: HashMap::new(),
             stop_count: 0,
             stop_blocked_count: 0,
-            telemetry: crate::state::CoachTelemetry::new(),
+            coach: crate::state::SessionCoachState::new(),
             activity: VecDeque::new(),
             active_agents: 0,
             client: crate::state::SessionClient::Claude,
             is_worktree: false,
             bootstrapped: false,
             bootstrapped_session_id: None,
-            pending_intervention: None,
-            intervention_muted: false,
-            last_user_prompt: None,
         }
     }
 
@@ -1126,7 +1123,7 @@ mod tests {
         assert_eq!(sess.client, SessionClient::Codex);
         assert_eq!(sess.cwd, Some("/tmp/codex-project".into()));
         assert_eq!(
-            sess.telemetry.session_title.as_deref(),
+            sess.coach.memory.session_title.as_deref(),
             Some("Fix auth"),
             "thread_name should seed the session title"
         );
@@ -1177,7 +1174,7 @@ mod tests {
         assert_eq!(sess.event_count, 1, "hook tool count preserved");
         assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
         assert_eq!(
-            sess.telemetry.session_title.as_deref(),
+            sess.coach.memory.session_title.as_deref(),
             Some("Hook task"),
         );
     }

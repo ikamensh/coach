@@ -895,15 +895,15 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
                 );
                 // Counters: error path must tick coach_errors and leave
                 // coach_calls / usage at zero (no successful round-trip).
-                assert_eq!(sess.telemetry.errors, 1, "error counter should tick");
-                assert_eq!(sess.telemetry.calls, 0, "no successful call yet");
-                assert!(sess.telemetry.last_called_at.is_none());
-                assert_eq!(sess.telemetry.total_usage.input_tokens, 0);
+                assert_eq!(sess.coach.telemetry.errors, 1, "error counter should tick");
+                assert_eq!(sess.coach.telemetry.calls, 0, "no successful call yet");
+                assert!(sess.coach.telemetry.last_called_at.is_none());
+                assert_eq!(sess.coach.telemetry.total_usage.input_tokens, 0);
                 // The error message must be captured so the panel can show
                 // it. Should match the activity log detail exactly.
-                assert!(sess.telemetry.last_error.is_some());
+                assert!(sess.coach.memory.last_error.is_some());
                 assert_eq!(
-                    sess.telemetry.last_error.as_deref(),
+                    sess.coach.memory.last_error.as_deref(),
                     observer_entry.detail.as_deref(),
                 );
                 return;
@@ -1239,7 +1239,7 @@ async fn test_with_real_cursor_agent() {
 /// prompt text, and pass through with no decision payload.
 #[tokio::test]
 async fn user_prompt_submit_records_activity() {
-    let (base, _state) = start_test_server().await;
+    let (base, state) = start_test_server().await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -1281,6 +1281,14 @@ async fn user_prompt_submit_records_activity() {
     assert_eq!(activity[0]["hook_event"], "UserPromptSubmit");
     assert_eq!(activity[0]["action"], "user spoke");
     assert_eq!(activity[0]["detail"], "make the sessions stop jumping around");
+
+    let pid = fake_pid_for_sid("talk-1");
+    let guard = state.read().await;
+    let session = guard.sessions.get(&pid).expect("session should exist in state");
+    assert_eq!(
+        session.coach.memory.last_user_prompt.as_deref(),
+        Some("make the sessions stop jumping around")
+    );
 }
 
 // ── /api/* CLI-facing endpoints ────────────────────────────────────────
@@ -1515,7 +1523,7 @@ async fn api_set_rules_replaces_rule_list() {
 
 #[tokio::test]
 async fn user_prompt_submit_truncates_long_prompts() {
-    let (base, _state) = start_test_server().await;
+    let (base, state) = start_test_server().await;
     let client = reqwest::Client::new();
 
     let long_prompt = "x".repeat(1000);
@@ -1524,7 +1532,7 @@ async fn user_prompt_submit_truncates_long_prompts() {
         .json(&serde_json::json!({
             "session_id": "longwinded",
             "hook_event_name": "UserPromptSubmit",
-            "prompt": long_prompt,
+            "prompt": long_prompt.clone(),
         }))
         .send()
         .await
@@ -1548,6 +1556,14 @@ async fn user_prompt_submit_truncates_long_prompts() {
     assert!(detail.ends_with("…"), "truncated prompts should end with ellipsis");
     // 200 x's plus the ellipsis character.
     assert_eq!(detail.chars().count(), 201);
+
+    let pid = fake_pid_for_sid("longwinded");
+    let guard = state.read().await;
+    let session = guard.sessions.get(&pid).expect("session should exist in state");
+    assert_eq!(
+        session.coach.memory.last_user_prompt.as_deref(),
+        Some(long_prompt.as_str())
+    );
 }
 
 // ── Command-hook ghost session bug ─────────────────────────────────────
