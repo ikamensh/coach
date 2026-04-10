@@ -126,6 +126,7 @@ pub fn run() {
             commands::replay_session,
             commands::set_coach_mode,
             commands::set_rules,
+            commands::set_intervention_muted,
             commands::get_path_status,
             commands::install_path,
             commands::uninstall_path,

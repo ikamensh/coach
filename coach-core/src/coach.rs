@@ -8,6 +8,7 @@ pub struct ObserveToolUseInput {
     pub chain: CoachChain,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
+    pub user_prompt: Option<String>,
 }
 
 pub struct ObserveToolUseOutput {
@@ -52,7 +53,7 @@ impl LlmCoach {
         &self,
         input: ObserveToolUseInput,
     ) -> Result<ObserveToolUseOutput, String> {
-        let event = crate::llm::build_observer_event(&input.tool_name, &input.tool_input)?;
+        let event = crate::llm::build_observer_event(&input.tool_name, &input.tool_input, input.user_prompt.as_deref())?;
         let (assessment, chain, usage) =
             crate::llm::observe_event(&self.state, &input.priorities, &input.chain, &event).await?;
         Ok(ObserveToolUseOutput {
@@ -127,6 +128,7 @@ mod tests {
                 chain: CoachChain::Empty,
                 tool_name: "Edit".into(),
                 tool_input: serde_json::json!({ "new_string": "hello" }),
+                user_prompt: None,
             })
             .await
             .unwrap();

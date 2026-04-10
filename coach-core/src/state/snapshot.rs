@@ -112,6 +112,15 @@ pub struct SessionSnapshot {
     /// True when the session's cwd is a git linked worktree.
     #[serde(default)]
     pub is_worktree: bool,
+    /// Whether observer interventions are muted (display-only, not sent).
+    #[serde(default)]
+    pub intervention_muted: bool,
+    /// Pending intervention message from the observer, not yet delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_intervention: Option<String>,
+    /// Total interventions detected by the observer this conversation.
+    #[serde(default)]
+    pub intervention_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -259,5 +268,8 @@ fn snapshot_session(s: &SessionState, now: DateTime<Utc>) -> SessionSnapshot {
         active_agents: s.active_agents,
         client: s.client,
         is_worktree: s.is_worktree,
+        intervention_muted: s.intervention_muted,
+        pending_intervention: s.pending_intervention.clone(),
+        intervention_count: s.telemetry.intervention_count,
     }
 }

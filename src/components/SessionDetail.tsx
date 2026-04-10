@@ -23,6 +23,7 @@ export function SessionDetail() {
   const sessions = useCoachStore((s) => s.sessions);
   const selectedPid = useCoachStore((s) => s.selectedPid);
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
+  const setInterventionMuted = useCoachStore((s) => s.setInterventionMuted);
   const setView = useCoachStore((s) => s.setView);
   const engineMode = useCoachStore((s) => s.engineMode);
 
@@ -99,16 +100,35 @@ export function SessionDetail() {
             • LLM mode but no activity yet → "waiting for first call" hint */}
       <section>
         <div className="flex items-baseline justify-between mb-2">
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
-            Coach
-          </h2>
-          <span className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono uppercase">
-            {engineMode === "rules"
-              ? "rules"
-              : session.coach_chain_kind === "empty"
-                ? "idle"
-                : session.coach_chain_kind}
-          </span>
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
+              Coach
+            </h2>
+            {session.intervention_count > 0 && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400 tabular-nums">
+                {session.intervention_count} intervention{session.intervention_count !== 1 ? "s" : ""}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setInterventionMuted(session.pid, !session.intervention_muted)}
+              className={`text-[10px] px-2 py-0.5 rounded font-medium transition-colors ${
+                session.intervention_muted
+                  ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-300 dark:hover:bg-zinc-600"
+                  : "bg-blue-500/20 text-blue-600 dark:text-blue-400 hover:bg-blue-500/30"
+              }`}
+            >
+              {session.intervention_muted ? "Muted" : "Live"}
+            </button>
+            <span className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono uppercase">
+              {engineMode === "rules"
+                ? "rules"
+                : session.coach_chain_kind === "empty"
+                  ? "idle"
+                  : session.coach_chain_kind}
+            </span>
+          </div>
         </div>
 
         {session.coach_calls > 0 ||
@@ -211,6 +231,18 @@ export function SessionDetail() {
               </div>
             )}
 
+            {/* Pending intervention — highlighted so it stands out. */}
+            {session.pending_intervention && (
+              <div className="border-t border-blue-300/40 dark:border-blue-500/20 pt-2">
+                <div className="text-[10px] uppercase tracking-wide text-blue-600 dark:text-blue-400 mb-1">
+                  Pending intervention {session.intervention_muted && "(muted)"}
+                </div>
+                <div className="text-xs text-blue-700 dark:text-blue-300 whitespace-pre-wrap font-medium">
+                  {session.pending_intervention}
+                </div>
+              </div>
+            )}
+
             {/* Last assessment text — the thing the user actually wants to read. */}
             {session.coach_last_assessment && (
               <div className="border-t border-amber-200/40 dark:border-amber-500/10 pt-2">
@@ -238,9 +270,7 @@ export function SessionDetail() {
           </div>
         ) : (
           <div className="text-xs text-zinc-600 dark:text-zinc-400 bg-zinc-50 dark:bg-zinc-800/30 border border-zinc-200/60 dark:border-zinc-700/40 rounded px-3 py-2">
-            LLM mode is on, but Coach hasn't been called yet on this session.
-            Flip the session to <strong>Away</strong> and let Claude run one
-            tool — assessments will appear here.
+            Coach is watching. Assessments will appear after the first tool use.
           </div>
         )}
       </section>

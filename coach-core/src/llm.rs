@@ -160,16 +160,23 @@ pub fn coach_system_prompt(priorities: &[String]) -> Result<String, String> {
 
 /// Build the per-event message we send to the observer.
 /// Tool input is included verbatim so the observer "sees what Claude saw."
+/// When available, the user's last prompt is prepended so the observer
+/// can compare user intent against agent behavior.
 pub fn build_observer_event(
     tool_name: &str,
     tool_input: &serde_json::Value,
+    user_prompt: Option<&str>,
 ) -> Result<String, String> {
     let input_pretty = serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".into());
     let template = crate::prompts::load("observer_event")?;
-    Ok(crate::prompts::render(
+    let mut rendered = crate::prompts::render(
         &template,
         &[("tool_name", tool_name), ("tool_input", &input_pretty)],
-    ))
+    );
+    if let Some(prompt) = user_prompt {
+        rendered = format!("User asked: {prompt}\n{rendered}");
+    }
+    Ok(rendered)
 }
 
 /// Build a History chain from a mock response, so tests see
@@ -686,7 +693,7 @@ mod tests {
     #[test]
     fn build_observer_event_includes_tool_and_input() {
         let input = serde_json::json!({"file_path": "/a.py", "content": "print(1)"});
-        let event = build_observer_event("Write", &input).unwrap();
+        let event = build_observer_event("Write", &input, None).unwrap();
         assert!(event.contains("Write"));
         assert!(event.contains("/a.py"));
         assert!(event.contains("print(1)"));
@@ -696,7 +703,7 @@ mod tests {
     /// (some tools have no input or send a literal null).
     #[test]
     fn build_observer_event_handles_null_input() {
-        let event = build_observer_event("NoInput", &serde_json::Value::Null).unwrap();
+        let event = build_observer_event("NoInput", &serde_json::Value::Null, None).unwrap();
         assert!(event.contains("NoInput"));
         assert!(event.contains("null"));
     }
@@ -1011,6 +1018,7 @@ mod live_tests {
                 "old_string": "",
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
+            None,
         )
         .unwrap();
         let (_text1, chain1, _u1) =
@@ -1026,6 +1034,7 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+            None,
         )
         .unwrap();
         let (_text2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
@@ -1052,6 +1061,7 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+            None,
         )
         .unwrap();
         let (_text, observed_chain, _u) =
@@ -1207,6 +1217,7 @@ mod live_tests {
                 "file_path": "/tmp/x.py",
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
+            None,
         )
         .unwrap();
         let (_t1, chain1, _u1) =
@@ -1222,6 +1233,7 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+            None,
         )
         .unwrap();
         let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
@@ -1246,6 +1258,7 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+            None,
         )
         .unwrap();
         let (_t, observed_chain, _u_obs) =
@@ -1382,6 +1395,7 @@ mod live_tests {
                 "file_path": "/tmp/x.py",
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
+            None,
         )
         .unwrap();
         let (_t1, chain1, _u1) =
@@ -1397,6 +1411,7 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+            None,
         )
         .unwrap();
         let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
@@ -1421,6 +1436,7 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+            None,
         )
         .unwrap();
         let (_t, observed_chain, _u_obs) =

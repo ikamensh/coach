@@ -65,6 +65,9 @@ interface SessionSnapshot {
   active_agents: number;
   client: SessionClient;
   is_worktree: boolean;
+  intervention_muted: boolean;
+  pending_intervention: string | null;
+  intervention_count: number;
 }
 
 interface ModelConfig {
@@ -156,6 +159,7 @@ interface CoachActions {
   installPath: () => Promise<void>;
   uninstallPath: () => Promise<void>;
   setAutoUninstallHooksOnExit: (enabled: boolean) => Promise<void>;
+  setInterventionMuted: (pid: number, muted: boolean) => Promise<void>;
 }
 
 type CoachStore = CoachState & CoachActions;
@@ -381,5 +385,14 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   setAutoUninstallHooksOnExit: async (enabled) => {
     await invoke("set_auto_uninstall_hooks_on_exit", { enabled });
     set({ autoUninstallHooksOnExit: enabled });
+  },
+
+  setInterventionMuted: async (pid, muted) => {
+    await invoke("set_intervention_muted", { pid, muted });
+    set((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.pid === pid ? { ...sess, intervention_muted: muted } : sess,
+      ),
+    }));
   },
 }));

@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn load_from_returns_embedded_when_no_override() {
         let s = load_from("coach_system", None).unwrap();
-        assert!(s.contains("Coach"));
+        assert!(s.contains("observe"));
         assert!(s.contains("{priorities}"));
     }
 

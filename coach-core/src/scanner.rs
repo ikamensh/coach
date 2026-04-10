@@ -443,6 +443,9 @@ mod tests {
             is_worktree: false,
             bootstrapped: false,
             bootstrapped_session_id: None,
+            pending_intervention: None,
+            intervention_muted: false,
+            last_user_prompt: None,
         }
     }
 

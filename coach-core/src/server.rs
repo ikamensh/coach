@@ -208,7 +208,13 @@ pub(crate) async fn run_user_prompt_submit(
 ) -> Json<HookResponse> {
     let sid = session_id(&payload);
     let mut coach = state.coach.write().await;
-    coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
+    let session = coach.apply_hook_event(pid, &sid, payload.cwd.as_deref());
+
+    // Store the user's prompt so the observer can compare user intent
+    // against agent behavior when checking for misunderstandings.
+    if let Some(ref prompt) = payload.prompt {
+        session.last_user_prompt = Some(prompt.clone());
+    }
 
     // Truncate the prompt for the activity log — full text is overkill for
     // a chip tooltip, and very long pastes would bloat the queue.
@@ -443,6 +449,7 @@ pub(crate) async fn run_post_tool_use(
     let namer_input;
     let rule_message;
     let mut consumer_rx = None;
+    let intervention_to_deliver;
     {
         let mut coach = state.coach.write().await;
         let event_count = {
@@ -467,6 +474,24 @@ pub(crate) async fn run_post_tool_use(
             coach.log(pid, "PostToolUse", "observed", Some(tool.clone()));
         }
 
+        // Consume any pending intervention from a previous observer run.
+        // Always consumed (cleared); only included in the response when unmuted.
+        let (pending, muted) = {
+            let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
+            (session.pending_intervention.take(), session.intervention_muted)
+        };
+        intervention_to_deliver = match pending {
+            Some(msg) if !muted => {
+                coach.log(pid, "Intervention", "delivered", Some(msg.clone()));
+                Some(msg)
+            }
+            Some(msg) => {
+                coach.log(pid, "Intervention", "muted", Some(msg));
+                None
+            }
+            None => None,
+        };
+
         let llm_active = coach.coach_mode == EngineMode::Llm
             && crate::settings::OBSERVER_CAPABLE_PROVIDERS
                 .contains(&coach.model.provider.as_str());
@@ -474,6 +499,7 @@ pub(crate) async fn run_post_tool_use(
         if llm_active {
             let priorities = coach.priorities.clone();
             let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
+            let user_prompt = session.last_user_prompt.clone();
             if session.telemetry.observer_tx.is_none() {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 session.telemetry.observer_tx = Some(tx);
@@ -484,6 +510,7 @@ pub(crate) async fn run_post_tool_use(
                     priorities,
                     tool_name: tool.clone(),
                     tool_input: tool_input.clone(),
+                    user_prompt,
                 },
             );
         }
@@ -520,7 +547,14 @@ pub(crate) async fn run_post_tool_use(
         });
     }
 
-    match rule_message {
+    // Combine rule messages and observer interventions into a single response.
+    let context = match (rule_message, intervention_to_deliver) {
+        (Some(rule), Some(intervention)) => Some(format!("{rule}\n\n[Coach]: {intervention}")),
+        (Some(rule), None) => Some(rule),
+        (None, Some(intervention)) => Some(format!("[Coach]: {intervention}")),
+        (None, None) => None,
+    };
+    match context {
         Some(msg) => Json(HookResponse {
             hook_specific_output: Some(serde_json::json!({
                 "additionalContext": msg
@@ -570,18 +604,27 @@ async fn observer_consumer(
                 chain,
                 tool_name: item.tool_name,
                 tool_input: item.tool_input,
+                user_prompt: item.user_prompt,
             })
             .await
         {
             Ok(result) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
+                let (assessment, intervention) = parse_intervention(&result.assessment);
                 let mut s = coach.write().await;
                 if let Some(sess) = s.sessions.get_mut(&pid) {
                     sess.telemetry
                         .record_success(latency_ms, result.usage, Some(result.chain));
-                    sess.telemetry.last_assessment = Some(result.assessment.clone());
+                    sess.telemetry.last_assessment = Some(assessment.clone());
+                    if let Some(ref msg) = intervention {
+                        sess.pending_intervention = Some(msg.clone());
+                        sess.telemetry.intervention_count += 1;
+                    }
                 }
-                s.log(pid, "Observer", "noted", Some(result.assessment));
+                s.log(pid, "Observer", "noted", Some(assessment));
+                if let Some(ref msg) = intervention {
+                    s.log(pid, "Observer", "intervention pending", Some(msg.clone()));
+                }
                 emit_update(&*emitter, &s);
             }
             Err(e) => {
@@ -594,6 +637,16 @@ async fn observer_consumer(
                 emit_update(&*emitter, &s);
             }
         }
+    }
+}
+
+/// Parse an observer response for the INTERVENE: prefix.
+/// Returns (full assessment text, optional intervention message).
+fn parse_intervention(text: &str) -> (String, Option<String>) {
+    if let Some(rest) = text.strip_prefix("INTERVENE:") {
+        (text.to_string(), Some(rest.trim().to_string()))
+    } else {
+        (text.to_string(), None)
     }
 }
 

@@ -344,6 +344,8 @@ async fn stop_blocks_then_allows_on_cooldown() {
 
     {
         let mut s = state.write().await;
+        // This test exercises the rules/cooldown stop path, so force Rules mode.
+        s.coach_mode = coach_core::settings::EngineMode::Rules;
         let pid = fake_pid_for_sid("stop-sess");
         if let Some(sess) = s.sessions.get_mut(&pid) {
             sess.mode = coach_core::state::CoachMode::Away;

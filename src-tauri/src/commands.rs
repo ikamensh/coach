@@ -312,6 +312,21 @@ pub async fn set_auto_uninstall_hooks_on_exit(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn set_intervention_muted(
+    state: tauri::State<'_, SharedState>,
+    app: tauri::AppHandle,
+    pid: u32,
+    muted: bool,
+) -> Result<(), String> {
+    let mut s = state.write().await;
+    if let Some(session) = s.sessions.get_mut(&pid) {
+        session.intervention_muted = muted;
+    }
+    emit_snapshot(&app, &s)?;
+    Ok(())
+}
+
 // ── PATH shim management ────────────────────────────────────────────────
 
 #[tauri::command]

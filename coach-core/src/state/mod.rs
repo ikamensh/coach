@@ -109,6 +109,7 @@ pub struct CoachTelemetry {
     pub last_error: Option<String>,
     pub session_title: Option<String>,
     pub observer_tx: Option<tokio::sync::mpsc::UnboundedSender<ObserverQueueItem>>,
+    pub intervention_count: usize,
 }
 
 impl CoachTelemetry {
@@ -125,6 +126,7 @@ impl CoachTelemetry {
             last_error: None,
             session_title: None,
             observer_tx: None,
+            intervention_count: 0,
         }
     }
 
@@ -235,6 +237,17 @@ pub struct SessionState {
     /// `apply_hook_event` decide whether bootstrapped tool_counts
     /// belong to the current conversation (keep) or a stale one (discard).
     pub bootstrapped_session_id: Option<String>,
+    /// Intervention message from the observer waiting to be delivered
+    /// on the next hook response. Set by observer_consumer, consumed
+    /// by run_post_tool_use.
+    pub pending_intervention: Option<String>,
+    /// When true, observer interventions are shown in the UI only —
+    /// not sent to the coding agent via hook responses.
+    pub intervention_muted: bool,
+    /// The last prompt the user typed, captured from UserPromptSubmit.
+    /// Included in observer events so the LLM can compare user intent
+    /// against agent behavior.
+    pub last_user_prompt: Option<String>,
 }
 
 impl SessionState {
@@ -266,6 +279,8 @@ impl SessionState {
         self.activity.clear();
         self.bootstrapped = false;
         self.bootstrapped_session_id = None;
+        self.pending_intervention = None;
+        self.last_user_prompt = None;
     }
 }
 
@@ -274,6 +289,7 @@ pub struct ObserverQueueItem {
     pub priorities: Vec<String>,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
+    pub user_prompt: Option<String>,
 }
 
 pub struct CoachState {
@@ -469,6 +485,9 @@ impl CoachState {
                         is_worktree: cwd.map_or(false, is_git_worktree),
                         bootstrapped: false,
                         bootstrapped_session_id: None,
+                        pending_intervention: None,
+                        intervention_muted: false,
+                        last_user_prompt: None,
                     },
                 );
             }
@@ -542,6 +561,9 @@ impl CoachState {
                 is_worktree: cwd.map_or(false, is_git_worktree),
                 bootstrapped: false,
                 bootstrapped_session_id: None,
+                pending_intervention: None,
+                intervention_muted: false,
+                last_user_prompt: None,
             },
         );
         true

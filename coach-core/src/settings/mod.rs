@@ -88,7 +88,7 @@ pub struct Settings {
 fn default_model() -> ModelConfig {
     ModelConfig {
         provider: "openai".into(),
-        model: "gpt-5.4-mini".into(),
+        model: "gpt-4.1-nano".into(),
     }
 }
 
@@ -123,7 +123,7 @@ fn default_port() -> u16 {
 }
 
 fn default_coach_mode() -> EngineMode {
-    EngineMode::Rules
+    EngineMode::Llm
 }
 
 fn default_rules() -> Vec<CoachRule> {
@@ -208,13 +208,13 @@ mod tests {
 
     // ── Default values ──────────────────────────────────────────────────
 
-    /// Default model should be OpenAI gpt-5.4-mini — observer requires
-    /// OpenAI's Responses API for stateful coach sessions.
+    /// Default model should be OpenAI gpt-4.1-nano — cheap enough for
+    /// always-on observation.
     #[test]
-    fn default_model_is_openai_mini() {
+    fn default_model_is_openai_nano() {
         let s = Settings::default();
         assert_eq!(s.model.provider, "openai");
-        assert_eq!(s.model.model, "gpt-5.4-mini");
+        assert_eq!(s.model.model, "gpt-4.1-nano");
     }
 
     /// OpenAI must be in the observer-capable list (it's the one provider
