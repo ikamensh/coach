@@ -11,6 +11,7 @@ pub mod pycoach;
 pub mod replay;
 pub mod scanner;
 pub mod server;
+pub mod services;
 pub mod settings;
 pub mod state;
 

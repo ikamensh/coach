@@ -1,4 +1,5 @@
-use coach_core::state::{self, CoachMode, SharedState};
+use coach_core::services;
+use coach_core::state::{CoachMode, SharedState};
 use coach_core::EventEmitter;
 use std::sync::Arc;
 use tauri::{
@@ -74,15 +75,7 @@ fn toggle_all(state: &SharedState, handle: &tauri::AppHandle) {
     let emitter = handle.state::<Arc<dyn EventEmitter>>().inner().clone();
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
-        let new_mode = state::mutate(&state, &emitter, |s| {
-            let new_mode = match s.sessions.default_mode {
-                CoachMode::Present => CoachMode::Away,
-                CoachMode::Away => CoachMode::Present,
-            };
-            s.sessions.set_all_modes(new_mode);
-            new_mode
-        })
-        .await;
+        let new_mode = services::toggle_default_mode(&state, &emitter).await;
         update_icon(&handle, &new_mode);
     });
 }
