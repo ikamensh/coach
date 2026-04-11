@@ -39,6 +39,7 @@ pub fn run() {
         eprintln!("[coach] logging to {}", p.display());
     }
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
@@ -135,6 +136,7 @@ pub fn run() {
             commands::set_auto_uninstall_hooks_on_exit,
             commands::list_saved_sessions,
             commands::replay_session,
+            commands::open_session_jsonl,
             commands::set_coach_mode,
             commands::set_rules,
             commands::set_intervention_muted,

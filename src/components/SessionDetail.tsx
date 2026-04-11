@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useCoachStore } from "../store/useCoachStore";
 import { formatDuration, formatTime, timeAgo } from "../utils/time";
 import { abbreviateCwd, jsonlPath } from "../utils/path";
@@ -90,7 +91,10 @@ export function SessionDetail() {
           <div className="text-zinc-500 dark:text-zinc-400">
             Started {formatTime(session.started_at)} · {timeAgo(session.started_at)} · {formatDuration(session.duration_secs)}
           </div>
-          <JsonlLink path={jsonlPath(session)} />
+          <JsonlLink
+            path={jsonlPath(session)}
+            sessionId={session.session_id}
+          />
         </div>
       </section>
 
@@ -373,36 +377,55 @@ export function SessionDetail() {
 }
 
 /**
- * Path to the Claude Code JSONL transcript for this session. Click to
- * copy — no Tauri opener plugin is configured yet, so we can't open
- * the file directly in the default editor. Once the backend exposes
- * a `reveal_in_finder` / `open_path` command this can upgrade to a
- * real link.
+ * Path to the Claude Code JSONL transcript. Click asks the backend to
+ * open it with the OS's default `.jsonl` handler via the Tauri opener
+ * plugin. If that fails — brand-new session with no file yet, or OS
+ * has no handler — we fall back to copying the displayed path so the
+ * user can still get at it.
  */
-function JsonlLink({ path }: { path: string | null }) {
-  const [copied, setCopied] = useState(false);
+function JsonlLink({
+  path,
+  sessionId,
+}: {
+  path: string | null;
+  sessionId: string;
+}) {
+  const [status, setStatus] = useState<"idle" | "copied" | "error">("idle");
   if (!path) return null;
 
   const handleClick = async () => {
     try {
-      await navigator.clipboard.writeText(path);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard blocked (rare in a Tauri webview). Fall back to a
-      // visible prompt — user can still copy manually from the text.
-      setCopied(false);
+      await invoke("open_session_jsonl", { sessionId });
+      setStatus("idle");
+    } catch (e) {
+      // Couldn't open (file not yet written, no default handler, etc.) —
+      // copy the displayed path as a fallback so the user still has it.
+      try {
+        await navigator.clipboard.writeText(path);
+        setStatus("copied");
+      } catch {
+        setStatus("error");
+      }
+      setTimeout(() => setStatus("idle"), 1500);
+      console.warn("open_session_jsonl failed:", e);
     }
   };
+
+  const label =
+    status === "copied"
+      ? "✓ copied (couldn't open)"
+      : status === "error"
+        ? "open failed"
+        : path;
 
   return (
     <button
       type="button"
       onClick={handleClick}
-      title="Click to copy path"
+      title="Click to open transcript"
       className="font-mono text-[10px] text-zinc-400 dark:text-zinc-600 hover:text-zinc-600 dark:hover:text-zinc-400 transition-colors truncate block text-left w-full"
     >
-      {copied ? "✓ copied" : path}
+      {label}
     </button>
   );
 }

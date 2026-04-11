@@ -258,6 +258,24 @@ pub async fn replay_session(
     replay::replay_session(&session_id, &mode, state.inner()).await
 }
 
+/// Open the Claude Code JSONL transcript for `session_id` in the OS's
+/// default handler for `.jsonl`. Uses `replay::find_session` to locate
+/// the file (walks `~/.claude/projects/*`), so brand-new sessions with
+/// no writes yet return a "not found" error — that's the honest signal,
+/// not an empty-file open.
+#[tauri::command]
+pub async fn open_session_jsonl(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = replay::find_session(&session_id)
+        .ok_or_else(|| format!("transcript not found for session {session_id}"))?;
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn set_coach_mode(
     state: tauri::State<'_, SharedState>,
