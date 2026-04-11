@@ -1,19 +1,18 @@
 //! Externalized model-facing prompts.
 //!
-//! Every prompt the coach sends to an LLM lives in `src-tauri/prompts/*.txt`.
+//! Every prompt the coach sends to an LLM lives in `coach-core/prompts/*.txt`.
 //! Each template is also embedded into the binary via `include_str!` so the
-//! shipped app is self-contained — there is no install-time prompts directory.
+//! shipped app is self-contained.
 //!
 //! ## Tight-loop iteration
 //!
-//! Set `COACH_PROMPTS_DIR=/path/to/coach/src-tauri/prompts` and every call
-//! reads the matching `.txt` file fresh from disk. Edit the file, fire the
-//! next hook, see the new prompt — no recompile. With the env var unset, the
-//! embedded defaults are used.
+//! Debug builds read each template fresh from disk on every call, from the
+//! same path the release build `include_str!`s from. Edit a file, fire the
+//! next hook, see the new prompt — no recompile. Release builds always use
+//! the embedded copies.
 //!
-//! There is intentionally no fallback when the env var is set: a missing or
-//! unreadable file surfaces as a clear error rather than silently reverting
-//! to the embedded copy. This is the behavior you want during iteration —
+//! A missing or unreadable file in debug mode surfaces as a clear error
+//! rather than silently reverting to the embedded copy: during iteration
 //! you want to know your edit was actually picked up.
 //!
 //! ## Template syntax
@@ -24,9 +23,11 @@
 //! pass through untouched as long as no provided key matches.
 
 use std::path::Path;
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 
-/// All embedded prompt templates, keyed by short name. The name is also the
-/// `.txt` filename under `COACH_PROMPTS_DIR` when the override is active.
+/// All embedded prompt templates, keyed by short name. The name matches the
+/// `.txt` filename under `coach-core/prompts/`.
 const EMBEDDED: &[(&str, &str)] = &[
     ("coach_system", include_str!("../prompts/coach_system.txt")),
     ("observer_event", include_str!("../prompts/observer_event.txt")),
@@ -42,21 +43,35 @@ const EMBEDDED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Look up a prompt template by name. If `COACH_PROMPTS_DIR` is set, reads
-/// `$COACH_PROMPTS_DIR/<name>.txt` fresh on every call (so editing the file
-/// affects the very next request, no restart needed). Otherwise returns the
-/// embedded copy.
-///
-/// Panics-by-design: an unknown name with no override is a programming error,
-/// not a user error, so it crashes immediately. A missing file when the env
-/// var IS set returns `Err` with the path so the caller can surface it.
-pub fn load(name: &str) -> Result<String, String> {
-    let dir = std::env::var("COACH_PROMPTS_DIR").ok();
-    load_from(name, dir.as_deref().map(Path::new))
+/// Canonical on-disk location of the prompts, resolved at compile time from
+/// `CARGO_MANIFEST_DIR`. Only used in debug builds — release ships the
+/// embedded copies.
+#[cfg(debug_assertions)]
+fn prompts_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts")
 }
 
-/// Pure version of [`load`] that takes the override directory explicitly.
-/// Tests use this so they never have to mutate process-wide env state.
+/// Look up a prompt template by name. In debug builds reads
+/// `<crate>/prompts/<name>.txt` fresh on every call so prompt edits take
+/// effect on the next request. In release builds returns the embedded copy.
+///
+/// Panics-by-design: an unknown name in a release build is a programming
+/// error, not a user error, so it crashes immediately. A missing file in a
+/// debug build returns `Err` with the path so the caller can surface it.
+pub fn load(name: &str) -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    {
+        load_from(name, Some(&prompts_dir()))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        load_from(name, None)
+    }
+}
+
+/// Pure version of [`load`] parameterized on the override directory. Tests
+/// use this to exercise both branches without touching `cfg` or the real
+/// on-disk path.
 fn load_from(name: &str, override_dir: Option<&Path>) -> Result<String, String> {
     if let Some(dir) = override_dir {
         let path = dir.join(format!("{name}.txt"));
@@ -128,6 +143,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = load_from("coach_system", Some(dir.path())).unwrap_err();
         assert!(err.contains("coach_system.txt"));
+    }
+
+    /// In debug builds, `load` should resolve the canonical on-disk path
+    /// and return non-empty content for every embedded template name. This
+    /// is the "does the debug path actually work" smoke test.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn load_resolves_on_disk_for_every_name_in_debug() {
+        for (name, _) in EMBEDDED {
+            let s = load(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!s.trim().is_empty(), "{name} came back empty from disk");
+        }
     }
 
     /// `render` substitutes every supplied key and leaves unknown braces
