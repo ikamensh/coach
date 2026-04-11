@@ -567,7 +567,22 @@ impl CoachState {
                 adopt_cwd_if_unset(sess, cwd);
             }
             Some(sess) => {
-                // /clear: new conversation in the same window.
+                // /clear: new conversation in the same window. If the
+                // previous conversation had accumulated real coach
+                // context, log it — a legitimate /clear is normal, but
+                // if this ever fires for a session the user hasn't
+                // touched in seconds it usually means `resolve_pid`
+                // cross-attributed a nested-claude hook to this pid.
+                let prior_sid = sess.current_session_id.clone();
+                let prior_chain_kind = sess.coach.memory.chain.kind();
+                let prior_events = sess.event_count;
+                if prior_chain_kind != "empty" || prior_events > 0 {
+                    eprintln!(
+                        "[coach] apply_hook_event: resetting pid {pid} \
+                         (old_sid={prior_sid}, new_sid={session_id}, \
+                         chain_kind={prior_chain_kind}, events={prior_events})"
+                    );
+                }
                 sess.current_session_id = session_id.to_string();
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;

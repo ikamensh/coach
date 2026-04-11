@@ -398,11 +398,23 @@ fn bootstrap_claude_session(
 
 // ── JSONL bootstrapping ─────────────────────────────────────────────────
 
-/// Derive the JSONL path: `{projects_dir}/{mangled-cwd}/{sessionId}.jsonl`
+/// Derive the JSONL path: `{projects_dir}/{mangled-cwd}/{sessionId}.jsonl`.
+/// Claude Code slugifies the cwd by replacing every non-alphanumeric byte
+/// with `-`, so `/tmp/coach_llm_demo` lands under `-tmp-coach-llm-demo`
+/// (not `-tmp-coach_llm_demo`). `/` alone was not enough.
 fn jsonl_path_for(session: &ClaudeSessionFile, projects_dir: &Path) -> Option<PathBuf> {
     let cwd = session.cwd.as_deref()?;
-    let mangled = cwd.replace('/', "-");
+    let mangled = mangle_cwd(cwd);
     Some(projects_dir.join(mangled).join(format!("{}.jsonl", session.session_id)))
+}
+
+/// Slugify a cwd the same way Claude Code does when naming its project
+/// directory under `~/.claude/projects/`: every non-alphanumeric byte
+/// becomes `-`.
+fn mangle_cwd(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// State bootstrapped from a JSONL conversation log.
@@ -706,10 +718,30 @@ mod tests {
 
     /// Helper: create a JSONL file at the path sync_sessions_with expects.
     fn write_jsonl(projects_dir: &Path, cwd: &str, session_id: &str, lines: &[&str]) {
-        let mangled = cwd.replace('/', "-");
-        let dir = projects_dir.join(mangled);
+        let dir = projects_dir.join(mangle_cwd(cwd));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{session_id}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    /// Property: mangle_cwd matches Claude Code's slugification so any
+    /// non-alphanumeric byte collapses to `-`. Regression for the
+    /// `/tmp/coach_llm_demo` → `-tmp-coach-llm-demo` case: the underscore
+    /// used to survive under the old `/`-only rule and the lookup would
+    /// miss the file Claude had actually written.
+    #[test]
+    fn mangle_cwd_collapses_all_non_alnum_to_dash() {
+        assert_eq!(mangle_cwd("/tmp/my-project"), "-tmp-my-project");
+        assert_eq!(
+            mangle_cwd("/tmp/coach_llm_demo"),
+            "-tmp-coach-llm-demo",
+            "underscores must become dashes (regression)"
+        );
+        assert_eq!(
+            mangle_cwd("/Users/ikamen/.coach/x.y"),
+            "-Users-ikamen--coach-x-y",
+            "dots, hidden dirs, and any other punctuation collapse too"
+        );
+        assert_eq!(mangle_cwd("/private/tmp/a_b"), "-private-tmp-a-b");
     }
 
     fn write_session_file_full(dir: &Path, pid: u32, session_id: &str, cwd: &str) {

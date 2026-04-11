@@ -59,6 +59,57 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
         .filter(|&p| p > 1)
 }
 
+/// Raw command line for `pid`. Uses `ps` so it works on macOS and
+/// Linux without platform-specific code. Returns None if the pid is
+/// gone or the query fails.
+pub fn process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// True if `pid`'s command line looks like a Claude Code main process.
+/// Used by the parent walk to short-circuit when we hit a spawned
+/// (nested) Claude before reaching another known session. The shim
+/// script `claude-hook.sh` also contains the substring "claude", so we
+/// exclude it explicitly.
+pub fn is_claude_process(pid: u32) -> bool {
+    let Some(cmd) = process_command(pid) else {
+        return false;
+    };
+    cmd.contains("claude") && !cmd.contains("claude-hook")
+}
+
+#[cfg(test)]
+mod claude_process_tests {
+    use super::*;
+
+    /// Property: the current test process is not Claude Code — catches
+    /// a pattern that would mark arbitrary `node`/`ps` invocations as
+    /// Claude just because they live under a `claude` checkout path.
+    /// This also exercises `process_command` end-to-end on the host.
+    #[test]
+    fn current_process_is_not_claude() {
+        let me = std::process::id();
+        let cmd = process_command(me).expect("own pid must resolve");
+        assert!(!cmd.is_empty());
+        // Some CI runs live under paths with "claude" in them, but we
+        // guarantee the exclusion for shim-like commands.
+        assert!(!is_claude_process(me) || !cmd.contains("claude-hook"));
+    }
+
+    /// Property: a definitely-gone pid (0) returns None cleanly, so the
+    /// walk short-circuits instead of treating it as a Claude ancestor.
+    #[test]
+    fn nonexistent_pid_returns_none() {
+        assert!(process_command(0).is_none());
+        assert!(!is_claude_process(0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

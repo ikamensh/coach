@@ -62,12 +62,18 @@ pub type PidResolver = Arc<dyn Fn(u16, &str) -> Option<u32> + Send + Sync>;
 /// can supply a fake; production uses `pid_resolver::parent_pid`.
 pub type ParentPidFn = Arc<dyn Fn(u32) -> Option<u32> + Send + Sync>;
 
+/// True if a pid looks like a Claude Code main process. Injected so
+/// tests can stage nested-Claude scenarios without spawning real
+/// processes. Production wraps `pid_resolver::is_claude_process`.
+pub type IsClaudeFn = Arc<dyn Fn(u32) -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) coach: SharedState,
     pub(crate) emitter: Arc<dyn EventEmitter>,
     resolver: PidResolver,
     parent_pid_fn: ParentPidFn,
+    is_claude_fn: IsClaudeFn,
 }
 
 pub(crate) fn session_id(payload: &HookPayload) -> String {
@@ -88,8 +94,18 @@ pub(crate) fn emit_update(emitter: &dyn EventEmitter, coach: &crate::state::Coac
 ///
 /// When the raw PID isn't a known session, walks up the parent chain.
 /// This handles command-type hooks where the TCP peer is the shim's
-/// curl process, not Claude Code. The parent walk finds the real
-/// Claude Code PID that the scanner already discovered.
+/// curl process, not Claude Code.
+///
+/// Two compatibility rules make the walk safe when a Claude Code runs
+/// under another Claude Code (`claude -p` from a Bash tool call):
+///
+/// 1. A known ancestor is only returned if its current session_id is
+///    empty or matches `sid`. Otherwise the walk would stomp an
+///    unrelated conversation via `apply_hook_event`'s /clear branch.
+/// 2. An unknown ancestor that looks like a Claude Code main process
+///    (detected via `is_claude_fn`) short-circuits the walk — it's
+///    almost certainly the spawned session that the scanner hasn't
+///    registered yet.
 async fn resolve_pid(state: &AppState, sid: &str, peer_port: u16) -> Option<u32> {
     {
         let coach = state.coach.read().await;
@@ -99,36 +115,69 @@ async fn resolve_pid(state: &AppState, sid: &str, peer_port: u16) -> Option<u32>
     }
     let raw_pid = (state.resolver)(peer_port, sid)?;
 
-    // Collect known session PIDs so we can check without holding the lock
-    // during the parent walk (which may do I/O).
-    let known: std::collections::HashSet<u32> = {
+    // Snapshot {pid → current_session_id} so we can classify ancestors
+    // without holding the lock during the walk's I/O.
+    let known: std::collections::HashMap<u32, String> = {
         let coach = state.coach.read().await;
-        coach.sessions.keys().copied().collect()
+        coach
+            .sessions
+            .iter()
+            .map(|(pid, sess)| (*pid, sess.current_session_id.clone()))
+            .collect()
     };
 
-    if known.contains(&raw_pid) {
+    if compatible(&known, raw_pid, sid) {
         eprintln!("[coach] resolved sid {sid} → pid {raw_pid} (peer port {peer_port})");
         return Some(raw_pid);
     }
 
-    // Walk parent chain: curl → sh → Claude Code.
     let mut candidate = raw_pid;
     for _ in 0..5 {
-        match (state.parent_pid_fn)(candidate) {
-            Some(ppid) if known.contains(&ppid) => {
-                eprintln!(
-                    "[coach] resolved sid {sid} → pid {ppid} (parent of {raw_pid}, peer port {peer_port})"
-                );
-                return Some(ppid);
-            }
-            Some(ppid) => candidate = ppid,
-            None => break,
+        let Some(ppid) = (state.parent_pid_fn)(candidate) else {
+            break;
+        };
+        if compatible(&known, ppid, sid) {
+            eprintln!(
+                "[coach] resolved sid {sid} → pid {ppid} (parent of {raw_pid}, peer port {peer_port})"
+            );
+            return Some(ppid);
         }
+        if known.contains_key(&ppid) {
+            // Known ancestor with a different session — don't cross.
+            // Register against the deepest non-crossing candidate;
+            // better than stomping an unrelated conversation.
+            eprintln!(
+                "[coach] resolved sid {sid} → pid {candidate} (stopped at mismatched ancestor {ppid}, peer port {peer_port})"
+            );
+            return Some(candidate);
+        }
+        if (state.is_claude_fn)(ppid) {
+            // Unknown Claude-looking ancestor: the spawned session.
+            eprintln!(
+                "[coach] resolved sid {sid} → pid {ppid} (claude ancestor of {raw_pid}, peer port {peer_port})"
+            );
+            return Some(ppid);
+        }
+        candidate = ppid;
     }
 
-    // No known ancestor — use raw PID (first hook before scanner runs).
-    eprintln!("[coach] resolved sid {sid} → pid {raw_pid} (peer port {peer_port})");
-    Some(raw_pid)
+    // Walk exhausted without a match. Register against the deepest
+    // candidate we reached — preferred over stomping a known session.
+    eprintln!(
+        "[coach] resolved sid {sid} → pid {candidate} (walk exhausted, peer port {peer_port})"
+    );
+    Some(candidate)
+}
+
+/// A known pid is "compatible" with `sid` when it has no current
+/// session yet (placeholder from the scanner) or its current session
+/// matches. Anything else means attributing this hook there would wipe
+/// an unrelated conversation.
+fn compatible(known: &std::collections::HashMap<u32, String>, pid: u32, sid: &str) -> bool {
+    match known.get(&pid) {
+        Some(existing) => existing.is_empty() || existing == sid,
+        None => false,
+    }
 }
 
 /// Shared by Claude `/hook/permission-request` and Cursor `/cursor/hook/*` permission analogues.
@@ -606,12 +655,14 @@ fn build_router(
     emitter: Arc<dyn EventEmitter>,
     resolver: PidResolver,
     parent_pid_fn: ParentPidFn,
+    is_claude_fn: IsClaudeFn,
 ) -> Router {
     let state = AppState {
         coach,
         emitter,
         resolver,
         parent_pid_fn,
+        is_claude_fn,
     };
     Router::new()
         .route("/hook/permission-request", post(handle_permission_request))
@@ -684,11 +735,24 @@ pub fn no_parent() -> ParentPidFn {
     Arc::new(|_| None)
 }
 
+/// Default "nothing looks like Claude" stub for tests that don't care
+/// about nested-Claude detection. Production uses
+/// `pid_resolver::is_claude_process`.
+pub fn no_claude_detect() -> IsClaudeFn {
+    Arc::new(|_| false)
+}
+
 /// Router without Tauri emitter — for integration tests.
 /// Tests inject a fake resolver via `fake_resolver_from_sid()` so the
 /// in-process client gets distinct fake PIDs per session_id.
 pub fn create_router_headless(coach: SharedState, resolver: PidResolver) -> Router {
-    build_router(coach, Arc::new(crate::NoopEmitter), resolver, no_parent())
+    build_router(
+        coach,
+        Arc::new(crate::NoopEmitter),
+        resolver,
+        no_parent(),
+        no_claude_detect(),
+    )
 }
 
 /// Router with a custom parent-PID function — for tests that exercise
@@ -698,7 +762,30 @@ pub fn create_router_headless_with_parent(
     resolver: PidResolver,
     parent_pid_fn: ParentPidFn,
 ) -> Router {
-    build_router(coach, Arc::new(crate::NoopEmitter), resolver, parent_pid_fn)
+    build_router(
+        coach,
+        Arc::new(crate::NoopEmitter),
+        resolver,
+        parent_pid_fn,
+        no_claude_detect(),
+    )
+}
+
+/// Router with custom parent-PID *and* Claude-detection functions — for
+/// tests that exercise the nested-Claude parent walk.
+pub fn create_router_headless_with_ancestry(
+    coach: SharedState,
+    resolver: PidResolver,
+    parent_pid_fn: ParentPidFn,
+    is_claude_fn: IsClaudeFn,
+) -> Router {
+    build_router(
+        coach,
+        Arc::new(crate::NoopEmitter),
+        resolver,
+        parent_pid_fn,
+        is_claude_fn,
+    )
 }
 
 /// Bind the production hook server. Pass `Some(app_handle)` from the
@@ -733,7 +820,14 @@ pub async fn serve_on_listener(
     port: u16,
 ) {
     let real_parent: ParentPidFn = Arc::new(crate::pid_resolver::parent_pid);
-    let app = build_router(coach, emitter, lsof_resolver(port), real_parent);
+    let real_is_claude: IsClaudeFn = Arc::new(crate::pid_resolver::is_claude_process);
+    let app = build_router(
+        coach,
+        emitter,
+        lsof_resolver(port),
+        real_parent,
+        real_is_claude,
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

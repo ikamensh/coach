@@ -1639,3 +1639,182 @@ async fn command_hook_updates_scanner_session_not_ghost() {
         "no ghost session should be created for curl's PID"
     );
 }
+
+// ── Nested-claude parent walk ─────────────────────────────────────────
+//
+// When a user runs `claude -p` from inside an already-running Claude
+// Code session (e.g. via a Bash tool call), the spawned child's hook
+// curl is a process descendant of the parent claude. The previous
+// parent walk climbed straight up to the parent's PID and stomped its
+// conversation via `apply_hook_event`'s `/clear` branch. The fix is
+// twofold: (1) unknown Claude-looking ancestors short-circuit the walk,
+// and (2) a known ancestor is only returned when its current
+// session_id is empty or matches the incoming sid.
+
+/// Regression: a hook from a spawned Claude must not touch the parent
+/// Claude's established session. Models the real process tree:
+///   curl → shim sh → spawned_claude → bash → parent_claude
+#[tokio::test]
+async fn nested_claude_hook_does_not_stomp_parent_session() {
+    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
+    let parent_claude_pid: u32 = 1000;
+    let bash_pid: u32 = 1500;
+    let spawned_claude_pid: u32 = 2000;
+    let shim_pid: u32 = 2500;
+    let curl_pid: u32 = 3000;
+
+    // Seed an established session for the parent Claude.
+    {
+        let mut s = state.write().await;
+        s.register_discovered_pid(
+            parent_claude_pid,
+            Some("/home/me/work"),
+            chrono::Utc::now(),
+        );
+        s.apply_hook_event(parent_claude_pid, "parent-sid", Some("/home/me/work"));
+        let sess = s.sessions.get_mut(&parent_claude_pid).unwrap();
+        sess.record_tool("Bash");
+        sess.coach.memory.chain = coach_core::state::CoachChain::ServerId {
+            id: "resp_established".into(),
+        };
+    }
+
+    let resolver: coach_core::server::PidResolver =
+        Arc::new(move |_peer_port, _sid| Some(curl_pid));
+    let parent_fn: coach_core::server::ParentPidFn = Arc::new(move |pid| match pid {
+        p if p == curl_pid => Some(shim_pid),
+        p if p == shim_pid => Some(spawned_claude_pid),
+        p if p == spawned_claude_pid => Some(bash_pid),
+        p if p == bash_pid => Some(parent_claude_pid),
+        _ => None,
+    });
+    // Only the two claude pids "look like" Claude Code.
+    let is_claude_fn: coach_core::server::IsClaudeFn =
+        Arc::new(move |pid| pid == spawned_claude_pid || pid == parent_claude_pid);
+
+    let router = coach_core::server::create_router_headless_with_ancestry(
+        state.clone(),
+        resolver,
+        parent_fn,
+        is_claude_fn,
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/hook/post-tool-use"))
+        .json(&serde_json::json!({
+            "session_id": "spawned-sid",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "cwd": "/tmp/sandbox",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let s = state.read().await;
+
+    // Parent session must still be intact — nothing got stomped.
+    let parent = s.sessions.get(&parent_claude_pid).expect("parent persists");
+    assert_eq!(parent.current_session_id, "parent-sid");
+    assert_eq!(parent.tool_counts.get("Bash"), Some(&1));
+    assert!(
+        matches!(
+            &parent.coach.memory.chain,
+            coach_core::state::CoachChain::ServerId { id } if id == "resp_established"
+        ),
+        "parent chain must survive the nested hook"
+    );
+
+    // The spawned session is registered under its own PID — the
+    // unknown Claude-looking ancestor the walk short-circuits on.
+    let spawned = s
+        .sessions
+        .get(&spawned_claude_pid)
+        .expect("spawned session must be tracked on its own pid");
+    assert_eq!(spawned.current_session_id, "spawned-sid");
+    assert_eq!(spawned.tool_counts.get("Read"), Some(&1));
+}
+
+/// Follow-up: once a spawned session is registered, subsequent hooks
+/// from it should land on the same pid, not bounce back to the parent.
+/// This is the `compatible(known, pid, sid)` branch of the walk.
+#[tokio::test]
+async fn nested_claude_second_hook_lands_on_same_pid() {
+    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
+    let parent_claude_pid: u32 = 1000;
+    let spawned_claude_pid: u32 = 2000;
+    let curl_pid: u32 = 3000;
+
+    {
+        let mut s = state.write().await;
+        s.register_discovered_pid(parent_claude_pid, Some("/p"), chrono::Utc::now());
+        s.apply_hook_event(parent_claude_pid, "parent-sid", Some("/p"));
+    }
+
+    let resolver: coach_core::server::PidResolver =
+        Arc::new(move |_peer_port, _sid| Some(curl_pid));
+    let parent_fn: coach_core::server::ParentPidFn = Arc::new(move |pid| match pid {
+        p if p == curl_pid => Some(spawned_claude_pid),
+        p if p == spawned_claude_pid => Some(parent_claude_pid),
+        _ => None,
+    });
+    let is_claude_fn: coach_core::server::IsClaudeFn =
+        Arc::new(move |pid| pid == spawned_claude_pid || pid == parent_claude_pid);
+
+    let router = coach_core::server::create_router_headless_with_ancestry(
+        state.clone(),
+        resolver,
+        parent_fn,
+        is_claude_fn,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    for _ in 0..3 {
+        client
+            .post(format!("{base}/hook/post-tool-use"))
+            .json(&serde_json::json!({
+                "session_id": "spawned-sid",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "cwd": "/tmp/sandbox",
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let s = state.read().await;
+    let spawned = s.sessions.get(&spawned_claude_pid).unwrap();
+    assert_eq!(spawned.tool_counts.get("Read"), Some(&3));
+    assert_eq!(spawned.current_session_id, "spawned-sid");
+    let parent = s.sessions.get(&parent_claude_pid).unwrap();
+    assert_eq!(parent.current_session_id, "parent-sid");
+    assert!(
+        parent.tool_counts.is_empty(),
+        "parent must not have inherited the spawned session's Read tool"
+    );
+}
