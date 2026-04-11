@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useCoachStore } from "../store/useCoachStore";
 import { formatDuration, formatTime, timeAgo } from "../utils/time";
-import { abbreviateCwd } from "../utils/path";
+import { abbreviateCwd, jsonlPath } from "../utils/path";
 import { TopBar } from "./TopBar";
 
 /// Compact integer formatter — 1234 → "1.2k", 12345 → "12.3k", < 1000 → as-is.
@@ -90,6 +90,7 @@ export function SessionDetail() {
           <div className="text-zinc-500 dark:text-zinc-400">
             Started {formatTime(session.started_at)} · {timeAgo(session.started_at)} · {formatDuration(session.duration_secs)}
           </div>
+          <JsonlLink path={jsonlPath(session)} />
         </div>
       </section>
 
@@ -368,6 +369,41 @@ export function SessionDetail() {
         )}
       </section>
     </div>
+  );
+}
+
+/**
+ * Path to the Claude Code JSONL transcript for this session. Click to
+ * copy — no Tauri opener plugin is configured yet, so we can't open
+ * the file directly in the default editor. Once the backend exposes
+ * a `reveal_in_finder` / `open_path` command this can upgrade to a
+ * real link.
+ */
+function JsonlLink({ path }: { path: string | null }) {
+  const [copied, setCopied] = useState(false);
+  if (!path) return null;
+
+  const handleClick = async () => {
+    try {
+      await navigator.clipboard.writeText(path);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard blocked (rare in a Tauri webview). Fall back to a
+      // visible prompt — user can still copy manually from the text.
+      setCopied(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      title="Click to copy path"
+      className="font-mono text-[10px] text-zinc-400 dark:text-zinc-600 hover:text-zinc-600 dark:hover:text-zinc-400 transition-colors truncate block text-left w-full"
+    >
+      {copied ? "✓ copied" : path}
+    </button>
   );
 }
 
