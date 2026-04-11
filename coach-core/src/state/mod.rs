@@ -724,6 +724,22 @@ impl CoachState {
 
 pub type SharedState = Arc<RwLock<CoachState>>;
 
+pub async fn mutate<F, R>(
+    state: &SharedState,
+    emitter: &Arc<dyn crate::EventEmitter>,
+    f: F,
+) -> R
+where
+    F: FnOnce(&mut CoachState) -> R,
+{
+    let mut s = state.write().await;
+    let out = f(&mut *s);
+    let snapshot = s.snapshot();
+    drop(s);
+    emitter.emit_state_update(&snapshot);
+    out
+}
+
 /// Build a `CoachState` with empty env_tokens so tests don't depend on
 /// the machine's actual environment variables. Lives at module scope so
 /// other modules' test trees (e.g. `replay::tests`) can share it.

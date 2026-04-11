@@ -7,15 +7,16 @@ use axum::Json;
 use serde_json::Value;
 
 use super::{
-    emit_update, fake_pid_for_sid, run_permission_request, run_post_tool_use, run_pre_tool_use,
+    fake_pid_for_sid, run_permission_request, run_post_tool_use, run_pre_tool_use,
     run_session_start, run_stop, run_user_prompt_submit, AppState, HookPayload, HookResponse,
 };
 use crate::state::SessionClient;
 
 async fn mark_codex(state: &AppState, pid: u32) {
-    let mut coach = state.coach.write().await;
-    coach.mark_client(pid, SessionClient::Codex);
-    emit_update(&*state.emitter, &coach);
+    crate::state::mutate(&state.coach, &state.emitter, |coach| {
+        coach.mark_client(pid, SessionClient::Codex);
+    })
+    .await;
 }
 
 fn codex_pid(payload: &HookPayload) -> u32 {

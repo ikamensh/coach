@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::{emit_update, AppState};
+use super::AppState;
 use crate::settings::{CoachRule, EngineMode, ModelConfig};
 use crate::state::CoachMode;
 
@@ -47,13 +47,17 @@ pub(crate) async fn set_session_mode(
     Path(pid): Path<u32>,
     Json(payload): Json<ModePayload>,
 ) -> Result<Json<crate::state::CoachSnapshot>, (StatusCode, String)> {
-    let mut s = state.coach.write().await;
-    if !s.sessions.contains_key(&pid) {
-        return Err((StatusCode::NOT_FOUND, format!("no session for pid {pid}")));
+    {
+        let s = state.coach.read().await;
+        if !s.sessions.contains_key(&pid) {
+            return Err((StatusCode::NOT_FOUND, format!("no session for pid {pid}")));
+        }
     }
-    s.set_session_mode(pid, payload.mode);
-    let snap = s.snapshot();
-    emit_update(&*state.emitter, &s);
+    let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
+        s.set_session_mode(pid, payload.mode);
+        s.snapshot()
+    })
+    .await;
     Ok(Json(snap))
 }
 
@@ -61,10 +65,11 @@ pub(crate) async fn set_all_modes(
     AxumState(state): AxumState<AppState>,
     Json(payload): Json<ModePayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.set_all_modes(payload.mode);
-    let snap = s.snapshot();
-    emit_update(&*state.emitter, &s);
+    let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
+        s.set_all_modes(payload.mode);
+        s.snapshot()
+    })
+    .await;
     Json(snap)
 }
 
@@ -72,10 +77,11 @@ pub(crate) async fn set_priorities(
     AxumState(state): AxumState<AppState>,
     Json(payload): Json<PrioritiesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.update_priorities(payload.priorities);
-    let snap = s.snapshot();
-    emit_update(&*state.emitter, &s);
+    let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
+        s.update_priorities(payload.priorities);
+        s.snapshot()
+    })
+    .await;
     Json(snap)
 }
 
@@ -83,10 +89,11 @@ pub(crate) async fn set_model(
     AxumState(state): AxumState<AppState>,
     Json(payload): Json<ModelConfig>,
 ) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.update_model(payload);
-    let snap = s.snapshot();
-    emit_update(&*state.emitter, &s);
+    let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
+        s.update_model(payload);
+        s.snapshot()
+    })
+    .await;
     Json(snap)
 }
 
@@ -94,10 +101,11 @@ pub(crate) async fn set_api_token(
     AxumState(state): AxumState<AppState>,
     Json(payload): Json<ApiTokenPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.update_api_token(&payload.provider, &payload.token);
-    let snap = s.snapshot();
-    emit_update(&*state.emitter, &s);
+    let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
+        s.update_api_token(&payload.provider, &payload.token);
+        s.snapshot()
+    })
+    .await;
     Json(snap)
 }
 
@@ -105,10 +113,11 @@ pub(crate) async fn set_coach_mode(
     AxumState(state): AxumState<AppState>,
     Json(payload): Json<CoachModePayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.update_coach_mode(payload.coach_mode);
-    let snap = s.snapshot();
-    emit_update(&*state.emitter, &s);
+    let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
+        s.update_coach_mode(payload.coach_mode);
+        s.snapshot()
+    })
+    .await;
     Json(snap)
 }
 
@@ -116,9 +125,10 @@ pub(crate) async fn set_rules(
     AxumState(state): AxumState<AppState>,
     Json(payload): Json<RulesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    let mut s = state.coach.write().await;
-    s.update_rules(payload.rules);
-    let snap = s.snapshot();
-    emit_update(&*state.emitter, &s);
+    let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
+        s.update_rules(payload.rules);
+        s.snapshot()
+    })
+    .await;
     Json(snap)
 }

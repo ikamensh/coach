@@ -1,9 +1,11 @@
-use coach_core::state::{CoachMode, SharedState, EVENT_STATE_UPDATED};
+use coach_core::state::{self, CoachMode, SharedState};
+use coach_core::EventEmitter;
+use std::sync::Arc;
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    Emitter, Manager,
+    Manager,
 };
 
 const TRAY_ID: &str = "coach-tray";
@@ -69,16 +71,19 @@ pub fn update_icon(app: &tauri::AppHandle, mode: &CoachMode) {
 
 fn toggle_all(state: &SharedState, handle: &tauri::AppHandle) {
     let state = state.clone();
+    let emitter = handle.state::<Arc<dyn EventEmitter>>().inner().clone();
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
-        let mut s = state.write().await;
-        let new_mode = match s.default_mode {
-            CoachMode::Present => CoachMode::Away,
-            CoachMode::Away => CoachMode::Present,
-        };
-        s.set_all_modes(new_mode);
+        let new_mode = state::mutate(&state, &emitter, |s| {
+            let new_mode = match s.default_mode {
+                CoachMode::Present => CoachMode::Away,
+                CoachMode::Away => CoachMode::Present,
+            };
+            s.set_all_modes(new_mode);
+            new_mode
+        })
+        .await;
         update_icon(&handle, &new_mode);
-        let _ = handle.emit(EVENT_STATE_UPDATED, s.snapshot());
     });
 }
 

@@ -89,6 +89,7 @@ pub fn run() {
             let emitter: Arc<dyn EventEmitter> = Arc::new(TauriEmitter {
                 handle: app.handle().clone(),
             });
+            app.manage(emitter.clone());
 
             let server_state = state.clone();
             let server_emitter = emitter.clone();

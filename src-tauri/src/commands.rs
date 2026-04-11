@@ -1,14 +1,12 @@
 use coach_core::path_install::{self, PathStatus};
 use coach_core::replay;
 use coach_core::settings::{CoachRule, EngineMode, HookStatus, HookTarget, ModelConfig};
-use coach_core::state::{CoachMode, CoachSnapshot, CoachState, SharedState, Theme, EVENT_STATE_UPDATED, EVENT_THEME_CHANGED};
+use coach_core::state::{self, CoachMode, CoachSnapshot, SharedState, Theme};
+use coach_core::EventEmitter;
 use serde_json::json;
-use tauri::Emitter;
+use std::sync::Arc;
 
-fn emit_snapshot(app: &tauri::AppHandle, state: &CoachState) -> Result<(), String> {
-    app.emit(EVENT_STATE_UPDATED, &state.snapshot())
-        .map_err(|e| e.to_string())
-}
+type Emitter<'a> = tauri::State<'a, Arc<dyn EventEmitter>>;
 
 #[tauri::command]
 pub async fn get_state(state: tauri::State<'_, SharedState>) -> Result<CoachSnapshot, String> {
@@ -19,77 +17,65 @@ pub async fn get_state(state: tauri::State<'_, SharedState>) -> Result<CoachSnap
 #[tauri::command]
 pub async fn set_session_mode(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     pid: u32,
     mode: CoachMode,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.set_session_mode(pid, mode);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.set_session_mode(pid, mode)).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_all_sessions_mode(
     state: tauri::State<'_, SharedState>,
+    emitter: Emitter<'_>,
     app: tauri::AppHandle,
     mode: CoachMode,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.set_all_modes(mode);
+    state::mutate(&state, emitter.inner(), |s| s.set_all_modes(mode)).await;
     crate::tray::update_icon(&app, &mode);
-    emit_snapshot(&app, &s)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_priorities(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     priorities: Vec<String>,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.update_priorities(priorities);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.update_priorities(priorities)).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_theme(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     theme: Theme,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.update_theme(theme.clone());
-    app.emit(EVENT_THEME_CHANGED, &theme)
-        .map_err(|e| e.to_string())?;
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.update_theme(theme.clone())).await;
+    emitter.emit_theme_changed(&theme);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_api_token(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     provider: String,
     token: String,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.update_api_token(&provider, &token);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.update_api_token(&provider, &token)).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_model(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     model: ModelConfig,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.update_model(model);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.update_model(model)).await;
     Ok(())
 }
 
@@ -191,26 +177,30 @@ async fn do_get_hook_status(state: &SharedState, target: HookTarget) -> Result<H
 
 async fn do_install_hooks(
     state: &SharedState,
-    app: &tauri::AppHandle,
+    emitter: &Arc<dyn EventEmitter>,
     target: HookTarget,
 ) -> Result<HookStatus, String> {
-    let mut s = state.write().await;
-    s.set_hook_enabled(target, true);
-    target.install(s.port)?;
-    emit_snapshot(app, &s)?;
-    Ok(target.check_status(s.port))
+    let port = state::mutate(state, emitter, |s| {
+        s.set_hook_enabled(target, true);
+        s.port
+    })
+    .await;
+    target.install(port)?;
+    Ok(target.check_status(port))
 }
 
 async fn do_uninstall_hooks(
     state: &SharedState,
-    app: &tauri::AppHandle,
+    emitter: &Arc<dyn EventEmitter>,
     target: HookTarget,
 ) -> Result<HookStatus, String> {
-    let mut s = state.write().await;
-    s.set_hook_enabled(target, false);
-    target.uninstall(s.port)?;
-    emit_snapshot(app, &s)?;
-    Ok(target.check_status(s.port))
+    let port = state::mutate(state, emitter, |s| {
+        s.set_hook_enabled(target, false);
+        s.port
+    })
+    .await;
+    target.uninstall(port)?;
+    Ok(target.check_status(port))
 }
 
 #[tauri::command]
@@ -219,13 +209,13 @@ pub async fn get_hook_status(state: tauri::State<'_, SharedState>) -> Result<Hoo
 }
 
 #[tauri::command]
-pub async fn install_hooks(state: tauri::State<'_, SharedState>, app: tauri::AppHandle) -> Result<HookStatus, String> {
-    do_install_hooks(&state, &app, HookTarget::Claude).await
+pub async fn install_hooks(state: tauri::State<'_, SharedState>, emitter: Emitter<'_>) -> Result<HookStatus, String> {
+    do_install_hooks(&state, emitter.inner(), HookTarget::Claude).await
 }
 
 #[tauri::command]
-pub async fn uninstall_hooks(state: tauri::State<'_, SharedState>, app: tauri::AppHandle) -> Result<HookStatus, String> {
-    do_uninstall_hooks(&state, &app, HookTarget::Claude).await
+pub async fn uninstall_hooks(state: tauri::State<'_, SharedState>, emitter: Emitter<'_>) -> Result<HookStatus, String> {
+    do_uninstall_hooks(&state, emitter.inner(), HookTarget::Claude).await
 }
 
 #[tauri::command]
@@ -234,13 +224,13 @@ pub async fn get_codex_hook_status(state: tauri::State<'_, SharedState>) -> Resu
 }
 
 #[tauri::command]
-pub async fn install_codex_hooks(state: tauri::State<'_, SharedState>, app: tauri::AppHandle) -> Result<HookStatus, String> {
-    do_install_hooks(&state, &app, HookTarget::Codex).await
+pub async fn install_codex_hooks(state: tauri::State<'_, SharedState>, emitter: Emitter<'_>) -> Result<HookStatus, String> {
+    do_install_hooks(&state, emitter.inner(), HookTarget::Codex).await
 }
 
 #[tauri::command]
-pub async fn uninstall_codex_hooks(state: tauri::State<'_, SharedState>, app: tauri::AppHandle) -> Result<HookStatus, String> {
-    do_uninstall_hooks(&state, &app, HookTarget::Codex).await
+pub async fn uninstall_codex_hooks(state: tauri::State<'_, SharedState>, emitter: Emitter<'_>) -> Result<HookStatus, String> {
+    do_uninstall_hooks(&state, emitter.inner(), HookTarget::Codex).await
 }
 
 #[tauri::command]
@@ -249,13 +239,13 @@ pub async fn get_cursor_hook_status(state: tauri::State<'_, SharedState>) -> Res
 }
 
 #[tauri::command]
-pub async fn install_cursor_hooks(state: tauri::State<'_, SharedState>, app: tauri::AppHandle) -> Result<HookStatus, String> {
-    do_install_hooks(&state, &app, HookTarget::Cursor).await
+pub async fn install_cursor_hooks(state: tauri::State<'_, SharedState>, emitter: Emitter<'_>) -> Result<HookStatus, String> {
+    do_install_hooks(&state, emitter.inner(), HookTarget::Cursor).await
 }
 
 #[tauri::command]
-pub async fn uninstall_cursor_hooks(state: tauri::State<'_, SharedState>, app: tauri::AppHandle) -> Result<HookStatus, String> {
-    do_uninstall_hooks(&state, &app, HookTarget::Cursor).await
+pub async fn uninstall_cursor_hooks(state: tauri::State<'_, SharedState>, emitter: Emitter<'_>) -> Result<HookStatus, String> {
+    do_uninstall_hooks(&state, emitter.inner(), HookTarget::Cursor).await
 }
 
 #[tauri::command]
@@ -277,49 +267,41 @@ pub async fn replay_session(
 #[tauri::command]
 pub async fn set_coach_mode(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     coach_mode: EngineMode,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.update_coach_mode(coach_mode);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.update_coach_mode(coach_mode)).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_rules(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     rules: Vec<CoachRule>,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.update_rules(rules);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.update_rules(rules)).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_auto_uninstall_hooks_on_exit(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.update_auto_uninstall(enabled);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.update_auto_uninstall(enabled)).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_intervention_muted(
     state: tauri::State<'_, SharedState>,
-    app: tauri::AppHandle,
+    emitter: Emitter<'_>,
     pid: u32,
     muted: bool,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.set_intervention_muted(pid, muted);
-    emit_snapshot(&app, &s)?;
+    state::mutate(&state, emitter.inner(), |s| s.set_intervention_muted(pid, muted)).await;
     Ok(())
 }
 

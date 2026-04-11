@@ -8,7 +8,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use super::{
-    emit_update, fake_pid_for_sid, run_permission_request, run_post_tool_use, run_session_start,
+    fake_pid_for_sid, run_permission_request, run_post_tool_use, run_session_start,
     run_stop, run_user_prompt_submit, AppState, HookPayload, HookResponse,
 };
 use crate::state::SessionClient;
@@ -19,9 +19,10 @@ use crate::state::SessionClient;
 /// (the default on creation), so without this re-emit the icon would
 /// flicker on the first event of every fresh cursor session.
 async fn mark_cursor(state: &AppState, pid: u32) {
-    let mut coach = state.coach.write().await;
-    coach.mark_client(pid, SessionClient::Cursor);
-    emit_update(&*state.emitter, &coach);
+    crate::state::mutate(&state.coach, &state.emitter, |coach| {
+        coach.mark_client(pid, SessionClient::Cursor);
+    })
+    .await;
 }
 
 /// First non-empty string under any of `keys`. Used to probe Cursor's
