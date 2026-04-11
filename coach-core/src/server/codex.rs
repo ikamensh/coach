@@ -1,46 +1,138 @@
-//! Codex CLI hooks use the same event names and payload format as Claude Code.
-//! Hooks arrive via a shim script (curl subprocess), so we use synthetic PIDs
-//! from session_id rather than lsof — same approach as Cursor.
+//! Codex CLI hooks. Payload shape is identical to Claude Code's (same
+//! `HookPayload` struct), but hooks arrive via a shim curl subprocess,
+//! so the TCP peer isn't the agent. We key sessions by `session_id` →
+//! synthetic PID, like the Cursor adapter does.
 
 use axum::extract::State as AxumState;
-use axum::Json;
+use axum::{routing::post, Json, Router};
 use serde_json::Value;
 
-use super::{
-    fake_pid_for_sid, run_permission_request, run_post_tool_use, run_pre_tool_use,
-    run_session_start, run_stop, run_user_prompt_submit, AppState, HookPayload, HookResponse,
-};
-use crate::state::SessionClient;
+use super::claude::HookPayload;
+use super::events::{dispatch, SessionEvent, SessionSource};
+use super::{fake_pid_for_sid, AppState};
 
-async fn mark_codex(state: &AppState, pid: u32) {
-    crate::state::mutate(&state.coach, &state.emitter, |coach| {
-        coach.mark_client(pid, SessionClient::Codex);
-    })
-    .await;
+const SOURCE: SessionSource = SessionSource::Codex;
+
+fn pid_and_sid(payload: &HookPayload) -> (u32, String) {
+    let sid = payload.sid();
+    (fake_pid_for_sid(&sid), sid)
 }
 
-fn codex_pid(payload: &HookPayload) -> u32 {
-    let sid = payload.session_id.as_deref().unwrap_or("unknown");
-    fake_pid_for_sid(sid)
+async fn permission_request(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&payload);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::PermissionRequested {
+            session_id: sid,
+            cwd: payload.cwd,
+            tool_name: payload.tool_name.unwrap_or_default(),
+        },
+    )
+    .await
 }
 
-macro_rules! codex_handler {
-    ($name:ident, $run:ident, $ret:ty) => {
-        pub async fn $name(
-            AxumState(state): AxumState<AppState>,
-            Json(payload): Json<HookPayload>,
-        ) -> Json<$ret> {
-            let pid = codex_pid(&payload);
-            let resp = $run(&state, pid, payload).await;
-            mark_codex(&state, pid).await;
-            resp
-        }
-    };
+async fn session_start(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&payload);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::SessionStarted {
+            session_id: sid,
+            cwd: payload.cwd,
+            source_label: payload.source.unwrap_or_else(|| "codex".into()),
+        },
+    )
+    .await
 }
 
-codex_handler!(permission_request, run_permission_request, HookResponse);
-codex_handler!(pre_tool_use, run_pre_tool_use, HookResponse);
-codex_handler!(post_tool_use, run_post_tool_use, HookResponse);
-codex_handler!(user_prompt_submit, run_user_prompt_submit, HookResponse);
-codex_handler!(session_start, run_session_start, HookResponse);
-codex_handler!(stop, run_stop, Value);
+async fn user_prompt_submit(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&payload);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::UserPromptSubmitted {
+            session_id: sid,
+            cwd: payload.cwd,
+            prompt: payload.prompt,
+        },
+    )
+    .await
+}
+
+async fn stop(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&payload);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::StopRequested {
+            session_id: sid,
+            cwd: payload.cwd,
+            stop_reason: payload.stop_reason,
+        },
+    )
+    .await
+}
+
+async fn pre_tool_use(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&payload);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::ToolStarting {
+            session_id: sid,
+            cwd: payload.cwd,
+            tool_name: payload.tool_name.unwrap_or_default(),
+        },
+    )
+    .await
+}
+
+async fn post_tool_use(
+    AxumState(state): AxumState<AppState>,
+    Json(payload): Json<HookPayload>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&payload);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::ToolCompleted {
+            session_id: sid,
+            cwd: payload.cwd,
+            tool_name: payload.tool_name.unwrap_or_default(),
+            tool_input: payload.tool_input.unwrap_or(Value::Null),
+        },
+    )
+    .await
+}
+
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/codex/hook/permission-request", post(permission_request))
+        .route("/codex/hook/stop", post(stop))
+        .route("/codex/hook/pre-tool-use", post(pre_tool_use))
+        .route("/codex/hook/post-tool-use", post(post_tool_use))
+        .route("/codex/hook/user-prompt-submit", post(user_prompt_submit))
+        .route("/codex/hook/session-start", post(session_start))
+}

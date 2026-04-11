@@ -1,34 +1,23 @@
-//! Cursor Agent lifecycle hooks (`~/.cursor/hooks.json`) send JSON to `/cursor/hook/*`.
-//! Cursor invokes subprocess commands (e.g. `curl`) that POST stdin to Coach; the TCP peer is
-//! not the agent process, so we key sessions by `session_id` from the payload and use the same
-//! synthetic PID scheme as integration tests (`fake_pid_for_sid`).
+//! Cursor Agent lifecycle hooks (`~/.cursor/hooks.json`).
+//!
+//! Cursor invokes a shim subprocess that POSTs the hook JSON to Coach;
+//! the TCP peer is the shim (curl), not the agent process, so we key
+//! sessions by `session_id` → synthetic PID just like the Codex adapter.
+//! Each hook has its own raw JSON shape, so there's no single payload
+//! struct — each route pulls what it needs out of the `serde_json::Value`.
 
 use axum::extract::State as AxumState;
-use axum::Json;
+use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 
-use super::{
-    fake_pid_for_sid, run_permission_request, run_post_tool_use, run_session_start,
-    run_stop, run_user_prompt_submit, AppState, HookPayload, HookResponse,
-};
-use crate::state::SessionClient;
+use super::events::{dispatch, SessionEvent, SessionSource};
+use super::{fake_pid_for_sid, AppState};
 
-/// Tag the session as belonging to Cursor and re-emit so the frontend
-/// gets the updated `client` field. The shared `run_*` path the cursor
-/// handler just called already emitted a snapshot with `client=Claude`
-/// (the default on creation), so without this re-emit the icon would
-/// flicker on the first event of every fresh cursor session.
-async fn mark_cursor(state: &AppState, pid: u32) {
-    crate::state::mutate(&state.coach, &state.emitter, |coach| {
-        coach.mark_client(pid, SessionClient::Cursor);
-    })
-    .await;
-}
+const SOURCE: SessionSource = SessionSource::Cursor;
 
-/// First non-empty string under any of `keys`. Used to probe Cursor's
-/// JSON payloads, which have shifted between snake_case and camelCase
-/// across versions.
-fn first_string_field(v: &Value, keys: &[&str]) -> Option<String> {
+/// First non-empty string under any of `keys`. Cursor's payloads have
+/// shifted between snake_case and camelCase across versions.
+fn first_string(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| {
         v.get(k)
             .and_then(|x| x.as_str())
@@ -37,8 +26,8 @@ fn first_string_field(v: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-fn cursor_session_key(v: &Value) -> String {
-    first_string_field(
+fn session_key(v: &Value) -> String {
+    first_string(
         v,
         &[
             "sessionId",
@@ -51,12 +40,8 @@ fn cursor_session_key(v: &Value) -> String {
     .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn cursor_pid(v: &Value) -> u32 {
-    fake_pid_for_sid(&cursor_session_key(v))
-}
-
-fn cursor_cwd(v: &Value) -> Option<String> {
-    first_string_field(
+fn cwd(v: &Value) -> Option<String> {
+    first_string(
         v,
         &["cwd", "workspaceRoot", "workspace_root", "rootPath", "root"],
     )
@@ -70,177 +55,207 @@ fn cursor_cwd(v: &Value) -> Option<String> {
     })
 }
 
-fn payload_session_start(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
-    let source = v
+fn pid_and_sid(v: &Value) -> (u32, String) {
+    let sid = session_key(v);
+    (fake_pid_for_sid(&sid), sid)
+}
+
+async fn session_start(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
+    let label = v
         .get("source")
         .or_else(|| v.get("type"))
         .and_then(|x| x.as_str())
         .unwrap_or("cursor")
         .to_string();
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("sessionStart".into()),
-        tool_name: None,
-        tool_input: None,
-        stop_reason: None,
-        prompt: None,
-        source: Some(source),
-        cwd: cursor_cwd(v),
-    }
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::SessionStarted {
+            session_id: sid,
+            cwd: cwd(&v),
+            source_label: label,
+        },
+    )
+    .await
 }
 
-fn payload_before_submit(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
+async fn before_submit_prompt(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
     let prompt = v
         .get("prompt")
         .or_else(|| v.get("text"))
         .or_else(|| v.get("message"))
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("beforeSubmitPrompt".into()),
-        tool_name: None,
-        tool_input: None,
-        stop_reason: None,
-        prompt,
-        source: None,
-        cwd: cursor_cwd(v),
-    }
+        .map(str::to_string);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::UserPromptSubmitted {
+            session_id: sid,
+            cwd: cwd(&v),
+            prompt,
+        },
+    )
+    .await
 }
 
-fn payload_before_shell(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
+/// `beforeShellExecution` — Cursor asks Coach whether to allow a shell
+/// command. Maps to the domain `PermissionRequested` event (same away-
+/// mode auto-approve semantics as Claude's permission-request hook).
+async fn before_shell(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::PermissionRequested {
+            session_id: sid,
+            cwd: cwd(&v),
+            tool_name: "Bash".into(),
+        },
+    )
+    .await
+}
+
+/// `beforeMCPExecution` — same story as `beforeShellExecution`, but for
+/// an MCP tool call.
+async fn before_mcp(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::PermissionRequested {
+            session_id: sid,
+            cwd: cwd(&v),
+            tool_name: "mcp".into(),
+        },
+    )
+    .await
+}
+
+async fn after_shell(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
     let cmd = v
         .get("command")
         .or_else(|| v.get("commandLine"))
-        .or_else(|| v.get("script"))
         .and_then(|x| x.as_str())
         .unwrap_or("");
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("beforeShellExecution".into()),
-        tool_name: Some("Bash".into()),
-        tool_input: Some(json!({ "command": cmd })),
-        stop_reason: None,
-        prompt: None,
-        source: None,
-        cwd: cursor_cwd(v),
-    }
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::ToolCompleted {
+            session_id: sid,
+            cwd: cwd(&v),
+            tool_name: "Bash".into(),
+            tool_input: json!({ "command": cmd }),
+        },
+    )
+    .await
 }
 
-fn payload_before_mcp(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("beforeMCPExecution".into()),
-        tool_name: Some("mcp".into()),
-        tool_input: Some(v.clone()),
-        stop_reason: None,
-        prompt: None,
-        source: None,
-        cwd: cursor_cwd(v),
-    }
+async fn after_mcp(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
+    let cwd_val = cwd(&v);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::ToolCompleted {
+            session_id: sid,
+            cwd: cwd_val,
+            tool_name: "mcp".into(),
+            tool_input: v,
+        },
+    )
+    .await
 }
 
-fn payload_after_shell(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
-    let cmd = v
-        .get("command")
-        .or_else(|| v.get("commandLine"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("afterShellExecution".into()),
-        tool_name: Some("Bash".into()),
-        tool_input: Some(json!({ "command": cmd })),
-        stop_reason: None,
-        prompt: None,
-        source: None,
-        cwd: cursor_cwd(v),
-    }
-}
-
-fn payload_after_mcp(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("afterMCPExecution".into()),
-        tool_name: Some("mcp".into()),
-        tool_input: Some(v.clone()),
-        stop_reason: None,
-        prompt: None,
-        source: None,
-        cwd: cursor_cwd(v),
-    }
-}
-
-fn payload_after_file_edit(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
+/// `afterFileEdit` — Cursor's only file-edit signal. We collapse it into
+/// `ToolCompleted { tool_name: "Edit" }` so the rules engine and observer
+/// see the same event they'd see from Claude Code's PostToolUse(Edit) hook.
+async fn after_file_edit(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
     let new_string = v
         .get("newContent")
         .or_else(|| v.get("new_string"))
         .or_else(|| v.get("newString"))
         .and_then(|x| x.as_str())
         .unwrap_or("");
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("afterFileEdit".into()),
-        tool_name: Some("Edit".into()),
-        tool_input: Some(json!({ "new_string": new_string })),
-        stop_reason: None,
-        prompt: None,
-        source: None,
-        cwd: cursor_cwd(v),
-    }
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::ToolCompleted {
+            session_id: sid,
+            cwd: cwd(&v),
+            tool_name: "Edit".into(),
+            tool_input: json!({ "new_string": new_string }),
+        },
+    )
+    .await
 }
 
-fn payload_stop(v: &Value) -> HookPayload {
-    let sid = cursor_session_key(v);
+async fn stop(
+    AxumState(state): AxumState<AppState>,
+    Json(v): Json<Value>,
+) -> Json<Value> {
+    let (pid, sid) = pid_and_sid(&v);
     let stop_reason = v
         .get("reason")
         .or_else(|| v.get("stopReason"))
         .or_else(|| v.get("stop_reason"))
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
-    HookPayload {
-        session_id: Some(sid),
-        hook_event_name: Some("stop".into()),
-        tool_name: None,
-        tool_input: None,
-        stop_reason,
-        prompt: None,
-        source: None,
-        cwd: cursor_cwd(v),
-    }
+        .map(str::to_string);
+    dispatch(
+        &state,
+        pid,
+        SOURCE,
+        SessionEvent::StopRequested {
+            session_id: sid,
+            cwd: cwd(&v),
+            stop_reason,
+        },
+    )
+    .await
 }
 
-/// Each cursor handler is identical: extract the synthetic PID from the
-/// payload, run the shared `run_*` for the matching Claude lifecycle
-/// event, then re-tag the session as Cursor (and re-emit). The macro
-/// keeps the function names stable so the axum routes in `server.rs`
-/// don't need to change when handlers are added or removed.
-macro_rules! cursor_handler {
-    ($name:ident, $run:ident, $payload:ident, $ret:ty) => {
-        pub async fn $name(
-            AxumState(state): AxumState<AppState>,
-            Json(v): Json<Value>,
-        ) -> Json<$ret> {
-            let pid = cursor_pid(&v);
-            let resp = $run(&state, pid, $payload(&v)).await;
-            mark_cursor(&state, pid).await;
-            resp
-        }
-    };
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/cursor/hook/session-start", post(session_start))
+        .route(
+            "/cursor/hook/before-submit-prompt",
+            post(before_submit_prompt),
+        )
+        .route("/cursor/hook/before-shell", post(before_shell))
+        .route("/cursor/hook/before-mcp", post(before_mcp))
+        .route("/cursor/hook/after-shell", post(after_shell))
+        .route("/cursor/hook/after-mcp", post(after_mcp))
+        .route("/cursor/hook/after-file-edit", post(after_file_edit))
+        .route("/cursor/hook/stop", post(stop))
 }
-
-cursor_handler!(session_start, run_session_start, payload_session_start, HookResponse);
-cursor_handler!(before_submit_prompt, run_user_prompt_submit, payload_before_submit, HookResponse);
-cursor_handler!(before_shell, run_permission_request, payload_before_shell, HookResponse);
-cursor_handler!(before_mcp, run_permission_request, payload_before_mcp, HookResponse);
-cursor_handler!(after_shell, run_post_tool_use, payload_after_shell, HookResponse);
-cursor_handler!(after_mcp, run_post_tool_use, payload_after_mcp, HookResponse);
-cursor_handler!(after_file_edit, run_post_tool_use, payload_after_file_edit, HookResponse);
-cursor_handler!(stop, run_stop, payload_stop, serde_json::Value);
