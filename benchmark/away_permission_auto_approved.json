@@ -1,0 +1,26 @@
+{
+  "name": "away_permission_auto_approved",
+  "source": "USER_STORIES G5",
+  "description": "In Away mode a PermissionRequest must be auto-approved so the user can walk away without a modal.",
+
+  "mode": "away",
+  "priorities": ["ship the test", "fix the bug"],
+  "session_id": "bench-g5",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": { "prompt": "run the tests" }
+    },
+    {
+      "hook": "permission-request",
+      "body": {
+        "tool_name": "Bash",
+        "cwd": "/app"
+      },
+      "expect": {
+        "permission": "allow"
+      }
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "name": "away_stop_cooldown_passes_second",
+  "source": "USER_STORIES G7",
+  "description": "After a Stop is blocked, a second Stop within the cooldown window must pass through — no stacked blocks.",
+
+  "mode": "away",
+  "priorities": ["ship the test", "fix the bug"],
+  "session_id": "bench-g7",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": { "prompt": "add a /health endpoint" }
+    },
+    {
+      "hook": "stop",
+      "body": { "stop_reason": "end_turn" },
+      "expect": {
+        "decision": "block",
+        "reason_contains": "ship"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Read",
+        "tool_input": { "file_path": "/app/server.py" },
+        "cwd": "/app"
+      }
+    },
+    {
+      "hook": "stop",
+      "body": { "stop_reason": "end_turn" },
+      "expect": {
+        "passthrough": true
+      }
+    }
+  ]
+}

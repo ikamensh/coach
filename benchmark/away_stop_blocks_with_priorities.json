@@ -1,0 +1,24 @@
+{
+  "name": "away_stop_blocks_with_priorities",
+  "source": "USER_STORIES G6",
+  "description": "In Away mode the first Stop must be blocked with the priority list injected as the block reason.",
+
+  "mode": "away",
+  "priorities": ["ship the test", "fix the bug"],
+  "session_id": "bench-g6",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": { "prompt": "what is 2+2" }
+    },
+    {
+      "hook": "stop",
+      "body": { "stop_reason": "end_turn" },
+      "expect": {
+        "decision": "block",
+        "reason_contains": "ship the test"
+      }
+    }
+  ]
+}
