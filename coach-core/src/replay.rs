@@ -1,21 +1,31 @@
 //! Session discovery and replay for the dev tools UI.
 //!
 //! Scans `~/.claude/projects/` for JSONL session files, extracts metadata,
-//! and replays hook events through Coach's intervention logic. The replay
-//! mode parameter mirrors live coach behavior:
-//!   • `"present"` — passthrough; no intervention
-//!   • `"away"`    — rules-mode: block the first Stop with the static
-//!                   `away_message`, pass subsequent ones (a stand-in for
-//!                   the live 15s cooldown)
-//!   • `"llm"`     — runs the same code path as the live coach:
-//!                   `observe_tool_use` per tool event (building the chain),
-//!                   `evaluate_stop_chained` per Stop event
+//! and replays hook events through **the same `dispatch()` path that
+//! handles live hooks**. There is no parallel intervention logic: replay
+//! parses a JSONL transcript into a sequence of `SessionEvent`s and
+//! feeds them through `server::events::dispatch` against an isolated
+//! `CoachState` clone (empty sessions, cloned config + services, no-op
+//! emitter). The live state the caller passed in is never touched.
+//!
+//! Replay modes change only two settings on the isolated state:
+//!   • `"present"` — `coach_mode = Rules`, default session mode `Present`
+//!   • `"away"`    — `coach_mode = Rules`, default session mode `Away`
+//!   • `"llm"`     — `coach_mode = Llm`,   default session mode `Away`
+//!
+//! Every other rule — cooldown, observer chain, rule matcher, permission
+//! auto-approval, Stop eviction — is the live code path, not a copy.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
 
-use crate::coach::{ChainedStopInput, LlmCoach, ObserveToolUseInput};
-use crate::state::{CoachChain, SharedState};
+use crate::server::events::{dispatch, SessionEvent, SessionSource};
+use crate::server::{fake_pid_for_sid, AppState};
+use crate::settings::EngineMode;
+use crate::state::{CoachMode, CoachState, RuntimeServices, SessionRegistry, SharedState};
 
 fn claude_projects_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
@@ -283,20 +293,233 @@ pub fn find_session(session_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Internal raw event extracted from the JSONL transcript before
-/// per-mode evaluation. Carries everything the live coach would see:
-/// tool input for the observer, user prompt for context, and stop_reason
-/// for stop evaluation.
-struct RawEvent {
-    kind: String,
-    tool_name: String,
-    tool_input: serde_json::Value,
-    timestamp: String,
-    summary: String,
-    stop_reason: Option<String>,
-    user_prompt: Option<String>,
+/// A step we feed to `dispatch`. Only a subset of steps become
+/// user-visible `ReplayEvent`s (`emit_index = Some`); `UserPromptSubmit`
+/// is dispatched internally so the observer sees the turn, but the
+/// DevPane timeline only shows tool calls and stops.
+struct DispatchStep {
+    event: SessionEvent,
+    emit: Option<EmitInfo>,
 }
 
+struct EmitInfo {
+    kind: &'static str,
+    tool_name: String,
+    timestamp: String,
+    summary: String,
+}
+
+/// Map a replay mode string to `(coach_mode, session_mode)`. Unknown
+/// strings fall back to `present` so UI bugs can't wedge the server.
+fn resolve_modes(replay_mode: &str) -> (EngineMode, CoachMode) {
+    match replay_mode {
+        "llm" => (EngineMode::Llm, CoachMode::Away),
+        "away" => (EngineMode::Rules, CoachMode::Away),
+        _ => (EngineMode::Rules, CoachMode::Present),
+    }
+}
+
+/// Build a fresh `CoachState` with an empty `SessionRegistry` but every
+/// other field cloned from the caller's live state. The replay session
+/// lives here and never leaks into the real state the caller handed us.
+async fn isolated_state_from(live: &SharedState, replay_mode: &str) -> SharedState {
+    let (engine_mode, session_mode) = resolve_modes(replay_mode);
+    let live_read = live.read().await;
+    let mut config = live_read.config.clone();
+    config.coach_mode = engine_mode;
+
+    let services = RuntimeServices {
+        http_client: live_read.services.http_client.clone(),
+        env_tokens: live_read.services.env_tokens.clone(),
+        mock_session_send: live_read.services.mock_session_send.clone(),
+        llm_logger: live_read.services.llm_logger.clone(),
+        #[cfg(feature = "pycoach")]
+        pycoach: live_read.services.pycoach.clone(),
+    };
+    drop(live_read);
+
+    let mut sessions = SessionRegistry::new();
+    sessions.default_mode = session_mode;
+
+    Arc::new(RwLock::new(CoachState {
+        sessions,
+        config,
+        services,
+    }))
+}
+
+/// Observer completion counter. Every successful or failed observer
+/// call bumps `telemetry.calls` or `telemetry.errors` exactly once, so
+/// their sum is a monotonic "observer work done" count for the session.
+async fn observer_progress(state: &SharedState, sid: &str) -> usize {
+    state
+        .read()
+        .await
+        .sessions
+        .get(sid)
+        .map(|s| s.coach.telemetry.calls + s.coach.telemetry.errors)
+        .unwrap_or(0)
+}
+
+/// Block until `observer_progress(sid) > baseline` or `timeout` elapses.
+/// Used between PostToolUse events in LLM mode so the chain is fully
+/// advanced before the next dispatch reads it. Live uses a fire-and-
+/// forget queue; replay waits so each event sees the previous one's
+/// verdict — otherwise a Stop might run on a stale chain.
+async fn wait_for_observer_tick(
+    state: &SharedState,
+    sid: &str,
+    baseline: usize,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if observer_progress(state, sid).await > baseline {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Convert a dispatch response into `(action, message)` for a
+/// `ReplayEvent`. Mirrors the three response shapes `dispatch` emits:
+///   • `{}`                                                   → passthrough
+///   • `{decision: "block", reason: "..."}`                   → blocked stop
+///   • `{hookSpecificOutput: {additionalContext: "..."}}`     → rule / intervention
+///   • `{hookSpecificOutput: {decision: {behavior: "allow"}}}` → auto-approved (unused here)
+fn interpret_response(resp: &serde_json::Value) -> (Option<String>, Option<String>) {
+    if resp.get("decision").and_then(|d| d.as_str()) == Some("block") {
+        let msg = resp
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        return (Some("blocked".to_string()), msg);
+    }
+    if let Some(ctx) = resp
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(|v| v.as_str())
+    {
+        return (
+            Some("intervention".to_string()),
+            Some(ctx.to_string()),
+        );
+    }
+    if resp
+        .pointer("/hookSpecificOutput/decision/behavior")
+        .and_then(|v| v.as_str())
+        == Some("allow")
+    {
+        return (Some("auto-approved".to_string()), None);
+    }
+    (None, None)
+}
+
+/// Parse a Claude Code JSONL transcript into an ordered dispatch stream.
+/// User messages become `UserPromptSubmitted`, assistant `tool_use`
+/// blocks become `ToolCompleted`, and assistant turns with
+/// `stop_reason == "end_turn"` become `StopRequested`. Only the
+/// tool/stop events get a user-visible `EmitInfo`; user prompts are
+/// dispatched silently so the observer sees them.
+fn build_dispatch_stream(
+    messages: &[serde_json::Value],
+    session_id: &str,
+    cwd: Option<String>,
+) -> Vec<DispatchStep> {
+    let mut steps: Vec<DispatchStep> = Vec::new();
+
+    for msg in messages {
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = msg
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if msg_type == "user" {
+            if let Some(prompt) = extract_user_prompt(msg) {
+                steps.push(DispatchStep {
+                    event: SessionEvent::UserPromptSubmitted {
+                        session_id: session_id.to_string(),
+                        cwd: cwd.clone(),
+                        prompt: Some(prompt),
+                    },
+                    emit: None,
+                });
+            }
+            continue;
+        }
+        if msg_type != "assistant" {
+            continue;
+        }
+
+        let content = msg.pointer("/message/content");
+        let stop_reason = msg
+            .pointer("/message/stop_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if let Some(arr) = content.and_then(|c| c.as_array()) {
+            for block in arr {
+                if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                let tool = block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let tool_input = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let summary = tool_summary(block);
+                steps.push(DispatchStep {
+                    event: SessionEvent::ToolCompleted {
+                        session_id: session_id.to_string(),
+                        cwd: cwd.clone(),
+                        tool_name: tool.clone(),
+                        tool_input,
+                    },
+                    emit: Some(EmitInfo {
+                        kind: "PostToolUse",
+                        tool_name: tool.clone(),
+                        timestamp: ts.clone(),
+                        summary: format!("{}: {}", tool, summary),
+                    }),
+                });
+            }
+        }
+
+        if stop_reason == "end_turn" {
+            steps.push(DispatchStep {
+                event: SessionEvent::StopRequested {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.clone(),
+                    stop_reason: Some(stop_reason.to_string()),
+                },
+                emit: Some(EmitInfo {
+                    kind: "Stop",
+                    tool_name: String::new(),
+                    timestamp: ts,
+                    summary: "end_turn".to_string(),
+                }),
+            });
+        }
+    }
+
+    steps
+}
+
+/// Replay a saved session against the real hook dispatch path.
+///
+/// Builds an isolated `CoachState` (empty sessions, config cloned from
+/// the caller's live state) and feeds it synthetic `SessionEvent`s
+/// derived from the JSONL transcript. The decision logic, observer
+/// chain, rule matcher, and cooldown behavior are all the live code —
+/// replay is just a transport. The caller's state is never mutated.
 pub async fn replay_session(
     session_id: &str,
     mode: &str,
@@ -304,8 +527,22 @@ pub async fn replay_session(
 ) -> Result<ReplayResult, String> {
     let path = find_session(session_id)
         .ok_or_else(|| format!("Session not found: {}", session_id))?;
+    replay_transcript_at(&path, session_id, mode, state).await
+}
 
-    let content = std::fs::read_to_string(&path)
+/// Replay a JSONL transcript from an arbitrary path. Used by the
+/// session-id entry point above and by scenario fixtures that don't
+/// live under `~/.claude/projects/`. `session_id` is the label used
+/// to key the replay session inside the isolated state and to tag
+/// activity entries; pass the file stem if you don't have a natural
+/// one.
+pub async fn replay_transcript_at(
+    path: &std::path::Path,
+    session_id: &str,
+    mode: &str,
+    state: &SharedState,
+) -> Result<ReplayResult, String> {
+    let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read session: {}", e))?;
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -319,186 +556,98 @@ pub async fn replay_session(
         }
     }
 
-    let topic = messages.iter()
+    let topic = messages
+        .iter()
         .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("user"))
         .map(extract_topic_from_entry)
         .unwrap_or_default();
 
-    let cwd = messages.iter()
+    let cwd_string: String = messages
+        .iter()
         .find_map(|m| m.get("cwd").and_then(|v| v.as_str()).map(String::from))
         .unwrap_or_default();
+    let cwd_opt: Option<String> = if cwd_string.is_empty() {
+        None
+    } else {
+        Some(cwd_string.clone())
+    };
 
-    let user_count = messages.iter()
+    let user_count = messages
+        .iter()
         .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("user"))
         .count();
-    let asst_count = messages.iter()
+    let asst_count = messages
+        .iter()
         .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("assistant"))
         .count();
 
-    // Snapshot priorities before any awaits — LLM calls below acquire
-    // their own short-lived read locks.
-    let priorities: Vec<String> = state.read().await.config.priorities.clone();
+    let isolated = isolated_state_from(state, mode).await;
+    let app_state = AppState {
+        coach: isolated.clone(),
+        emitter: Arc::new(crate::NoopEmitter),
+    };
+    let pid = fake_pid_for_sid(session_id);
 
-    // Extract hook events from the transcript, tracking the last user
-    // message so each event carries the same `user_prompt` the live
-    // observer would have seen.
-    let mut events: Vec<RawEvent> = Vec::new();
-    let mut last_user_prompt: Option<String> = None;
+    // Whether LLM mode is actually live: requires `llm` replay mode AND
+    // that the cloned provider is observer-capable. Matches the live
+    // gate in `on_tool_completed`, so replay never waits on an observer
+    // that won't fire.
+    let llm_active = {
+        let s = isolated.read().await;
+        s.config.coach_mode == EngineMode::Llm
+            && crate::settings::OBSERVER_CAPABLE_PROVIDERS
+                .contains(&s.config.model.provider.as_str())
+    };
 
-    for msg in &messages {
-        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let steps = build_dispatch_stream(&messages, session_id, cwd_opt);
 
-        if msg_type == "user" {
-            last_user_prompt = extract_user_prompt(msg);
-            continue;
-        }
-        if msg_type != "assistant" {
-            continue;
-        }
-
-        let ts = msg.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let content = msg.pointer("/message/content");
-        let stop_reason = msg.pointer("/message/stop_reason").and_then(|v| v.as_str()).unwrap_or("");
-
-        if let Some(arr) = content.and_then(|c| c.as_array()) {
-            for block in arr {
-                if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
-                    continue;
-                }
-                let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let tool_input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
-                let summary = tool_summary(block);
-                events.push(RawEvent {
-                    kind: "PostToolUse".to_string(),
-                    tool_name: tool.to_string(),
-                    tool_input,
-                    timestamp: ts.clone(),
-                    summary: format!("{}: {}", tool, summary),
-                    stop_reason: None,
-                    user_prompt: last_user_prompt.clone(),
-                });
-            }
-        }
-
-        // Live coach observes the Stop hook regardless of stop_reason,
-        // but in the JSONL transcript the only assistant frames that
-        // would have triggered Stop are the `end_turn` ones. Filtering
-        // here keeps replay aligned with what the user actually saw.
-        if stop_reason == "end_turn" {
-            events.push(RawEvent {
-                kind: "Stop".to_string(),
-                tool_name: String::new(),
-                tool_input: serde_json::Value::Null,
-                timestamp: ts,
-                summary: "end_turn".to_string(),
-                stop_reason: Some(stop_reason.to_string()),
-                user_prompt: last_user_prompt.clone(),
-            });
-        }
-    }
-
-    // Evaluate events through the same code path as the live coach:
-    //   • PostToolUse → observe_tool_use (builds the conversational chain)
-    //   • Stop → evaluate_stop_chained (decides using that chain)
-    // This mirrors server.rs observer_consumer + run_stop exactly.
-    let llm_coach = LlmCoach::new(state.clone());
-    let mut replay_events = Vec::new();
+    let mut replay_events: Vec<ReplayEvent> = Vec::new();
     let mut first_intervention: Option<usize> = None;
-    let mut chain = CoachChain::Empty;
-    let mut rules_stop_blocked = false; // rules-mode "block first Stop only"
 
-    for (i, ev) in events.iter().enumerate() {
-        let (action, message) = if mode == "present" {
-            (None, None)
-        } else if mode == "llm" && ev.kind == "PostToolUse" {
-            // Mirror observer_consumer: call observe_tool_use to build
-            // the chain and detect interventions.
-            match llm_coach
-                .observe_tool_use(ObserveToolUseInput {
-                    priorities: priorities.clone(),
-                    chain: chain.clone(),
-                    tool_name: ev.tool_name.clone(),
-                    tool_input: ev.tool_input.clone(),
-                    user_prompt: ev.user_prompt.clone(),
-                    session_id: Some(session_id.to_string()),
-                })
-                .await
-            {
-                Ok(result) => {
-                    chain = result.chain;
-                    if result.assessment.starts_with("INTERVENE:") {
-                        let msg = result.assessment.strip_prefix("INTERVENE:").unwrap().trim().to_string();
-                        (Some("intervention".to_string()), Some(msg))
-                    } else {
-                        (None, None)
-                    }
-                }
-                Err(e) => (
-                    Some("error".to_string()),
-                    Some(format!("[LLM error] {e}")),
-                ),
-            }
-        } else if mode == "llm" && ev.kind == "Stop" {
-            // Mirror run_stop: evaluate using the accumulated chain.
-            match llm_coach
-                .evaluate_stop_chained(ChainedStopInput {
-                    priorities: priorities.clone(),
-                    chain: chain.clone(),
-                    stop_reason: ev.stop_reason.clone(),
-                    session_id: Some(session_id.to_string()),
-                })
-                .await
-            {
-                Ok(result) => {
-                    chain = result.chain;
-                    if result.decision.allow {
-                        (None, None)
-                    } else {
-                        let msg = result.decision
-                            .message
-                            .filter(|m| !m.trim().is_empty())
-                            .unwrap_or_else(|| crate::state::away_message(&priorities));
-                        (Some("blocked".to_string()), Some(msg))
-                    }
-                }
-                Err(e) => (
-                    Some("error".to_string()),
-                    Some(format!("[LLM error] {e}")),
-                ),
-            }
-        } else if ev.kind != "Stop" {
-            (None, None)
-        } else if rules_stop_blocked {
-            (None, None)
+    for step in steps {
+        let is_tool = matches!(step.event, SessionEvent::ToolCompleted { .. });
+        let baseline = if llm_active && is_tool {
+            observer_progress(&isolated, session_id).await
         } else {
-            rules_stop_blocked = true;
-            (
-                Some("blocked".to_string()),
-                Some(crate::state::away_message(&priorities)),
-            )
+            0
         };
 
-        let is_intervention = action.is_some();
+        let response = dispatch(&app_state, pid, SessionSource::ClaudeCode, step.event).await;
 
+        if llm_active && is_tool {
+            wait_for_observer_tick(
+                &isolated,
+                session_id,
+                baseline,
+                Duration::from_secs(30),
+            )
+            .await;
+        }
+
+        let Some(emit) = step.emit else {
+            continue;
+        };
+
+        let (action, message) = interpret_response(&response.0);
+        let index = replay_events.len();
+        if action.is_some() && first_intervention.is_none() {
+            first_intervention = Some(index);
+        }
         replay_events.push(ReplayEvent {
-            index: i,
-            kind: ev.kind.clone(),
-            tool_name: ev.tool_name.clone(),
-            timestamp: ev.timestamp.clone(),
-            summary: ev.summary.clone(),
+            index,
+            kind: emit.kind.to_string(),
+            tool_name: emit.tool_name,
+            timestamp: emit.timestamp,
+            summary: emit.summary,
             action,
             message,
         });
-
-        if is_intervention && first_intervention.is_none() {
-            first_intervention = Some(i);
-        }
     }
 
     Ok(ReplayResult {
         session_id: session_id.to_string(),
         topic,
-        cwd,
+        cwd: cwd_string,
         message_count: messages.len(),
         user_message_count: user_count,
         assistant_message_count: asst_count,
@@ -584,6 +733,147 @@ mod tests {
         let state: SharedState = Arc::new(RwLock::new(crate::state::test_state()));
         let result = replay_session("nonexistent-id-12345", "away", &state).await;
         assert!(result.is_err());
+    }
+
+    /// End-to-end regression: a synthetic JSONL fixture replayed through
+    /// the live `dispatch()` path for all three modes. Proves that
+    /// replay reuses the real hook pipeline (rules, observer, Stop
+    /// cooldown) rather than a parallel implementation.
+    ///
+    /// The fixture is the smallest meaningful conversation: one user
+    /// prompt, one tool call, one `end_turn` — so the stream the replay
+    /// dispatcher produces is exactly `[UserPromptSubmitted,
+    /// ToolCompleted, StopRequested]`, and the user-visible
+    /// `ReplayEvent` list is exactly `[PostToolUse, Stop]`.
+    ///
+    /// Each mode asserts a different invariant of the live pipeline:
+    /// `present` — every hook passes through; `away` — the first Stop
+    /// is blocked by the rules-mode `away_message`; `llm` — the mock
+    /// provider drives `evaluate_stop_chained` and the block reason
+    /// propagates out of the HTTP-shape response via
+    /// `interpret_response`. If any of these drift, replay has stopped
+    /// sharing the live path.
+    #[tokio::test]
+    async fn replay_dispatches_through_live_path_for_all_modes() {
+        use crate::settings::{EngineMode, ModelConfig};
+        use crate::state::{CoachState, CoachUsage, MockSessionSend};
+        use std::io::Write;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let mut file = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .expect("tempfile");
+        // One user → one tool_use → one end_turn. The transcript has to
+        // be valid claude JSONL so the parser's msg_type / content /
+        // stop_reason pointers all hit. Keep it as compact as the
+        // parser allows so the intent is visible at a glance.
+        writeln!(
+            file,
+            r#"{{"type":"user","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp/x","message":{{"content":"build hello world"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2025-01-01T00:00:01Z","cwd":"/tmp/x","message":{{"stop_reason":"tool_use","content":[{{"type":"tool_use","name":"Read","input":{{"file_path":"/tmp/x/main.py"}}}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","timestamp":"2025-01-01T00:00:02Z","cwd":"/tmp/x","message":{{"stop_reason":"end_turn","content":[{{"type":"text","text":"done"}}]}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let sid = "test-fixture-1";
+
+        // ── present: nothing blocks ────────────────────────────────
+        let state: SharedState = Arc::new(RwLock::new(crate::state::test_state()));
+        let result = replay_transcript_at(file.path(), sid, "present", &state)
+            .await
+            .expect("present replay");
+        assert_eq!(result.event_count, 2, "1 PostToolUse + 1 Stop expected");
+        assert!(
+            result.events.iter().all(|e| e.action.is_none()),
+            "present mode should never intervene, got {:?}",
+            result.events
+        );
+        assert!(result.first_intervention_index.is_none());
+
+        // ── away (rules): first Stop blocked by away_message ───────
+        let result = replay_transcript_at(file.path(), sid, "away", &state)
+            .await
+            .expect("away replay");
+        assert_eq!(result.event_count, 2);
+        let stop = result
+            .events
+            .iter()
+            .find(|e| e.kind == "Stop")
+            .expect("Stop event missing");
+        assert_eq!(
+            stop.action.as_deref(),
+            Some("blocked"),
+            "away mode must block the first Stop: {:?}",
+            stop
+        );
+        assert!(stop.message.is_some());
+        assert_eq!(result.first_intervention_index, Some(1));
+
+        // ── llm (mocked observer + stop evaluator) ─────────────────
+        // Mock discriminates by the stop-prompt substring from
+        // `prompts/stop_chained.txt`. Observer calls return "Noted."
+        // (no INTERVENE prefix → no intervention); the stop evaluator
+        // returns a JSON verdict the live Stop handler parses into a
+        // `decision.block` response the replay layer then surfaces.
+        let mock: MockSessionSend = Arc::new(|_sys, msg| {
+            if msg.contains("requesting to stop") {
+                Ok((
+                    r#"{"allow": false, "message": "keep going"}"#.into(),
+                    CoachUsage::default(),
+                ))
+            } else {
+                Ok(("Noted.".into(), CoachUsage::default()))
+            }
+        });
+        let mut coach = CoachState {
+            sessions: crate::state::SessionRegistry::new(),
+            config: crate::state::test_state().config,
+            services: crate::state::test_state().services,
+        };
+        coach.config.coach_mode = EngineMode::Llm;
+        coach.config.model = ModelConfig {
+            provider: "anthropic".into(),
+            model: "mock".into(),
+        };
+        coach
+            .config
+            .api_tokens
+            .insert("anthropic".into(), "mock".into());
+        coach.services.mock_session_send = Some(mock);
+        let state_llm: SharedState = Arc::new(RwLock::new(coach));
+
+        let result = replay_transcript_at(file.path(), sid, "llm", &state_llm)
+            .await
+            .expect("llm replay");
+        assert_eq!(result.event_count, 2);
+        let stop = result
+            .events
+            .iter()
+            .find(|e| e.kind == "Stop")
+            .expect("Stop event missing");
+        assert_eq!(
+            stop.action.as_deref(),
+            Some("blocked"),
+            "llm mode should block via mocked decision: {:?}",
+            stop
+        );
+        let msg = stop.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("keep going"),
+            "mocked block reason should propagate, got: {:?}",
+            msg
+        );
     }
 
     /// Live integration test for `mode = "llm"`: pick the smallest real

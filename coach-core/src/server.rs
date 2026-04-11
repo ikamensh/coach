@@ -13,7 +13,7 @@ mod api;
 mod claude;
 mod codex;
 mod cursor;
-mod events;
+pub(crate) mod events;
 mod observer;
 mod rules;
 
