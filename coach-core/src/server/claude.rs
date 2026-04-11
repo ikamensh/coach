@@ -21,7 +21,7 @@ use serde_json::Value;
 use std::net::SocketAddr;
 
 use super::events::{dispatch, SessionEvent, SessionSource};
-use super::AppState;
+use super::HookServerState;
 
 const SOURCE: SessionSource = SessionSource::ClaudeCode;
 
@@ -52,7 +52,7 @@ fn peer_pid(addr: SocketAddr) -> u32 {
 }
 
 async fn handle_permission_request(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
@@ -71,7 +71,7 @@ async fn handle_permission_request(
 }
 
 async fn handle_session_start(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
@@ -90,7 +90,7 @@ async fn handle_session_start(
 }
 
 async fn handle_user_prompt_submit(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
@@ -109,7 +109,7 @@ async fn handle_user_prompt_submit(
 }
 
 async fn handle_stop(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
@@ -128,7 +128,7 @@ async fn handle_stop(
 }
 
 async fn handle_pre_tool_use(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
@@ -147,7 +147,7 @@ async fn handle_pre_tool_use(
 }
 
 async fn handle_post_tool_use(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
@@ -166,7 +166,7 @@ async fn handle_post_tool_use(
     .await
 }
 
-pub(crate) fn routes() -> Router<AppState> {
+pub(crate) fn routes() -> Router<HookServerState> {
     Router::new()
         .route("/hook/permission-request", post(handle_permission_request))
         .route("/hook/stop", post(handle_stop))

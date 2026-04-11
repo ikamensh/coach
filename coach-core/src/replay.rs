@@ -5,7 +5,7 @@
 //! handles live hooks**. There is no parallel intervention logic: replay
 //! parses a JSONL transcript into a sequence of `SessionEvent`s and
 //! feeds them through `server::events::dispatch` against an isolated
-//! `CoachState` clone (empty sessions, cloned config + services, no-op
+//! `AppState` clone (empty sessions, cloned config + services, no-op
 //! emitter). The live state the caller passed in is never touched.
 //!
 //! Replay modes change only two settings on the isolated state:
@@ -23,9 +23,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::server::events::{dispatch, SessionEvent, SessionSource};
-use crate::server::{fake_pid_for_sid, AppState};
+use crate::server::{fake_pid_for_sid, HookServerState};
 use crate::settings::EngineMode;
-use crate::state::{CoachMode, CoachState, RuntimeServices, SessionRegistry, SharedState};
+use crate::state::{CoachMode, AppState, RuntimeServices, SessionRegistry, SharedState};
 
 fn claude_projects_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
@@ -319,7 +319,7 @@ fn resolve_modes(replay_mode: &str) -> (EngineMode, CoachMode) {
     }
 }
 
-/// Build a fresh `CoachState` with an empty `SessionRegistry` but every
+/// Build a fresh `AppState` with an empty `SessionRegistry` but every
 /// other field cloned from the caller's live state. The replay session
 /// lives here and never leaks into the real state the caller handed us.
 async fn isolated_state_from(live: &SharedState, replay_mode: &str) -> SharedState {
@@ -341,7 +341,7 @@ async fn isolated_state_from(live: &SharedState, replay_mode: &str) -> SharedSta
     let mut sessions = SessionRegistry::new();
     sessions.default_mode = session_mode;
 
-    Arc::new(RwLock::new(CoachState {
+    Arc::new(RwLock::new(AppState {
         sessions,
         config,
         services,
@@ -515,7 +515,7 @@ fn build_dispatch_stream(
 
 /// Replay a saved session against the real hook dispatch path.
 ///
-/// Builds an isolated `CoachState` (empty sessions, config cloned from
+/// Builds an isolated `AppState` (empty sessions, config cloned from
 /// the caller's live state) and feeds it synthetic `SessionEvent`s
 /// derived from the JSONL transcript. The decision logic, observer
 /// chain, rule matcher, and cooldown behavior are all the live code —
@@ -582,8 +582,8 @@ pub async fn replay_transcript_at(
         .count();
 
     let isolated = isolated_state_from(state, mode).await;
-    let app_state = AppState {
-        coach: isolated.clone(),
+    let app_state = HookServerState {
+        app: isolated.clone(),
         emitter: Arc::new(crate::NoopEmitter),
     };
     let pid = fake_pid_for_sid(session_id);
@@ -756,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn replay_dispatches_through_live_path_for_all_modes() {
         use crate::settings::{EngineMode, ModelConfig};
-        use crate::state::{CoachState, CoachUsage, MockSessionSend};
+        use crate::state::{AppState, CoachUsage, MockSessionSend};
         use std::io::Write;
         use std::sync::Arc;
         use tokio::sync::RwLock;
@@ -836,7 +836,7 @@ mod tests {
                 Ok(("Noted.".into(), CoachUsage::default()))
             }
         });
-        let mut coach = CoachState {
+        let mut coach = AppState {
             sessions: crate::state::SessionRegistry::new(),
             config: crate::state::test_state().config,
             services: crate::state::test_state().services,

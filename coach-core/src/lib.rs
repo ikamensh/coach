@@ -16,7 +16,7 @@ pub mod settings;
 pub mod state;
 
 use settings::Settings;
-use state::{CoachState, SharedState};
+use state::{AppState, SharedState};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -80,7 +80,7 @@ pub async fn serve(port_override: Option<u16>) -> Result<(), String> {
     }
     settings.save();
 
-    let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(settings)));
+    let state: SharedState = Arc::new(RwLock::new(AppState::from_settings(settings)));
 
     spawn_pycoach_if_configured(state.clone());
 

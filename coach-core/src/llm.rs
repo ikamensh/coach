@@ -1133,7 +1133,7 @@ mod live_tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    /// Build a CoachState that uses the live `OPENAI_API_KEY`.
+    /// Build an AppState that uses the live `OPENAI_API_KEY`.
     /// Returns None when the key is missing so tests no-op cleanly.
     fn live_state() -> Option<SharedState> {
         let token = std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty())?;

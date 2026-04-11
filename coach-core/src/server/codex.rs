@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::claude::HookPayload;
 use super::events::{dispatch, SessionEvent, SessionSource};
-use super::{fake_pid_for_sid, AppState};
+use super::{fake_pid_for_sid, HookServerState};
 
 const SOURCE: SessionSource = SessionSource::Codex;
 
@@ -19,7 +19,7 @@ fn pid_and_sid(payload: &HookPayload) -> (u32, String) {
 }
 
 async fn permission_request(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&payload);
@@ -37,7 +37,7 @@ async fn permission_request(
 }
 
 async fn session_start(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&payload);
@@ -55,7 +55,7 @@ async fn session_start(
 }
 
 async fn user_prompt_submit(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&payload);
@@ -73,7 +73,7 @@ async fn user_prompt_submit(
 }
 
 async fn stop(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&payload);
@@ -91,7 +91,7 @@ async fn stop(
 }
 
 async fn pre_tool_use(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&payload);
@@ -109,7 +109,7 @@ async fn pre_tool_use(
 }
 
 async fn post_tool_use(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&payload);
@@ -127,7 +127,7 @@ async fn post_tool_use(
     .await
 }
 
-pub(crate) fn routes() -> Router<AppState> {
+pub(crate) fn routes() -> Router<HookServerState> {
     Router::new()
         .route("/codex/hook/permission-request", post(permission_request))
         .route("/codex/hook/stop", post(stop))

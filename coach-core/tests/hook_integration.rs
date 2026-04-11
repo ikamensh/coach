@@ -11,14 +11,14 @@
 /// that its session appears in Coach state. Run with:
 ///     cargo test -p coach -- --ignored
 use coach_core::settings::Settings;
-use coach_core::state::CoachState;
+use coach_core::state::AppState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Start the hook server on an OS-assigned port and return its base URL.
-async fn start_test_server() -> (String, Arc<RwLock<CoachState>>) {
-    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
+async fn start_test_server() -> (String, Arc<RwLock<AppState>>) {
+    let state = Arc::new(RwLock::new(AppState::from_settings(Settings::default())));
     let router = coach_core::server::create_router_headless(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -384,11 +384,11 @@ async fn stop_blocks_then_allows_on_cooldown() {
 /// Regression: `/clear` produces a fresh session entry under the new
 /// session_id and drops the old entry when it arrives from the same
 /// PID. The hook transport provides the PID via the kernel resolver,
-/// so we exercise the path directly on CoachState (the resolver
+/// so we exercise the path directly on AppState (the resolver
 /// returns 0 on loopback inside a single-process test).
 #[tokio::test]
 async fn clear_replaces_session_in_same_window() {
-    let mut coach = CoachState::from_settings(Settings::default());
+    let mut coach = AppState::from_settings(Settings::default());
     let pid = 4242;
     coach.sessions.apply_hook_event(pid, "before-clear", Some("/projects/coach"));
     coach.sessions.get_mut("before-clear").unwrap().record_tool("Read");
@@ -412,7 +412,7 @@ async fn clear_replaces_session_in_same_window() {
 /// it in.
 #[tokio::test]
 async fn scanner_discovers_real_sessions() {
-    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
+    let state = Arc::new(RwLock::new(AppState::from_settings(Settings::default())));
 
     coach_core::scanner::sync_sessions(&state, &coach_core::NoopEmitter).await;
 
@@ -436,7 +436,7 @@ async fn scanner_discovers_real_sessions() {
 /// under the real conversation id.
 #[tokio::test]
 async fn hook_adopts_scanner_discovered_pid() {
-    let mut coach = CoachState::from_settings(Settings::default());
+    let mut coach = AppState::from_settings(Settings::default());
     let pid = 7777;
     let scanner_started = chrono::Utc::now() - chrono::Duration::hours(1);
     coach
@@ -730,7 +730,7 @@ async fn post_tool_use_rule_response_schema() {
 // "no token for primary provider" check before making any HTTP call, so the
 // failure paths run in milliseconds.
 
-async fn put_in_llm_mode_no_key(state: &Arc<RwLock<CoachState>>) {
+async fn put_in_llm_mode_no_key(state: &Arc<RwLock<AppState>>) {
     let mut s = state.write().await;
     s.config.coach_mode = coach_core::settings::EngineMode::Llm;
     s.config.model = coach_core::settings::ModelConfig {
@@ -1225,7 +1225,7 @@ async fn user_prompt_submit_records_activity() {
 // These mirror the Tauri commands. The CLI uses them when Coach is
 // running so the GUI's in-memory state stays consistent with the file
 // on disk. Property checked: each POST changes both the snapshot the
-// next GET sees AND the underlying CoachState (so a save() call would
+// next GET sees AND the underlying AppState (so a save() call would
 // reflect the change).
 
 #[tokio::test]
@@ -1262,7 +1262,7 @@ async fn api_set_priorities_updates_state_and_snapshot() {
         .unwrap();
     assert_eq!(snap2["priorities"][0], "X");
 
-    // And the underlying CoachState (the same one a save() would persist).
+    // And the underlying AppState (the same one a save() would persist).
     let s = state.read().await;
     assert_eq!(s.config.priorities, vec!["X", "Y", "Z"]);
 }
@@ -1502,11 +1502,11 @@ async fn user_prompt_submit_truncates_long_prompts() {
 // rekey, session identity comes from the hook payload's session_id —
 // the parent and nested child carry different session_ids, so they
 // naturally get separate entries. These tests lock in that property
-// against the CoachState directly (the transport PID is metadata).
+// against the AppState directly (the transport PID is metadata).
 
 #[tokio::test]
 async fn nested_claude_sessions_do_not_collide() {
-    let mut coach = CoachState::from_settings(Settings::default());
+    let mut coach = AppState::from_settings(Settings::default());
     let parent_pid = 1000;
     let nested_pid = 2000;
 

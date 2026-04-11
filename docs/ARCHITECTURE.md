@@ -12,7 +12,7 @@ The boundary between `coach-core` and the GUI is the `EventEmitter` trait in `co
 
 ## Key invariants
 
-- **`state::mutate` is the only write path to `CoachState`.** It takes the write lock, runs the closure, snapshots, releases the lock, and emits the snapshot. Because there is one write primitive, the frontend can never miss an update.
+- **`state::mutate` is the only write path to `AppState`.** It takes the write lock, runs the closure, snapshots, releases the lock, and emits the snapshot. Because there is one write primitive, the frontend can never miss an update.
 - **Sessions are keyed by `session_id`**, the stable identifier that Claude/Codex/Cursor include in every hook payload. PID is metadata on `SessionState`, used only by the scanner for liveness and by the UI for display.
 - **Every control-plane operation exists as exactly one function in `services.rs`.** Tauri commands and HTTP `/api/config/*` handlers both call into it. No operation has two implementations.
 - **The observer consumer task's lifetime equals its session's lifetime.** It's spawned with the session's first tool observation and aborted by `impl Drop for SessionState` when the session is evicted.
@@ -68,7 +68,7 @@ External CLIs                                       Frontend / HTTP config      
                                                │
                                                ▼
                   ┌─────────────────────────────────────────────────────┐
-                  │ state::mutate(state, emitter, |s: &mut CoachState|) │
+                  │ state::mutate(state, emitter, |s: &mut AppState|)   │
                   │                                                     │
                   │   acquire write lock                                │
                   │   run closure                                       │
@@ -81,7 +81,7 @@ External CLIs                                       Frontend / HTTP config      
                                           │
                                           ▼
          ┌──────────────────────────────────────────────────────────────┐
-         │ CoachState  (behind Arc<RwLock<_>>)                           │
+         │ AppState  (behind Arc<RwLock<_>>)                             │
          │                                                                │
          │ ├─ sessions:  SessionRegistry                                  │
          │ │    inner: HashMap<SessionId, SessionState>                   │
@@ -194,10 +194,10 @@ Persistence layers:
 
 | Module | What lives here |
 |---|---|
-| `coach-core/src/state/mod.rs` | `CoachState`, `SessionRegistry`, `RuntimeServices`, `SessionState`, `SessionCoachState`, `CoachMemory`, `state::mutate()` |
+| `coach-core/src/state/mod.rs` | `AppState`, `SessionRegistry`, `RuntimeServices`, `SessionState`, `SessionCoachState`, `CoachMemory`, `state::mutate()` |
 | `coach-core/src/settings/mod.rs` | `Settings` (= `AppConfig` alias), `update_*` methods, disk persistence |
 | `coach-core/src/services.rs` | 12 control-plane mutation functions |
-| `coach-core/src/server.rs` | Axum router wiring, `AppState`, server entry point |
+| `coach-core/src/server.rs` | Axum router wiring, `HookServerState`, server entry point |
 | `coach-core/src/server/claude.rs` · `codex.rs` · `cursor.rs` | Transport adapters (raw payload → `SessionEvent`) |
 | `coach-core/src/server/events.rs` | `SessionEvent`, `SessionSource`, `dispatch()`, the `on_*` handlers |
 | `coach-core/src/server/api.rs` | HTTP adapters for `/api/config/*` and `/api/sessions/{id}/mode` |

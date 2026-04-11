@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::AppState;
+use super::HookServerState;
 use crate::services::{self, ServiceError};
 use crate::settings::{CoachRule, EngineMode, ModelConfig};
 use crate::state::CoachMode;
@@ -48,16 +48,16 @@ pub(crate) struct RulesPayload {
 /// After a service mutation, take a quick read lock and return the
 /// snapshot. The mutation already emitted; the snapshot we send back is
 /// what the CLI consumes.
-async fn snapshot(state: &AppState) -> crate::state::CoachSnapshot {
-    state.coach.read().await.snapshot()
+async fn snapshot(state: &HookServerState) -> crate::state::CoachSnapshot {
+    state.app.read().await.snapshot()
 }
 
 pub(crate) async fn set_session_mode(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Path(session_id): Path<String>,
     Json(payload): Json<ModePayload>,
 ) -> Result<Json<crate::state::CoachSnapshot>, (StatusCode, String)> {
-    match services::set_session_mode(&state.coach, &state.emitter, session_id, payload.mode).await
+    match services::set_session_mode(&state.app, &state.emitter, session_id, payload.mode).await
     {
         Ok(()) => Ok(Json(snapshot(&state).await)),
         Err(ServiceError::SessionNotFound { .. }) => {
@@ -67,49 +67,49 @@ pub(crate) async fn set_session_mode(
 }
 
 pub(crate) async fn set_all_modes(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<ModePayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    services::set_all_modes(&state.coach, &state.emitter, payload.mode).await;
+    services::set_all_modes(&state.app, &state.emitter, payload.mode).await;
     Json(snapshot(&state).await)
 }
 
 pub(crate) async fn set_priorities(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<PrioritiesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    services::set_priorities(&state.coach, &state.emitter, payload.priorities).await;
+    services::set_priorities(&state.app, &state.emitter, payload.priorities).await;
     Json(snapshot(&state).await)
 }
 
 pub(crate) async fn set_model(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<ModelConfig>,
 ) -> Json<crate::state::CoachSnapshot> {
-    services::set_model(&state.coach, &state.emitter, payload).await;
+    services::set_model(&state.app, &state.emitter, payload).await;
     Json(snapshot(&state).await)
 }
 
 pub(crate) async fn set_api_token(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<ApiTokenPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    services::set_api_token(&state.coach, &state.emitter, payload.provider, payload.token).await;
+    services::set_api_token(&state.app, &state.emitter, payload.provider, payload.token).await;
     Json(snapshot(&state).await)
 }
 
 pub(crate) async fn set_coach_mode(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<CoachModePayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    services::set_coach_mode(&state.coach, &state.emitter, payload.coach_mode).await;
+    services::set_coach_mode(&state.app, &state.emitter, payload.coach_mode).await;
     Json(snapshot(&state).await)
 }
 
 pub(crate) async fn set_rules(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(payload): Json<RulesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
-    services::set_rules(&state.coach, &state.emitter, payload.rules).await;
+    services::set_rules(&state.app, &state.emitter, payload.rules).await;
     Json(snapshot(&state).await)
 }

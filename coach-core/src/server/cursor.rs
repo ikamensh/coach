@@ -11,7 +11,7 @@ use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 
 use super::events::{dispatch, SessionEvent, SessionSource};
-use super::{fake_pid_for_sid, AppState};
+use super::{fake_pid_for_sid, HookServerState};
 
 const SOURCE: SessionSource = SessionSource::Cursor;
 
@@ -61,7 +61,7 @@ fn pid_and_sid(v: &Value) -> (u32, String) {
 }
 
 async fn session_start(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -85,7 +85,7 @@ async fn session_start(
 }
 
 async fn before_submit_prompt(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -112,7 +112,7 @@ async fn before_submit_prompt(
 /// command. Maps to the domain `PermissionRequested` event (same away-
 /// mode auto-approve semantics as Claude's permission-request hook).
 async fn before_shell(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -132,7 +132,7 @@ async fn before_shell(
 /// `beforeMCPExecution` — same story as `beforeShellExecution`, but for
 /// an MCP tool call.
 async fn before_mcp(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -150,7 +150,7 @@ async fn before_mcp(
 }
 
 async fn after_shell(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -174,7 +174,7 @@ async fn after_shell(
 }
 
 async fn after_mcp(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -197,7 +197,7 @@ async fn after_mcp(
 /// `ToolCompleted { tool_name: "Edit" }` so the rules engine and observer
 /// see the same event they'd see from Claude Code's PostToolUse(Edit) hook.
 async fn after_file_edit(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -222,7 +222,7 @@ async fn after_file_edit(
 }
 
 async fn stop(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
     Json(v): Json<Value>,
 ) -> Json<Value> {
     let (pid, sid) = pid_and_sid(&v);
@@ -245,7 +245,7 @@ async fn stop(
     .await
 }
 
-pub(crate) fn routes() -> Router<AppState> {
+pub(crate) fn routes() -> Router<HookServerState> {
     Router::new()
         .route("/cursor/hook/session-start", post(session_start))
         .route(

@@ -356,7 +356,7 @@ pub async fn sync_sessions_with(
 
 /// Bootstrap a Claude Code session from its JSONL conversation log.
 fn bootstrap_claude_session(
-    coach: &mut crate::state::CoachState,
+    coach: &mut crate::state::AppState,
     session: &ClaudeSessionFile,
     projects_dir: &Path,
     changed: &mut bool,
@@ -915,7 +915,7 @@ mod tests {
         ]);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 
@@ -956,7 +956,7 @@ mod tests {
         ]);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 
@@ -1009,7 +1009,7 @@ mod tests {
         ]);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 
@@ -1065,7 +1065,7 @@ mod tests {
         ]);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 
@@ -1128,7 +1128,7 @@ mod tests {
         ]);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
         let live = scan_live_sessions_in(sessions_dir.path());
@@ -1192,7 +1192,7 @@ mod tests {
         ]);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 
@@ -1272,7 +1272,7 @@ mod tests {
         }];
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 
@@ -1307,7 +1307,7 @@ mod tests {
         let pid = fake_pid_for_sid(thread_id);
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 
@@ -1354,7 +1354,7 @@ mod tests {
         let projects_dir = TempDir::new().unwrap();
 
         let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::state::CoachState::from_settings(crate::settings::Settings::default()),
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
         ));
         let emitter = crate::NoopEmitter;
 

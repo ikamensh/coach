@@ -96,7 +96,7 @@ not on the next tool call.
 
 ### Identity: PID is the canonical key
 
-`CoachState.sessions` is `HashMap<u32, SessionState>` keyed by PID. One
+`AppState.sessions` is `HashMap<u32, SessionState>` keyed by PID. One
 window, one entry, end of story. The map mirrors the user's mental model.
 
 `SessionState` carries a `current_session_id: String` field that is updated
@@ -148,7 +148,7 @@ pid_resolver::resolve(peer_port)  ──►  PID  (~1.5ms netstat2 call)
         ▼  cache (session_id → pid)
         │
         ▼
-CoachState.hook_event_for_pid(pid, session_id, …)
+AppState.hook_event_for_pid(pid, session_id, …)
         │
         ├── pid not in sessions yet → create entry
         ├── current_session_id matches → bump counters

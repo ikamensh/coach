@@ -81,9 +81,9 @@ Why:
 
 Concrete near-term step: the three hook routers (`server.rs`, `codex.rs`, `cursor.rs`) currently re-implement the same set of endpoints with per-source payload parsing. Once domain events exist, they collapse into one router parameterized by source, and the only per-source code is "raw payload → domain event".
 
-### 5. Split `CoachState` into smaller roots
+### 5. Split `AppState` into smaller roots
 
-The current `CoachState` mixes:
+The current `AppState` mixes:
 
 - live sessions
 - app config
@@ -130,7 +130,7 @@ Extract them into a dedicated area, likely alongside coach logic, so the HTTP la
 
 ### 8. Key sessions by `session_id`, not PID
 
-Today `CoachState.sessions` is `HashMap<u32, SessionState>` keyed by PID. The hook payload carries a stable `session_id` from Claude/Cursor; we then resolve it to a PID via lsof, parent-walk, and a cache (`server.rs:109-170`). The PID resolver is the most fragile code in the repo, and PIDs are the wrong abstraction in the first place — they get reused, and "a coding session" is what the user actually means.
+Today `AppState.sessions` is `HashMap<u32, SessionState>` keyed by PID. The hook payload carries a stable `session_id` from Claude/Cursor; we then resolve it to a PID via lsof, parent-walk, and a cache (`server.rs:109-170`). The PID resolver is the most fragile code in the repo, and PIDs are the wrong abstraction in the first place — they get reused, and "a coding session" is what the user actually means.
 
 Switch to `HashMap<SessionId, SessionState>` and store the PID inside the value as best-effort metadata. Lookups become O(1) on a stable identifier instead of a parent walk; nested-Claude and PID-reuse cases stop being routing problems.
 
@@ -195,7 +195,7 @@ This should be a later step, not the next step.
 7. Introduce `state.mutate(|s| { ... })` helper (mutate-and-notify; small first step from section 6)
 8. Introduce domain `SessionEvent` (and collapse the three hook routers onto it — section 4)
 9. Rekey sessions by `session_id` (section 8)
-10. Split `CoachState` into smaller roots
+10. Split `AppState` into smaller roots
 11. Extract shared application services on top of the mutate helper
 12. Only then consider crate/package splitting
 
@@ -212,7 +212,7 @@ Commits that executed the plan:
 - `c4d9286` — section 10: `#[cfg(debug_assertions)]` prompt loading, `COACH_PROMPTS_DIR` removed
 - `3c9425f` — section 4 / item 8: `SessionEvent` + collapse of the three hook routers
 - `341d19b` — section 8 / item 9: rekey sessions by `session_id`, PID demoted to metadata
-- `4793e85` — section 5 / item 10: split `CoachState` into `sessions` / `config` / `services` roots
+- `4793e85` — section 5 / item 10: split `AppState` into `sessions` / `config` / `services` roots
 - `9dbb736` — section 6 / item 11: shared application service layer
 
 Items 1–6 (the `LlmCoach` boundary and routing stop / observer / naming / replay through it, plus `CoachMemory` extraction) were completed before this plan-execution pass.

@@ -12,7 +12,7 @@
 ///     cargo test -p coach --test scenario_replay -- --ignored --nocapture
 
 use coach_core::settings::{EngineMode, ModelConfig, Settings};
-use coach_core::state::{CoachMode, CoachState, CoachUsage, MockSessionSend};
+use coach_core::state::{CoachMode, AppState, CoachUsage, MockSessionSend};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,13 +22,13 @@ use tokio::sync::RwLock;
 
 struct Harness {
     base: String,
-    state: Arc<RwLock<CoachState>>,
+    state: Arc<RwLock<AppState>>,
     client: reqwest::Client,
 }
 
 impl Harness {
     async fn real_llm(priorities: Vec<&str>) -> Self {
-        let mut coach = CoachState::from_settings(Settings::default());
+        let mut coach = AppState::from_settings(Settings::default());
         coach.config.coach_mode = EngineMode::Llm;
         coach.config.priorities = priorities.into_iter().map(String::from).collect();
 
@@ -49,7 +49,7 @@ impl Harness {
     }
 
     async fn mock(mock: MockSessionSend) -> Self {
-        let mut coach = CoachState::from_settings(Settings::default());
+        let mut coach = AppState::from_settings(Settings::default());
         coach.config.coach_mode = EngineMode::Llm;
         coach.config.model = ModelConfig { provider: "anthropic".into(), model: "mock".into() };
         coach.config.api_tokens.insert("anthropic".into(), "mock".into());
@@ -57,7 +57,7 @@ impl Harness {
         Self::boot(Arc::new(RwLock::new(coach))).await
     }
 
-    async fn boot(state: Arc<RwLock<CoachState>>) -> Self {
+    async fn boot(state: Arc<RwLock<AppState>>) -> Self {
         let router = coach_core::server::create_router_headless(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

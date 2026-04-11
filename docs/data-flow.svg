@@ -58,15 +58,15 @@
   <!-- Row 4: state::mutate (CENTRAL, full width) -->
   <g>
     <rect x="40" y="450" width="1320" height="90" rx="8" fill="#c8e6c9" stroke="#2e7d32" stroke-width="2.5"/>
-    <text x="700" y="485" font-size="18" font-weight="700" text-anchor="middle" fill="#1b5e20">state::mutate(state, emitter, |s: &amp;mut CoachState| { ... })</text>
+    <text x="700" y="485" font-size="18" font-weight="700" text-anchor="middle" fill="#1b5e20">state::mutate(state, emitter, |s: &amp;mut AppState| { ... })</text>
     <text x="700" y="507" font-size="12" text-anchor="middle" fill="#2e7d32">acquire write lock  →  run closure  →  snapshot  →  release  →  emit</text>
     <text x="700" y="526" font-size="11" text-anchor="middle" fill="#33691e" font-style="italic">the one write path for shared state</text>
   </g>
 
-  <!-- Row 5: CoachState (narrower — leave left column and right column clear for arrows) -->
+  <!-- Row 5: AppState (narrower — leave left column and right column clear for arrows) -->
   <g>
     <rect x="370" y="580" width="700" height="170" rx="6" fill="#fff3cd" stroke="#f57f17" stroke-width="1.5"/>
-    <text x="720" y="605" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">CoachState  ·  Arc&lt;RwLock&lt;_&gt;&gt;</text>
+    <text x="720" y="605" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">AppState  ·  Arc&lt;RwLock&lt;_&gt;&gt;</text>
 
     <rect x="386" y="620" width="220" height="120" rx="4" fill="#ffffff" stroke="#f57f17" stroke-dasharray="3 2"/>
     <text x="496" y="638" font-size="11" font-weight="600" text-anchor="middle" fill="#37474f">sessions: SessionRegistry</text>
@@ -166,18 +166,18 @@
   <line x1="1200" y1="280" x2="1200" y2="448" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
   <text x="1210" y="370" font-size="11" fill="#455a64">closure</text>
 
-  <!-- 6. state::mutate → CoachState (short, dim, visual hint only) -->
+  <!-- 6. state::mutate → AppState (short, dim, visual hint only) -->
   <line x1="720" y1="540" x2="720" y2="578" stroke="#90a4ae" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
   <text x="730" y="565" font-size="10" fill="#78909c" font-style="italic">writes</text>
 
-  <!-- 7. state::mutate → observer channel (routed in the LEFT column, clear of CoachState which starts at x=370) -->
+  <!-- 7. state::mutate → observer channel (routed in the LEFT column, clear of AppState which starts at x=370) -->
   <line x1="180" y1="540" x2="180" y2="788" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
   <text x="192" y="615" font-size="11" fill="#455a64">try_send</text>
   <text x="192" y="630" font-size="10" fill="#455a64">ObserverQueueItem</text>
   <text x="192" y="647" font-size="9" fill="#78909c" font-style="italic">(inside on_tool_completed</text>
   <text x="192" y="660" font-size="9" fill="#78909c" font-style="italic">closure)</text>
 
-  <!-- 8. state::mutate → EventEmitter (RIGHT column, clear of CoachState which ends at x=1070) -->
+  <!-- 8. state::mutate → EventEmitter (RIGHT column, clear of AppState which ends at x=1070) -->
   <line x1="1220" y1="540" x2="1220" y2="788" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
   <text x="1232" y="615" font-size="11" fill="#455a64">CoachSnapshot</text>
   <text x="1232" y="632" font-size="9" fill="#78909c" font-style="italic">emit_state_update</text>
@@ -195,7 +195,7 @@
   <line x1="195" y1="1108" x2="195" y2="1080" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
   <text x="212" y="1098" font-size="10" fill="#455a64">HTTPS / assessment</text>
 
-  <!-- 12. observer consumer → state::mutate (feedback loop — ROUTED through gap at x=340-370 between observer column and CoachState) -->
+  <!-- 12. observer consumer → state::mutate (feedback loop — ROUTED through gap at x=340-370 between observer column and AppState) -->
   <polyline points="320,940 345,940 345,540" fill="none" stroke="#c62828" stroke-width="1.8" marker-end="url(#arrowfb)"/>
   <text x="355" y="720" font-size="11" fill="#c62828" font-weight="600">writes back via mutate</text>
   <text x="355" y="735" font-size="10" fill="#c62828">assessment +</text>

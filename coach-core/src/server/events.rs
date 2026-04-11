@@ -13,10 +13,10 @@ use std::time::Duration;
 use axum::Json;
 use serde_json::{json, Value};
 
-use super::{observer, rules, AppState};
+use super::{observer, rules, HookServerState};
 use crate::coach::{ChainedStopInput, LlmCoach, NameSessionInput, StopContext};
 use crate::settings::EngineMode;
-use crate::state::{CoachMode, CoachState, SessionClient, SessionState};
+use crate::state::{CoachMode, AppState, SessionClient, SessionState};
 
 /// Which coding-agent CLI / IDE produced a hook. Domain handlers use
 /// this to tag sessions so the frontend renders the right icon.
@@ -89,7 +89,7 @@ pub(crate) enum SessionEvent {
 /// passthrough, `{hookSpecificOutput: ...}` for permission / post-tool-use
 /// responses, `{decision: "block", reason: ...}` for blocked stops.
 pub(crate) async fn dispatch(
-    state: &AppState,
+    state: &HookServerState,
     pid: u32,
     source: SessionSource,
     event: SessionEvent,
@@ -148,7 +148,7 @@ fn should_request_title(event_count: usize) -> bool {
 /// client. Runs inside an existing `state::mutate` closure so the
 /// snapshot goes out once with the right icon — no flicker.
 fn adopt<'a>(
-    coach: &'a mut CoachState,
+    coach: &'a mut AppState,
     pid: u32,
     sid: &str,
     cwd: Option<&str>,
@@ -163,14 +163,14 @@ fn adopt<'a>(
 /// of evicting the previous conversation's entry if `/clear` happened
 /// in the same window.
 async fn on_session_started(
-    state: &AppState,
+    state: &HookServerState,
     pid: u32,
     source: SessionSource,
     session_id: String,
     cwd: Option<String>,
     source_label: String,
 ) -> Json<Value> {
-    crate::state::mutate(&state.coach, &state.emitter, |coach| {
+    crate::state::mutate(&state.app, &state.emitter, |coach| {
         adopt(coach, pid, &session_id, cwd.as_deref(), source);
         coach
             .sessions
@@ -184,7 +184,7 @@ async fn on_session_started(
 /// entry. Truncated for the activity chip tooltip; full text stays in
 /// coach memory so the observer sees the whole turn.
 async fn on_user_prompt_submitted(
-    state: &AppState,
+    state: &HookServerState,
     pid: u32,
     source: SessionSource,
     session_id: String,
@@ -200,7 +200,7 @@ async fn on_user_prompt_submitted(
             p.clone()
         }
     });
-    crate::state::mutate(&state.coach, &state.emitter, |coach| {
+    crate::state::mutate(&state.app, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.coach.memory.last_user_prompt = prompt;
         coach
@@ -215,14 +215,14 @@ async fn on_user_prompt_submitted(
 /// user can walk away; in Present mode we pass through and let the
 /// agent's normal UI prompt.
 async fn on_permission_requested(
-    state: &AppState,
+    state: &HookServerState,
     pid: u32,
     source: SessionSource,
     session_id: String,
     cwd: Option<String>,
     tool_name: String,
 ) -> Json<Value> {
-    let mode = crate::state::mutate(&state.coach, &state.emitter, |coach| {
+    let mode = crate::state::mutate(&state.app, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         let mode = sess.mode;
         let action = if mode == CoachMode::Away {
@@ -250,7 +250,7 @@ async fn on_permission_requested(
 /// we track how many Agent calls are in flight so the snapshot can show
 /// "is the sub-agent still running?".
 async fn on_tool_starting(
-    state: &AppState,
+    state: &HookServerState,
     pid: u32,
     source: SessionSource,
     session_id: String,
@@ -260,7 +260,7 @@ async fn on_tool_starting(
     if tool_name != "Agent" {
         return passthrough();
     }
-    crate::state::mutate(&state.coach, &state.emitter, |coach| {
+    crate::state::mutate(&state.app, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.record_agent_start();
         coach
@@ -275,7 +275,7 @@ async fn on_tool_starting(
 /// fire the observer queue if LLM mode is active, schedule session
 /// naming at the right cadence. The busiest hook by far.
 async fn on_tool_completed(
-    state: &AppState,
+    state: &HookServerState,
     pid: u32,
     source: SessionSource,
     session_id: String,
@@ -284,7 +284,7 @@ async fn on_tool_completed(
     tool_input: Value,
 ) -> Json<Value> {
     let (rule_message, intervention_to_deliver, namer_input) =
-        crate::state::mutate(&state.coach, &state.emitter, |coach| {
+        crate::state::mutate(&state.app, &state.emitter, |coach| {
             let event_count = {
                 let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
                 sess.record_tool(&tool_name);
@@ -357,7 +357,7 @@ async fn on_tool_completed(
                         crate::state::OBSERVER_QUEUE_CAPACITY,
                     );
                     sess.coach.observer_tx = Some(tx);
-                    let coach_state = state.coach.clone();
+                    let coach_state = state.app.clone();
                     let emitter = state.emitter.clone();
                     let sid_for_task = session_id.clone();
                     sess.coach.observer_task = Some(tokio::spawn(async move {
@@ -402,7 +402,7 @@ async fn on_tool_completed(
         .await;
 
     if let Some(input) = namer_input {
-        let coach_state = state.coach.clone();
+        let coach_state = state.app.clone();
         let emitter = state.emitter.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
@@ -434,7 +434,7 @@ const STOP_COOLDOWN: Duration = Duration::from_secs(15);
 /// Note: Stop uses top-level `decision`/`reason` fields, NOT
 /// `hookSpecificOutput` — Claude Code rejects the latter on stop hooks.
 async fn on_stop_requested(
-    state: &AppState,
+    state: &HookServerState,
     pid: u32,
     source: SessionSource,
     session_id: String,
@@ -450,7 +450,7 @@ async fn on_stop_requested(
             ctx: StopContext,
         },
     }
-    let phase1 = crate::state::mutate(&state.coach, &state.emitter, |coach| {
+    let phase1 = crate::state::mutate(&state.app, &state.emitter, |coach| {
         let priorities = coach.config.priorities.clone();
         let provider_capable = crate::settings::OBSERVER_CAPABLE_PROVIDERS
             .contains(&coach.config.model.provider.as_str());
@@ -495,7 +495,7 @@ async fn on_stop_requested(
     };
 
     if coach_mode == EngineMode::Llm {
-        let llm_coach = LlmCoach::new(state.coach.clone());
+        let llm_coach = LlmCoach::new(state.app.clone());
         let started = std::time::Instant::now();
         let chained = if provider_capable {
             match llm_coach
@@ -522,7 +522,7 @@ async fn on_stop_requested(
         match result {
             Ok((decision, new_chain, usage)) if decision.allow => {
                 let latency_ms = started.elapsed().as_millis() as u64;
-                crate::state::mutate(&state.coach, &state.emitter, |coach| {
+                crate::state::mutate(&state.app, &state.emitter, |coach| {
                     if let Some(s) = coach.sessions.get_mut(&session_id) {
                         let u = usage.unwrap_or_default();
                         s.coach.record_success(latency_ms, u, new_chain);
@@ -536,7 +536,7 @@ async fn on_stop_requested(
             }
             Ok((decision, new_chain, usage)) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
-                let message = crate::state::mutate(&state.coach, &state.emitter, |coach| {
+                let message = crate::state::mutate(&state.app, &state.emitter, |coach| {
                     let message = decision
                         .message
                         .filter(|m| !m.trim().is_empty())
@@ -565,7 +565,7 @@ async fn on_stop_requested(
             }
             Err(e) => {
                 eprintln!("[coach] LLM evaluate_stop failed, falling back: {e}");
-                crate::state::mutate(&state.coach, &state.emitter, |coach| {
+                crate::state::mutate(&state.app, &state.emitter, |coach| {
                     if let Some(s) = coach.sessions.get_mut(&session_id) {
                         s.coach.record_error(&e);
                     }
@@ -579,7 +579,7 @@ async fn on_stop_requested(
         Cooldown,
         Blocked(String),
     }
-    let phase3 = crate::state::mutate(&state.coach, &state.emitter, |coach| {
+    let phase3 = crate::state::mutate(&state.app, &state.emitter, |coach| {
         let on_cooldown = coach
             .sessions
             .get(&session_id)

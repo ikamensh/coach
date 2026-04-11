@@ -6,7 +6,7 @@ mod tray;
 pub use coach_core::*;
 
 use coach_core::settings::Settings;
-use coach_core::state::{CoachSnapshot, CoachState, SharedState, Theme};
+use coach_core::state::{CoachSnapshot, AppState, SharedState, Theme};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -82,7 +82,7 @@ pub fn run() {
             }
             settings.save();
 
-            let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(settings)));
+            let state: SharedState = Arc::new(RwLock::new(AppState::from_settings(settings)));
 
             app.manage(state.clone());
 

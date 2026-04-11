@@ -183,7 +183,7 @@ pub fn away_message(priorities: &[String]) -> String {
 
 // ── snapshot() implementation ───────────────────────────────────────────
 
-impl super::CoachState {
+impl super::AppState {
     /// Snapshot for the frontend.
     pub fn snapshot(&self) -> CoachSnapshot {
         let now = Utc::now();

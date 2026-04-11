@@ -24,7 +24,7 @@ use snapshot::{activity_bucket, SESSION_ACTIVE_WINDOW_SECS};
 /// Stable conversation identifier emitted by the coding agent (Claude
 /// Code, Cursor, Codex). A session lives for the duration of one
 /// conversation — `/clear` mints a new one. This is the key the
-/// `CoachState.sessions` map is indexed by; the OS PID is metadata.
+/// `AppState.sessions` map is indexed by; the OS PID is metadata.
 pub type SessionId = String;
 
 /// Key scanner-discovered placeholders under a sentinel prefix + pid
@@ -274,7 +274,7 @@ pub enum SessionClient {
     Codex,
 }
 
-/// Per-conversation state. The owning `CoachState.sessions` map is
+/// Per-conversation state. The owning `AppState.sessions` map is
 /// keyed by `session_id`; `pid` is metadata used for display and
 /// scanner liveness checks. `/clear` mints a new `session_id`, so a
 /// window that has been cleared shows up as a fresh `SessionState`.
@@ -453,19 +453,19 @@ pub struct RuntimeServices {
     pub llm_logger: Option<Arc<LlmLogger>>,
     /// Optional Python sidecar (`pycoach serve`). `None` until/unless the
     /// user opts in via `COACH_PYCOACH_BIN` / `COACH_PYCOACH_CMD`. The Arc
-    /// owns a child process with `kill_on_drop`, so dropping `CoachState`
+    /// owns a child process with `kill_on_drop`, so dropping `AppState`
     /// at app exit also stops the sidecar.
     #[cfg(feature = "pycoach")]
     pub pycoach: Option<Arc<Pycoach>>,
 }
 
-pub struct CoachState {
+pub struct AppState {
     pub sessions: SessionRegistry,
     pub config: AppConfig,
     pub services: RuntimeServices,
 }
 
-impl CoachState {
+impl AppState {
     /// Resolve the effective token for a provider: user override wins, then env.
     pub fn effective_token(&self, provider: &str) -> Option<&str> {
         self.config
@@ -502,7 +502,7 @@ fn adopt_cwd_if_unset(sess: &mut SessionState, cwd: Option<&str>) {
     }
 }
 
-impl CoachState {
+impl AppState {
     pub fn from_settings(settings: Settings) -> Self {
         Self {
             sessions: SessionRegistry::new(),
@@ -750,7 +750,7 @@ impl SessionRegistry {
     }
 }
 
-pub type SharedState = Arc<RwLock<CoachState>>;
+pub type SharedState = Arc<RwLock<AppState>>;
 
 pub async fn mutate<F, R>(
     state: &SharedState,
@@ -758,7 +758,7 @@ pub async fn mutate<F, R>(
     f: F,
 ) -> R
 where
-    F: FnOnce(&mut CoachState) -> R,
+    F: FnOnce(&mut AppState) -> R,
 {
     let mut s = state.write().await;
     let out = f(&mut *s);
@@ -768,12 +768,12 @@ where
     out
 }
 
-/// Build a `CoachState` with empty env_tokens so tests don't depend on
+/// Build an `AppState` with empty env_tokens so tests don't depend on
 /// the machine's actual environment variables. Lives at module scope so
 /// other modules' test trees (e.g. `replay::tests`) can share it.
 #[cfg(test)]
-pub(crate) fn test_state() -> CoachState {
-    CoachState {
+pub(crate) fn test_state() -> AppState {
+    AppState {
         sessions: SessionRegistry::new(),
         config: AppConfig {
             api_tokens: HashMap::new(),
@@ -1248,9 +1248,9 @@ mod tests {
         };
 
         // `AppConfig` is an alias for `Settings`, so the round-trip is
-        // just "copy it into CoachState and read it back" — no manual
+        // just "copy it into AppState and read it back" — no manual
         // field copying, no risk of forgetting a new field.
-        let restored = CoachState::from_settings(original.clone()).config;
+        let restored = AppState::from_settings(original.clone()).config;
 
         assert_eq!(restored.api_tokens, original.api_tokens);
         assert_eq!(restored.model.provider, original.model.provider);

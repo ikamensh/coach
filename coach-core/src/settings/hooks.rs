@@ -860,7 +860,7 @@ pub fn sync_managed_cursor_hooks_at(
 
 /// Best-effort hook cleanup on Coach shutdown. Reads `~/.coach/settings.json`
 /// from disk so the call site can be a sync shutdown callback that has no
-/// access to (or shouldn't be locking) the in-memory `CoachState`.
+/// access to (or shouldn't be locking) the in-memory `AppState`.
 ///
 /// No-op if `auto_uninstall_hooks_on_exit` is false. Removes Claude and/or
 /// Cursor managed hooks based on the persistent intent flags. Errors are

@@ -18,24 +18,24 @@ mod observer;
 mod rules;
 
 #[derive(Clone)]
-pub(crate) struct AppState {
-    pub(crate) coach: SharedState,
+pub(crate) struct HookServerState {
+    pub(crate) app: SharedState,
     pub(crate) emitter: Arc<dyn EventEmitter>,
 }
 
 async fn handle_get_state(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<HookServerState>,
 ) -> Json<crate::state::CoachSnapshot> {
-    let coach = state.coach.read().await;
-    Json(coach.snapshot())
+    let app = state.app.read().await;
+    Json(app.snapshot())
 }
 
 async fn handle_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-fn build_router(coach: SharedState, emitter: Arc<dyn EventEmitter>) -> Router {
-    let state = AppState { coach, emitter };
+fn build_router(app: SharedState, emitter: Arc<dyn EventEmitter>) -> Router {
+    let state = HookServerState { app, emitter };
     Router::new()
         .merge(claude::routes())
         .merge(codex::routes())

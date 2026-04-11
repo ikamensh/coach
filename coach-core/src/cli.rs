@@ -581,15 +581,15 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
 
     // Replay is async because `--mode llm` calls into the LLM coach.
     // Spin up a one-shot multi-thread runtime + an in-process
-    // CoachState seeded from the user's settings — no daemon involved.
-    use crate::state::{CoachState, SharedState};
+    // AppState seeded from the user's settings — no daemon involved.
+    use crate::state::{AppState, SharedState};
     use std::sync::Arc;
     use tokio::sync::RwLock;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
-    let state: SharedState = Arc::new(RwLock::new(CoachState::from_settings(Settings::load())));
+    let state: SharedState = Arc::new(RwLock::new(AppState::from_settings(Settings::load())));
     let result = runtime.block_on(replay::replay_session(session_id, &mode, &state))?;
 
     if json_out {
