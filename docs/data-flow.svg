@@ -65,7 +65,7 @@
 
   <!-- Row 5: AppState (narrower — leave left column and right column clear for arrows) -->
   <g>
-    <rect x="370" y="580" width="700" height="170" rx="6" fill="#fff3cd" stroke="#f57f17" stroke-width="1.5"/>
+    <rect x="370" y="580" width="700" height="195" rx="6" fill="#fff3cd" stroke="#f57f17" stroke-width="1.5"/>
     <text x="720" y="605" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">AppState  ·  Arc&lt;RwLock&lt;_&gt;&gt;</text>
 
     <rect x="386" y="620" width="220" height="120" rx="4" fill="#ffffff" stroke="#f57f17" stroke-dasharray="3 2"/>
@@ -89,6 +89,11 @@
     <text x="950" y="672" font-size="9" text-anchor="middle" fill="#616161">mock_session_send</text>
     <text x="950" y="688" font-size="9" text-anchor="middle" fill="#616161">llm_logger</text>
     <text x="950" y="702" font-size="9" text-anchor="middle" fill="#616161">pycoach? (feature-gated)</text>
+
+    <!-- Writer annotations: who writes to which slice -->
+    <text x="496" y="762" font-size="9" font-style="italic" text-anchor="middle" fill="#c62828">← hook events · observer fb · scanner · services(mode)</text>
+    <text x="723" y="762" font-size="9" font-style="italic" text-anchor="middle" fill="#c62828">← services.rs (control plane)</text>
+    <text x="950" y="762" font-size="9" font-style="italic" text-anchor="middle" fill="#c62828">← set once at startup</text>
   </g>
 
   <!-- Row 6: observer queue (left) + EventEmitter (right) -->
