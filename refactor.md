@@ -201,15 +201,18 @@ This should be a later step, not the next step.
 
 Independent and ready to grab any time: prompt loading precedence cleanup (section 10).
 
-## Current Step
+## Status
 
-Right now the next best step is:
+Items 1–11 and the standalone prompt-loading cleanup all landed. Only item 12 (crate/package splitting) is still parked — revisit when the seams inside `coach-core` feel natural to split.
 
-- move the live stop path in `coach-core/src/server.rs` onto `LlmCoach`
+Commits that executed the plan:
 
-Why this next:
+- `c7dedc5` — section 6 small step: `state::mutate()` helper
+- `e1f9f75` — section 9: bounded observer queue + session-scoped consumer lifetime
+- `c4d9286` — section 10: `#[cfg(debug_assertions)]` prompt loading, `COACH_PROMPTS_DIR` removed
+- `3c9425f` — section 4 / item 8: `SessionEvent` + collapse of the three hook routers
+- `341d19b` — section 8 / item 9: rekey sessions by `session_id`, PID demoted to metadata
+- `4793e85` — section 5 / item 10: split `CoachState` into `sessions` / `config` / `services` roots
+- `9dbb736` — section 6 / item 11: shared application service layer
 
-- it is high-value and narrow
-- it touches the real app behavior
-- it avoids a large multi-file rewrite
-- once stop is on the boundary, observer and naming can follow with the same pattern
+Items 1–6 (the `LlmCoach` boundary and routing stop / observer / naming / replay through it, plus `CoachMemory` extraction) were completed before this plan-execution pass.
