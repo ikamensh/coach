@@ -1,8 +1,0 @@
-{
-  "team": "full",
-  "orchestrator": "api",
-  "orchestrator_model": "gpt-5.4",
-  "max_exchanges": 30,
-  "max_cycles": 5,
-  "auto_commit": true
-}

@@ -9,6 +9,9 @@ src-tauri/target/
 # Per-machine Claude Code state (settings.local.json, worktrees, etc.)
 .claude/
 
+# Kodo orchestrator state (per-machine notes, run status, config)
+.kodo/
+
 # Tauri build artifacts: tauri-build regenerates these from
 # src-tauri/capabilities/ on every cargo build.
 src-tauri/gen/
