@@ -19,6 +19,8 @@ The boundary between `coach-core` and the GUI is the `EventEmitter` trait in `co
 
 ## Diagram
 
+For a data-flow-focused view with `state::mutate` as the central write primitive and the intervention feedback loop drawn explicitly, see [`docs/data-flow.svg`](data-flow.svg). The ASCII diagram below is a component map — what lives where and how it connects.
+
 ```
 External CLIs                                       Frontend / HTTP config       Feedback writers
 ─────────────                                       ────────────────────         ────────────────

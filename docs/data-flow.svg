@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1400 1280"
+     font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, sans-serif"
+     font-size="13">
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#37474f"/>
+    </marker>
+    <marker id="arrowfb" viewBox="0 0 10 10" refX="10" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c62828"/>
+    </marker>
+  </defs>
+
+  <rect width="1400" height="1280" fill="#fafafa"/>
+
+  <!-- Title -->
+  <text x="700" y="38" font-size="24" font-weight="700" text-anchor="middle" fill="#212121">Coach  ·  data flow</text>
+  <text x="700" y="62" font-size="13" text-anchor="middle" fill="#546e7a">hook observation → LLM analysis → intervention feedback</text>
+
+  <!-- ============================== BOXES ============================== -->
+
+  <!-- Row 1: external sources -->
+  <g>
+    <rect x="370" y="100" width="300" height="70" rx="6" fill="#f5f5f5" stroke="#616161" stroke-width="1.5"/>
+    <text x="520" y="130" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">Claude Code · Codex · Cursor</text>
+    <text x="520" y="150" font-size="11" text-anchor="middle" fill="#546e7a">external CLIs (hooks)</text>
+  </g>
+  <g>
+    <rect x="1040" y="100" width="320" height="70" rx="6" fill="#f5f5f5" stroke="#616161" stroke-width="1.5"/>
+    <text x="1200" y="130" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">Tauri commands · /api/config/*</text>
+    <text x="1200" y="150" font-size="11" text-anchor="middle" fill="#546e7a">control plane (GUI + HTTP)</text>
+  </g>
+
+  <!-- Row 2: translation layer -->
+  <g>
+    <rect x="370" y="210" width="300" height="70" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+    <text x="520" y="240" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">server/{claude,codex,cursor}.rs</text>
+    <text x="520" y="260" font-size="11" text-anchor="middle" fill="#546e7a">transport adapter  ·  parse raw payload</text>
+  </g>
+  <g>
+    <rect x="1040" y="210" width="320" height="70" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+    <text x="1200" y="240" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">services.rs</text>
+    <text x="1200" y="260" font-size="11" text-anchor="middle" fill="#546e7a">12 functions  ·  one impl per operation</text>
+  </g>
+
+  <!-- Row 3: events::dispatch -->
+  <g>
+    <rect x="370" y="320" width="300" height="90" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+    <text x="520" y="350" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">server/events.rs</text>
+    <text x="520" y="369" font-size="11" text-anchor="middle" fill="#546e7a">dispatch → on_*_handler</text>
+    <text x="520" y="388" font-size="10" text-anchor="middle" fill="#78909c" font-style="italic">reads pending_intervention for HookResponse</text>
+  </g>
+
+  <!-- Row 4: state::mutate (CENTRAL, full width) -->
+  <g>
+    <rect x="40" y="450" width="1320" height="90" rx="8" fill="#c8e6c9" stroke="#2e7d32" stroke-width="2.5"/>
+    <text x="700" y="485" font-size="18" font-weight="700" text-anchor="middle" fill="#1b5e20">state::mutate(state, emitter, |s: &amp;mut CoachState| { ... })</text>
+    <text x="700" y="507" font-size="12" text-anchor="middle" fill="#2e7d32">acquire write lock  →  run closure  →  snapshot  →  release  →  emit</text>
+    <text x="700" y="526" font-size="11" text-anchor="middle" fill="#33691e" font-style="italic">the one write path for shared state</text>
+  </g>
+
+  <!-- Row 5: CoachState (narrower — leave left column and right column clear for arrows) -->
+  <g>
+    <rect x="370" y="580" width="700" height="170" rx="6" fill="#fff3cd" stroke="#f57f17" stroke-width="1.5"/>
+    <text x="720" y="605" font-size="14" font-weight="600" text-anchor="middle" fill="#212121">CoachState  ·  Arc&lt;RwLock&lt;_&gt;&gt;</text>
+
+    <rect x="386" y="620" width="220" height="120" rx="4" fill="#ffffff" stroke="#f57f17" stroke-dasharray="3 2"/>
+    <text x="496" y="638" font-size="11" font-weight="600" text-anchor="middle" fill="#37474f">sessions: SessionRegistry</text>
+    <text x="496" y="655" font-size="9" text-anchor="middle" fill="#616161">HashMap&lt;SessionId, SessionState&gt;</text>
+    <text x="496" y="673" font-size="9" text-anchor="middle" fill="#616161">per session:</text>
+    <text x="496" y="687" font-size="9" text-anchor="middle" fill="#616161">memory, observer_tx,</text>
+    <text x="496" y="701" font-size="9" text-anchor="middle" fill="#616161">observer_task, pid, …</text>
+    <text x="496" y="725" font-size="9" text-anchor="middle" fill="#c62828" font-style="italic">Drop aborts observer task</text>
+
+    <rect x="613" y="620" width="220" height="120" rx="4" fill="#ffffff" stroke="#f57f17" stroke-dasharray="3 2"/>
+    <text x="723" y="638" font-size="11" font-weight="600" text-anchor="middle" fill="#37474f">config: AppConfig</text>
+    <text x="723" y="656" font-size="9" text-anchor="middle" fill="#616161">priorities · model · api_tokens</text>
+    <text x="723" y="672" font-size="9" text-anchor="middle" fill="#616161">rules · theme · coach_mode</text>
+    <text x="723" y="688" font-size="9" text-anchor="middle" fill="#616161">hooks_user_enabled, …</text>
+    <text x="723" y="725" font-size="9" text-anchor="middle" fill="#78909c" font-style="italic">persisted → ~/.coach/settings.json</text>
+
+    <rect x="840" y="620" width="220" height="120" rx="4" fill="#ffffff" stroke="#f57f17" stroke-dasharray="3 2"/>
+    <text x="950" y="638" font-size="11" font-weight="600" text-anchor="middle" fill="#37474f">services: RuntimeServices</text>
+    <text x="950" y="656" font-size="9" text-anchor="middle" fill="#616161">http_client · env_tokens</text>
+    <text x="950" y="672" font-size="9" text-anchor="middle" fill="#616161">mock_session_send</text>
+    <text x="950" y="688" font-size="9" text-anchor="middle" fill="#616161">llm_logger</text>
+    <text x="950" y="702" font-size="9" text-anchor="middle" fill="#616161">pycoach? (feature-gated)</text>
+  </g>
+
+  <!-- Row 6: observer queue (left) + EventEmitter (right) -->
+  <g>
+    <rect x="40" y="790" width="280" height="80" rx="6" fill="#fff3cd" stroke="#f57f17" stroke-width="1.5"/>
+    <text x="180" y="817" font-size="13" font-weight="600" text-anchor="middle" fill="#212121">observer channel</text>
+    <text x="180" y="835" font-size="10" text-anchor="middle" fill="#546e7a">mpsc, bounded cap 64 per session</text>
+    <text x="180" y="852" font-size="10" text-anchor="middle" fill="#546e7a">on full: drop + observer_dropped++</text>
+  </g>
+  <g>
+    <rect x="1080" y="790" width="280" height="80" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+    <text x="1220" y="818" font-size="13" font-weight="600" text-anchor="middle" fill="#212121">EventEmitter</text>
+    <text x="1220" y="836" font-size="10" text-anchor="middle" fill="#546e7a">TauriEmitter (GUI)</text>
+    <text x="1220" y="852" font-size="10" text-anchor="middle" fill="#546e7a">NoopEmitter (headless, tests)</text>
+  </g>
+
+  <!-- Row 7: observer consumer (left) + Zustand/React (right) -->
+  <g>
+    <rect x="40" y="900" width="280" height="80" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+    <text x="180" y="928" font-size="13" font-weight="600" text-anchor="middle" fill="#212121">observer consumer task</text>
+    <text x="180" y="946" font-size="10" text-anchor="middle" fill="#546e7a">server/observer.rs</text>
+    <text x="180" y="962" font-size="10" text-anchor="middle" fill="#546e7a">one task per session, lives with it</text>
+  </g>
+  <g>
+    <rect x="1080" y="900" width="280" height="80" rx="6" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="1.5"/>
+    <text x="1220" y="928" font-size="13" font-weight="600" text-anchor="middle" fill="#212121">useCoachStore  ·  React</text>
+    <text x="1220" y="946" font-size="10" text-anchor="middle" fill="#546e7a">Zustand store · Tauri event listener</text>
+    <text x="1220" y="962" font-size="10" text-anchor="middle" fill="#546e7a">SessionList · SessionDetail</text>
+  </g>
+
+  <!-- Row 8: LlmCoach -->
+  <g>
+    <rect x="40" y="1010" width="280" height="70" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+    <text x="180" y="1036" font-size="13" font-weight="600" text-anchor="middle" fill="#212121">LlmCoach  ·  llm.rs</text>
+    <text x="180" y="1054" font-size="10" text-anchor="middle" fill="#546e7a">observe_tool_use · name_session</text>
+    <text x="180" y="1069" font-size="10" text-anchor="middle" fill="#546e7a">evaluate_stop[_chained]</text>
+  </g>
+
+  <!-- Row 9: LLM provider -->
+  <g>
+    <rect x="40" y="1110" width="280" height="60" rx="6" fill="#f5f5f5" stroke="#616161" stroke-width="1.5"/>
+    <text x="180" y="1135" font-size="13" font-weight="600" text-anchor="middle" fill="#212121">LLM provider API</text>
+    <text x="180" y="1153" font-size="10" text-anchor="middle" fill="#546e7a">Anthropic · OpenAI · Gemini</text>
+  </g>
+
+  <!-- ============================== ARROWS ============================== -->
+
+  <!-- Hook path (left-of-center column) going DOWN -->
+
+  <!-- 1. Claude Code → Transport -->
+  <line x1="500" y1="170" x2="500" y2="208" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="510" y="194" font-size="11" fill="#455a64">POST /hook/*  ·  HookPayload JSON</text>
+
+  <!-- 2. Transport → events::dispatch -->
+  <line x1="500" y1="280" x2="500" y2="318" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="510" y="304" font-size="11" fill="#455a64">SessionEvent + SessionSource</text>
+
+  <!-- 3. events::dispatch → state::mutate -->
+  <line x1="500" y1="410" x2="500" y2="448" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="510" y="434" font-size="11" fill="#455a64">closure inside on_*_handler</text>
+
+  <!-- 16. events::dispatch → Claude Code (HookResponse with intervention) - RED feedback arrow, routed around the right side of the column -->
+  <polyline points="670,355 710,355 710,135 672,135" fill="none" stroke="#c62828" stroke-width="1.8" marker-end="url(#arrowfb)"/>
+  <text x="720" y="260" font-size="11" fill="#c62828" font-weight="600">HookResponse</text>
+  <text x="720" y="275" font-size="10" fill="#c62828">pending_intervention</text>
+  <text x="720" y="289" font-size="10" fill="#c62828">read from state</text>
+
+  <!-- Control path (right column) going DOWN -->
+
+  <!-- 4. Tauri/HTTP → services.rs -->
+  <line x1="1200" y1="170" x2="1200" y2="208" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="1210" y="194" font-size="11" fill="#455a64">operation args</text>
+
+  <!-- 5. services.rs → state::mutate (longer) -->
+  <line x1="1200" y1="280" x2="1200" y2="448" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="1210" y="370" font-size="11" fill="#455a64">closure</text>
+
+  <!-- 6. state::mutate → CoachState (short, dim, visual hint only) -->
+  <line x1="720" y1="540" x2="720" y2="578" stroke="#90a4ae" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <text x="730" y="565" font-size="10" fill="#78909c" font-style="italic">writes</text>
+
+  <!-- 7. state::mutate → observer channel (routed in the LEFT column, clear of CoachState which starts at x=370) -->
+  <line x1="180" y1="540" x2="180" y2="788" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="192" y="615" font-size="11" fill="#455a64">try_send</text>
+  <text x="192" y="630" font-size="10" fill="#455a64">ObserverQueueItem</text>
+  <text x="192" y="647" font-size="9" fill="#78909c" font-style="italic">(inside on_tool_completed</text>
+  <text x="192" y="660" font-size="9" fill="#78909c" font-style="italic">closure)</text>
+
+  <!-- 8. state::mutate → EventEmitter (RIGHT column, clear of CoachState which ends at x=1070) -->
+  <line x1="1220" y1="540" x2="1220" y2="788" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="1232" y="615" font-size="11" fill="#455a64">CoachSnapshot</text>
+  <text x="1232" y="632" font-size="9" fill="#78909c" font-style="italic">emit_state_update</text>
+
+  <!-- 9. observer channel → observer consumer -->
+  <line x1="180" y1="870" x2="180" y2="898" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="192" y="888" font-size="10" fill="#455a64">recv</text>
+
+  <!-- 10. observer consumer → LlmCoach -->
+  <line x1="180" y1="980" x2="180" y2="1008" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="192" y="998" font-size="10" fill="#455a64">ObserveToolUseInput</text>
+
+  <!-- 11. LlmCoach ↔ LLM provider (bidirectional) -->
+  <line x1="165" y1="1080" x2="165" y2="1108" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <line x1="195" y1="1108" x2="195" y2="1080" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="212" y="1098" font-size="10" fill="#455a64">HTTPS / assessment</text>
+
+  <!-- 12. observer consumer → state::mutate (feedback loop — ROUTED through gap at x=340-370 between observer column and CoachState) -->
+  <polyline points="320,940 345,940 345,540" fill="none" stroke="#c62828" stroke-width="1.8" marker-end="url(#arrowfb)"/>
+  <text x="355" y="720" font-size="11" fill="#c62828" font-weight="600">writes back via mutate</text>
+  <text x="355" y="735" font-size="10" fill="#c62828">assessment +</text>
+  <text x="355" y="749" font-size="10" fill="#c62828">pending_intervention</text>
+
+  <!-- 13. EventEmitter → Zustand/React -->
+  <line x1="1220" y1="870" x2="1220" y2="898" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="1232" y="888" font-size="10" fill="#455a64">Tauri event "coach-state-updated"</text>
+
+  <!-- ============================== LEGEND ============================== -->
+
+  <g transform="translate(40, 1200)">
+    <rect x="0" y="0" width="1320" height="60" fill="#ffffff" stroke="#cfd8dc" stroke-width="1" rx="4"/>
+
+    <rect x="14" y="18" width="14" height="14" fill="#e3f2fd" stroke="#1565c0" rx="2"/>
+    <text x="34" y="30" font-size="11" fill="#37474f">process</text>
+
+    <rect x="100" y="18" width="14" height="14" fill="#fff3cd" stroke="#f57f17" rx="2"/>
+    <text x="120" y="30" font-size="11" fill="#37474f">data store / queue</text>
+
+    <rect x="240" y="18" width="14" height="14" fill="#f5f5f5" stroke="#616161" rx="2"/>
+    <text x="260" y="30" font-size="11" fill="#37474f">external</text>
+
+    <rect x="330" y="18" width="14" height="14" fill="#c8e6c9" stroke="#2e7d32" stroke-width="2" rx="2"/>
+    <text x="350" y="30" font-size="11" fill="#37474f">central write primitive</text>
+
+    <rect x="490" y="18" width="14" height="14" fill="#f3e5f5" stroke="#6a1b9a" rx="2"/>
+    <text x="510" y="30" font-size="11" fill="#37474f">frontend</text>
+
+    <line x1="590" y1="25" x2="625" y2="25" stroke="#37474f" stroke-width="1.8" marker-end="url(#arrow)"/>
+    <text x="632" y="29" font-size="11" fill="#37474f">forward data flow</text>
+
+    <line x1="760" y1="25" x2="795" y2="25" stroke="#c62828" stroke-width="1.8" marker-end="url(#arrowfb)"/>
+    <text x="802" y="29" font-size="11" fill="#37474f">feedback / response loop</text>
+
+    <text x="14" y="50" font-size="10" fill="#78909c" font-style="italic">The intervention loop (both red arrows) is the non-obvious part. The observer consumer writes its LLM assessment back through the same mutate helper; the result lives in session memory as pending_intervention until the next on_tool_completed picks it up and returns it to the CLI inside HookResponse. Interventions are pulled by the next hook, never pushed.</text>
+  </g>
+</svg>
