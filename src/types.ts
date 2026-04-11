@@ -74,6 +74,10 @@ export interface PathStatus {
 export interface SessionSnapshot {
   /** Stable conversation id — the canonical session identity. */
   session_id: string;
+  /** Session id the scanner read from the JSONL during bootstrap.
+   *  Used as a fallback to link to the transcript before the first
+   *  live hook populates `session_id`. */
+  bootstrapped_session_id?: string | null;
   /** OS PID of the coding-agent process (metadata only). */
   pid: number;
   mode: CoachMode;

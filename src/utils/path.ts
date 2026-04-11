@@ -21,21 +21,25 @@ export function abbreviateCwd(cwd: string | null | undefined): string {
  * with `-`, so `/Users/alice/work_2024` lives under
  * `-Users-alice-work-2024`.
  *
+ * Falls back to `bootstrapped_session_id` when `session_id` is empty
+ * — scanner-discovered sessions don't get a real `session_id` until
+ * the first live hook lands, but the JSONL transcript is already on
+ * disk under the id the scanner read at bootstrap time.
+ *
  * Returns null when the path can't be formed: non-Claude client
- * (Cursor/Codex use different storage), missing cwd, or missing
- * session_id (scanner placeholders before the first hook lands).
- * The returned path is user-facing display only — we can't resolve
- * `~` without backend help, so clicking currently copies the path
- * to the clipboard rather than opening the file.
+ * (Cursor/Codex use different storage), missing cwd, or neither id
+ * available.
  */
 export function jsonlPath(session: {
   client: string;
   session_id: string;
+  bootstrapped_session_id?: string | null;
   cwd: string | null;
 }): string | null {
   if (session.client !== "claude") return null;
-  if (!session.session_id) return null;
+  const sid = session.session_id || session.bootstrapped_session_id || "";
+  if (!sid) return null;
   if (!session.cwd) return null;
   const mangled = session.cwd.replace(/[^a-zA-Z0-9]/g, "-");
-  return `~/.claude/projects/${mangled}/${session.session_id}.jsonl`;
+  return `~/.claude/projects/${mangled}/${sid}.jsonl`;
 }

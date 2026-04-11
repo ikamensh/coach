@@ -62,6 +62,12 @@ pub struct SessionSnapshot {
     /// Stable conversation identifier from the coding agent. Empty
     /// string if the scanner saw the process before any hook fired.
     pub session_id: String,
+    /// Session id the scanner discovered from the JSONL transcript
+    /// during bootstrap. Present for placeholder sessions that don't
+    /// yet have a live `session_id`, so the frontend can still link to
+    /// the on-disk transcript before the first hook lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrapped_session_id: Option<String>,
     /// OS PID of the coding-agent process. Metadata only — the
     /// session's identity is `session_id`.
     pub pid: u32,
@@ -251,6 +257,7 @@ impl super::AppState {
 fn snapshot_session(s: &SessionState, now: DateTime<Utc>) -> SessionSnapshot {
     SessionSnapshot {
         session_id: s.session_id.clone(),
+        bootstrapped_session_id: s.bootstrapped_session_id.clone(),
         pid: s.pid,
         mode: s.mode,
         cwd: s.cwd.clone(),

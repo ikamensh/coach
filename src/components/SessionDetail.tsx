@@ -86,14 +86,14 @@ export function SessionDetail() {
             {abbreviateCwd(session.cwd)}
           </div>
           <div className="font-mono text-zinc-400 dark:text-zinc-600">
-            {session.session_id.slice(0, 12)}
+            {(session.session_id || session.bootstrapped_session_id || "").slice(0, 12) || "—"}
           </div>
           <div className="text-zinc-500 dark:text-zinc-400">
             Started {formatTime(session.started_at)} · {timeAgo(session.started_at)} · {formatDuration(session.duration_secs)}
           </div>
           <JsonlLink
             path={jsonlPath(session)}
-            sessionId={session.session_id}
+            sessionId={session.session_id || session.bootstrapped_session_id || ""}
           />
         </div>
       </section>

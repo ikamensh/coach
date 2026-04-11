@@ -43,8 +43,40 @@ describe("jsonlPath", () => {
     expect(jsonlPath({ ...base, client: "codex" })).toBeNull();
   });
 
-  it("returns null before the session has a session_id (scanner placeholder)", () => {
+  it("falls back to bootstrapped_session_id when session_id is empty", () => {
+    // Scanner-discovered sessions have session_id="" until the first
+    // live hook lands. The JSONL transcript already exists on disk
+    // under the id the scanner read at bootstrap time.
+    expect(
+      jsonlPath({
+        ...base,
+        session_id: "",
+        bootstrapped_session_id: "boot-999",
+      }),
+    ).toBe("~/.claude/projects/-Users-alice-work/boot-999.jsonl");
+  });
+
+  it("returns null when neither id is available", () => {
+    expect(
+      jsonlPath({
+        ...base,
+        session_id: "",
+        bootstrapped_session_id: null,
+      }),
+    ).toBeNull();
     expect(jsonlPath({ ...base, session_id: "" })).toBeNull();
+  });
+
+  it("prefers the live session_id over the bootstrapped one", () => {
+    // Once a real hook lands we key off the canonical id, not the
+    // stale bootstrap id from the (possibly /clear'd) older file.
+    expect(
+      jsonlPath({
+        ...base,
+        session_id: "live-xyz",
+        bootstrapped_session_id: "stale-old",
+      }),
+    ).toBe("~/.claude/projects/-Users-alice-work/live-xyz.jsonl");
   });
 
   it("returns null when cwd is unknown (no way to derive the project dir)", () => {
