@@ -12,7 +12,7 @@ pub(crate) async fn observer_consumer(
     coach: SharedState,
     emitter: Arc<dyn EventEmitter>,
     pid: u32,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::state::ObserverQueueItem>,
+    mut rx: tokio::sync::mpsc::Receiver<crate::state::ObserverQueueItem>,
 ) {
     let llm_coach = LlmCoach::new(coach.clone());
     while let Some(item) = rx.recv().await {

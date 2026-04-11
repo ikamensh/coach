@@ -539,7 +539,6 @@ pub(crate) async fn run_post_tool_use(
     let tool = payload.tool_name.unwrap_or_default();
     let tool_input = payload.tool_input.unwrap_or(serde_json::Value::Null);
 
-    let mut consumer_rx = None;
     let (rule_message, intervention_to_deliver, namer_input) =
         crate::state::mutate(&state.coach, &state.emitter, |coach| {
             let event_count = {
@@ -593,18 +592,31 @@ pub(crate) async fn run_post_tool_use(
                 let priorities = coach.priorities.clone();
                 let session = coach.sessions.get_mut(&pid).expect("apply_hook_event populated");
                 if session.coach.observer_tx.is_none() {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (tx, rx) = tokio::sync::mpsc::channel(
+                        crate::state::OBSERVER_QUEUE_CAPACITY,
+                    );
                     session.coach.observer_tx = Some(tx);
-                    consumer_rx = Some(rx);
+                    let coach_state = state.coach.clone();
+                    let emitter = state.emitter.clone();
+                    session.coach.observer_task = Some(tokio::spawn(async move {
+                        observer::observer_consumer(coach_state, emitter, pid, rx).await;
+                    }));
                 }
-                let _ = session.coach.observer_tx.as_ref().unwrap().send(
-                    crate::state::ObserverQueueItem {
-                        priorities,
-                        tool_name: tool.clone(),
-                        tool_input: tool_input.clone(),
-                        user_prompt: session.coach.memory.last_user_prompt.clone(),
-                    },
-                );
+                let item = crate::state::ObserverQueueItem {
+                    priorities,
+                    tool_name: tool.clone(),
+                    tool_input: tool_input.clone(),
+                    user_prompt: session.coach.memory.last_user_prompt.clone(),
+                };
+                if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                    session.coach.observer_tx.as_ref().unwrap().try_send(item)
+                {
+                    session.coach.observer_dropped += 1;
+                    eprintln!(
+                        "[coach] observer queue full (pid={pid}, dropped={})",
+                        session.coach.observer_dropped
+                    );
+                }
             }
 
             let namer_input = if llm_active && should_request_title(event_count) {
@@ -624,15 +636,6 @@ pub(crate) async fn run_post_tool_use(
             (rule_message, intervention_to_deliver, namer_input)
         })
         .await;
-
-    // Spawn the sequential observer consumer if we just created the queue.
-    if let Some(rx) = consumer_rx {
-        let coach_state = state.coach.clone();
-        let emitter = state.emitter.clone();
-        tokio::spawn(async move {
-            observer::observer_consumer(coach_state, emitter, pid, rx).await;
-        });
-    }
 
     if let Some(input) = namer_input {
         let coach_state = state.coach.clone();

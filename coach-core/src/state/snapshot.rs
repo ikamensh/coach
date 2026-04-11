@@ -121,6 +121,9 @@ pub struct SessionSnapshot {
     /// Total interventions detected by the observer this conversation.
     #[serde(default)]
     pub intervention_count: usize,
+    /// Observer queue items dropped because the bounded channel was full.
+    #[serde(default)]
+    pub observer_dropped: u64,
     /// The system prompt sent to the LLM on the last observer call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coach_last_system_prompt: Option<String>,
@@ -277,6 +280,7 @@ fn snapshot_session(s: &SessionState, now: DateTime<Utc>) -> SessionSnapshot {
         intervention_muted: s.coach.intervention_muted,
         pending_intervention: s.coach.memory.pending_intervention.clone(),
         intervention_count: s.coach.telemetry.intervention_count,
+        observer_dropped: s.coach.observer_dropped,
         coach_last_system_prompt: s.coach.memory.last_system_prompt.clone(),
         coach_last_user_message: s.coach.memory.last_user_message.clone(),
     }

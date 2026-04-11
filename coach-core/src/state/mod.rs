@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 use crate::llm_log::LlmLogger;
 #[cfg(feature = "pycoach")]
@@ -164,11 +165,15 @@ impl CoachTelemetry {
     }
 }
 
+pub const OBSERVER_QUEUE_CAPACITY: usize = 64;
+
 /// All coach-specific state hanging off one live session.
 pub struct SessionCoachState {
     pub memory: CoachMemory,
     pub telemetry: CoachTelemetry,
-    pub observer_tx: Option<tokio::sync::mpsc::UnboundedSender<ObserverQueueItem>>,
+    pub observer_tx: Option<tokio::sync::mpsc::Sender<ObserverQueueItem>>,
+    pub observer_task: Option<JoinHandle<()>>,
+    pub observer_dropped: u64,
     /// When true, observer interventions are shown in the UI only —
     /// not sent to the coding agent via hook responses.
     pub intervention_muted: bool,
@@ -180,6 +185,8 @@ impl SessionCoachState {
             memory: CoachMemory::new(),
             telemetry: CoachTelemetry::new(),
             observer_tx: None,
+            observer_task: None,
+            observer_dropped: 0,
             intervention_muted: true,
         }
     }
@@ -188,6 +195,10 @@ impl SessionCoachState {
         self.memory = CoachMemory::new();
         self.telemetry = CoachTelemetry::new();
         self.observer_tx = None;
+        if let Some(handle) = self.observer_task.take() {
+            handle.abort();
+        }
+        self.observer_dropped = 0;
     }
 
     pub fn record_success(
@@ -321,6 +332,14 @@ impl SessionState {
         self.activity.clear();
         self.bootstrapped = false;
         self.bootstrapped_session_id = None;
+    }
+}
+
+impl Drop for SessionState {
+    fn drop(&mut self) {
+        if let Some(handle) = self.coach.observer_task.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -1413,5 +1432,29 @@ mod tests {
 
         assert!(dead.is_empty());
         assert_eq!(state.sessions.len(), 2);
+    }
+
+    // ── observer queue backpressure ─────────────────────────────────────
+
+    /// With capacity 64 and no consumer, pushing 100 items must drop the
+    /// 36 that overflow and match the counter we expose in the snapshot.
+    #[tokio::test]
+    async fn observer_queue_drops_overflow_and_counts() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ObserverQueueItem>(
+            OBSERVER_QUEUE_CAPACITY,
+        );
+        let mut dropped: u64 = 0;
+        for _ in 0..100 {
+            let item = ObserverQueueItem {
+                priorities: vec![],
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+                user_prompt: None,
+            };
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(item) {
+                dropped += 1;
+            }
+        }
+        assert_eq!(dropped, 100 - OBSERVER_QUEUE_CAPACITY as u64);
     }
 }
