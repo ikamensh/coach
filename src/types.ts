@@ -72,10 +72,10 @@ export interface PathStatus {
 // ── Snapshot types (Rust -> TS via Tauri events) ───────────────────────
 
 export interface SessionSnapshot {
-  /** OS PID — stable across /clear, the canonical identity for a window. */
-  pid: number;
-  /** Current conversation id — changes on /clear. */
+  /** Stable conversation id — the canonical session identity. */
   session_id: string;
+  /** OS PID of the coding-agent process (metadata only). */
+  pid: number;
   mode: CoachMode;
   /** Launch directory of the window. Set once on first observation and frozen. */
   cwd: string | null;

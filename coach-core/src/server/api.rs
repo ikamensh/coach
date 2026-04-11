@@ -44,17 +44,20 @@ pub(crate) struct RulesPayload {
 
 pub(crate) async fn set_session_mode(
     AxumState(state): AxumState<AppState>,
-    Path(pid): Path<u32>,
+    Path(session_id): Path<String>,
     Json(payload): Json<ModePayload>,
 ) -> Result<Json<crate::state::CoachSnapshot>, (StatusCode, String)> {
     {
         let s = state.coach.read().await;
-        if !s.sessions.contains_key(&pid) {
-            return Err((StatusCode::NOT_FOUND, format!("no session for pid {pid}")));
+        if !s.sessions.contains_key(&session_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("no session for id {session_id}"),
+            ));
         }
     }
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.set_session_mode(pid, payload.mode);
+        s.set_session_mode(&session_id, payload.mode);
         s.snapshot()
     })
     .await;

@@ -275,9 +275,9 @@ pub async fn sync_all_sessions_with(
     // Keep hook-created sessions (Cursor, etc.) that are still active.
     // Without this, remove_dead_pids would evict them between scan cycles.
     let recent_cutoff = std::time::Instant::now() - Duration::from_secs(30);
-    for (pid, sess) in &coach.sessions {
+    for sess in coach.sessions.values() {
         if sess.last_event > recent_cutoff {
-            live_pids.insert(*pid);
+            live_pids.insert(sess.pid);
         }
     }
 
@@ -289,7 +289,9 @@ pub async fn sync_all_sessions_with(
             session.started_at_utc(),
         );
         if created {
-            coach.log(session.pid, "Scanner", "process discovered", session.cwd.clone());
+            if let Some(key) = coach.session_key_for_pid(session.pid) {
+                coach.log(&key, "Scanner", "process discovered", session.cwd.clone());
+            }
             changed = true;
         }
         bootstrap_claude_session(&mut coach, session, projects_dir, &mut changed);
@@ -303,18 +305,25 @@ pub async fn sync_all_sessions_with(
             session.cwd.as_deref(),
             session.started_at_utc(),
         );
+        // Placeholders live under a sentinel key until a hook fills in
+        // the real session_id, so we look them up by pid.
+        let Some(current_key) = coach.session_key_for_pid(pid) else {
+            continue;
+        };
         if created {
             coach.log(
-                pid,
+                &current_key,
                 "Scanner",
                 "codex session discovered",
                 session.cwd.clone(),
             );
             changed = true;
         }
-        coach.mark_client(pid, SessionClient::Codex);
+        coach.mark_client(&current_key, SessionClient::Codex);
         // Set thread name as session title if we have one and coach hasn't set its own.
-        if let (Some(name), Some(sess)) = (&session.thread_name, coach.sessions.get_mut(&pid)) {
+        if let (Some(name), Some(sess)) =
+            (&session.thread_name, coach.sessions.get_mut(&current_key))
+        {
             if sess.coach.memory.session_title.is_none() {
                 sess.coach.memory.session_title = Some(name.clone());
             }
@@ -350,48 +359,49 @@ fn bootstrap_claude_session(
     projects_dir: &Path,
     changed: &mut bool,
 ) {
-    let needs_bootstrap = coach
-        .sessions
-        .get(&session.pid)
-        .is_some_and(|s| !s.bootstrapped);
-    if !needs_bootstrap {
+    let Some(key) = coach.session_key_for_pid(session.pid) else {
         return;
-    }
+    };
+    let sess_state_sid = {
+        let sess = coach.sessions.get(&key).unwrap();
+        if sess.bootstrapped {
+            return;
+        }
+        sess.session_id.clone()
+    };
     // Prefer the hook's session_id (current conversation) over
     // the session file's (may be stale after /clear).
-    let effective_sid = coach
-        .sessions
-        .get(&session.pid)
-        .filter(|s| !s.current_session_id.is_empty())
-        .map(|s| s.current_session_id.clone())
-        .unwrap_or_else(|| session.session_id.clone());
+    let effective_sid = if sess_state_sid.is_empty() {
+        session.session_id.clone()
+    } else {
+        sess_state_sid
+    };
     let effective_session = ClaudeSessionFile {
         session_id: effective_sid.clone(),
         ..session.clone()
     };
-    if let Some(jsonl_path) = jsonl_path_for(&effective_session, projects_dir) {
-        let sess = coach.sessions.get_mut(&session.pid).unwrap();
-        match replay_jsonl(&jsonl_path, sess) {
-            Ok(total) => {
-                sess.bootstrapped_session_id = Some(effective_sid.clone());
-                sess.bootstrapped = true;
-                let agents = sess.active_agents;
-                coach.log(
-                    session.pid,
-                    "Scanner",
-                    "bootstrapped from JSONL",
-                    Some(format!("{total} tools, {agents} active agents")),
-                );
-                *changed = true;
-            }
-            Err(e) => {
-                eprintln!("[coach] JSONL bootstrap failed for pid {}: {e}", session.pid);
-            }
-        }
-    } else {
-        // No JSONL found — mark as bootstrapped to avoid retrying.
-        if let Some(sess) = coach.sessions.get_mut(&session.pid) {
+    let Some(jsonl_path) = jsonl_path_for(&effective_session, projects_dir) else {
+        if let Some(sess) = coach.sessions.get_mut(&key) {
             sess.bootstrapped = true;
+        }
+        return;
+    };
+    let sess = coach.sessions.get_mut(&key).unwrap();
+    match replay_jsonl(&jsonl_path, sess) {
+        Ok(total) => {
+            sess.bootstrapped_session_id = Some(effective_sid);
+            sess.bootstrapped = true;
+            let agents = sess.active_agents;
+            coach.log(
+                &key,
+                "Scanner",
+                "bootstrapped from JSONL",
+                Some(format!("{total} tools, {agents} active agents")),
+            );
+            *changed = true;
+        }
+        Err(e) => {
+            eprintln!("[coach] JSONL bootstrap failed for pid {}: {e}", session.pid);
         }
     }
 }
@@ -630,8 +640,8 @@ mod tests {
         use std::collections::{HashMap, VecDeque};
         use std::time::Instant;
         crate::state::SessionState {
+            session_id: String::new(),
             pid: 0,
-            current_session_id: String::new(),
             mode: crate::state::CoachMode::Present,
             cwd: None,
             last_event: Instant::now(),
@@ -759,6 +769,8 @@ mod tests {
     }
 
     /// Scanner discovers a session and bootstraps it from the JSONL.
+    /// The placeholder lives under an empty session_id until a hook
+    /// lands with the real one.
     #[tokio::test]
     async fn sync_bootstraps_scanner_discovered_session() {
         let sessions_dir = TempDir::new().unwrap();
@@ -786,15 +798,15 @@ mod tests {
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
 
         let coach = state.read().await;
-        let sess = coach.sessions.get(&my_pid).expect("session should exist");
+        let sess = coach.session_for_pid(my_pid).expect("session should exist");
         assert!(sess.bootstrapped);
         assert_eq!(sess.tool_counts.get("Read"), Some(&1));
         assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
         assert_eq!(sess.tool_counts.get("Agent"), Some(&1));
         assert_eq!(sess.active_agents, 1, "Agent t3 has no result yet");
         assert_eq!(sess.event_count, 3);
-        assert!(sess.current_session_id.is_empty(),
-            "bootstrap must not set current_session_id");
+        assert!(sess.session_id.is_empty(),
+            "bootstrap must not set session_id");
         assert_eq!(sess.bootstrapped_session_id, Some(sid.to_string()));
     }
 
@@ -825,7 +837,7 @@ mod tests {
         {
             let mut coach = state.write().await;
             coach.apply_hook_event(my_pid, sid, Some(cwd));
-            let sess = coach.sessions.get(&my_pid).unwrap();
+            let sess = coach.sessions.get(sid).unwrap();
             assert!(sess.tool_counts.is_empty(), "hook-created session starts empty");
             assert!(!sess.bootstrapped);
         }
@@ -835,7 +847,7 @@ mod tests {
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
 
         let coach = state.read().await;
-        let sess = coach.sessions.get(&my_pid).unwrap();
+        let sess = coach.sessions.get(sid).unwrap();
         assert!(sess.bootstrapped);
         assert_eq!(sess.tool_counts.get("Edit"), Some(&2));
         assert_eq!(sess.event_count, 2);
@@ -843,11 +855,10 @@ mod tests {
     }
 
     /// Regression: when the hook's session_id differs from the session
-    /// file's (stale after /clear), bootstrap must NOT overwrite the
-    /// hook's session_id — otherwise the next hook triggers the /clear
-    /// reset path and wipes tool_counts.
+    /// file's (stale after /clear), bootstrap must prefer the hook's
+    /// JSONL so the session shows what the user is actually working on.
     #[tokio::test]
-    async fn bootstrap_does_not_overwrite_hook_session_id() {
+    async fn bootstrap_prefers_hook_session_over_stale_file() {
         let sessions_dir = TempDir::new().unwrap();
         let projects_dir = TempDir::new().unwrap();
         let my_pid = std::process::id();
@@ -881,14 +892,13 @@ mod tests {
             coach.apply_hook_event(my_pid, hook_sid, Some(cwd));
         }
 
-        // Scanner bootstraps — must NOT replace hook_sid with file_sid.
+        // Scanner bootstraps — should load the hook_sid's JSONL.
         let live = scan_live_sessions_in(sessions_dir.path());
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
 
         let coach = state.read().await;
-        let sess = coach.sessions.get(&my_pid).unwrap();
-        assert_eq!(sess.current_session_id, hook_sid,
-            "bootstrap must not overwrite the hook's session_id");
+        let sess = coach.sessions.get(hook_sid).unwrap();
+        assert_eq!(sess.session_id, hook_sid);
         assert!(sess.bootstrapped);
         // Should have loaded the CURRENT conversation's tools (Read+Edit+Edit),
         // not the stale one (Bash).
@@ -910,10 +920,10 @@ mod tests {
     }
 
     /// Scanner-first with stale session file (after /clear). The hook
-    /// carries the REAL session_id. Bootstrap data from the old
-    /// conversation must be discarded.
+    /// carries the REAL session_id. Rekey creates a fresh entry under
+    /// the real session_id; the stale placeholder is left behind.
     #[tokio::test]
-    async fn scanner_first_stale_sid_then_hook_discards_bootstrap() {
+    async fn scanner_first_stale_sid_then_hook_creates_fresh_entry() {
         let sessions_dir = TempDir::new().unwrap();
         let projects_dir = TempDir::new().unwrap();
         let my_pid = std::process::id();
@@ -932,23 +942,26 @@ mod tests {
         ));
         let emitter = crate::NoopEmitter;
 
-        // Scanner runs first — bootstraps from stale JSONL.
+        // Scanner runs first — bootstraps from stale JSONL into a
+        // placeholder keyed under the empty session_id.
         let live = scan_live_sessions_in(sessions_dir.path());
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
 
         {
             let coach = state.read().await;
-            let sess = coach.sessions.get(&my_pid).unwrap();
+            let sess = coach.session_for_pid(my_pid).unwrap();
             assert!(sess.bootstrapped);
-            assert!(sess.current_session_id.is_empty());
+            assert!(sess.session_id.is_empty());
             assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
         }
 
-        // Hook arrives with the REAL session_id — stale data discarded.
+        // Hook arrives with the REAL session_id — placeholder is
+        // rekeyed under real_sid; stale bootstrap is discarded because
+        // its bootstrapped_session_id doesn't match.
         {
             let mut coach = state.write().await;
             let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
-            assert_eq!(sess.current_session_id, real_sid);
+            assert_eq!(sess.session_id, real_sid);
             assert_eq!(sess.event_count, 0, "stale data discarded, no tools yet");
             assert!(sess.tool_counts.is_empty(),
                 "stale bootstrap tool_counts must be cleared");
@@ -972,17 +985,12 @@ mod tests {
         let real_sid = "post-clear-conversation";
         let cwd = "/tmp/clear-reload-test";
 
-        // Session file still has the stale sessionId (Claude Code
-        // doesn't always update it immediately after /clear).
         write_session_file_full(sessions_dir.path(), my_pid, stale_sid, cwd);
 
-        // JSONL for the OLD conversation (before /clear).
         write_jsonl(projects_dir.path(), cwd, stale_sid, &[
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"old1","name":"Bash","input":{}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"old1","content":"ok"}]}}"#,
         ]);
-        // JSONL for the NEW conversation (after /clear) — this is the
-        // one with real work that should be displayed.
         write_jsonl(projects_dir.path(), cwd, real_sid, &[
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
@@ -998,11 +1006,11 @@ mod tests {
         let emitter = crate::NoopEmitter;
         let live = scan_live_sessions_in(sessions_dir.path());
 
-        // ── Step 1: Scanner bootstraps from stale JSONL ──
+        // ── Step 1: Scanner bootstraps from stale JSONL into the placeholder ──
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
         {
             let coach = state.read().await;
-            let sess = coach.sessions.get(&my_pid).unwrap();
+            let sess = coach.session_for_pid(my_pid).unwrap();
             assert_eq!(sess.tool_counts.get("Bash"), Some(&1), "stale bootstrap loaded");
             assert_eq!(sess.event_count, 1);
         }
@@ -1019,7 +1027,7 @@ mod tests {
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
         {
             let coach = state.read().await;
-            let sess = coach.sessions.get(&my_pid).unwrap();
+            let sess = coach.sessions.get(real_sid).unwrap();
             assert_eq!(sess.event_count, 4,
                 "re-bootstrap from correct JSONL: Read + Edit + Bash + Write = 4 events");
             assert_eq!(sess.tool_counts.get("Read"), Some(&1));
@@ -1066,12 +1074,13 @@ mod tests {
 
         {
             let coach = state.read().await;
-            let sess = coach.sessions.get(&my_pid).unwrap();
+            let sess = coach.session_for_pid(my_pid).unwrap();
             assert_eq!(sess.event_count, 2);
         }
 
-        // Hook with same session_id — bootstrap data preserved,
-        // event_count unchanged until record_tool is called.
+        // Hook with same session_id — placeholder is rekeyed to sid;
+        // bootstrap data survives because bootstrapped_session_id
+        // matches.
         {
             let mut coach = state.write().await;
             let sess = coach.apply_hook_event(my_pid, sid, Some(cwd));
@@ -1151,7 +1160,7 @@ mod tests {
 
         let coach = state.read().await;
         let pid = fake_pid_for_sid("codex-thread-001");
-        let sess = coach.sessions.get(&pid).expect("codex session should exist");
+        let sess = coach.session_for_pid(pid).expect("codex session should exist");
         assert_eq!(sess.client, SessionClient::Codex);
         assert_eq!(sess.cwd, Some("/tmp/codex-project".into()));
         assert_eq!(
@@ -1179,7 +1188,7 @@ mod tests {
         {
             let mut coach = state.write().await;
             coach.apply_hook_event(pid, thread_id, Some("/tmp/hook-cwd"));
-            let sess = coach.sessions.get_mut(&pid).unwrap();
+            let sess = coach.sessions.get_mut(thread_id).unwrap();
             sess.record_tool("Bash");
         }
 
@@ -1201,7 +1210,7 @@ mod tests {
         .await;
 
         let coach = state.read().await;
-        let sess = coach.sessions.get(&pid).unwrap();
+        let sess = coach.sessions.get(thread_id).unwrap();
         assert_eq!(sess.client, SessionClient::Codex);
         assert_eq!(sess.event_count, 1, "hook tool count preserved");
         assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
@@ -1242,7 +1251,7 @@ mod tests {
 
         let coach = state.read().await;
         assert!(
-            coach.sessions.contains_key(&cursor_pid),
+            coach.session_for_pid(cursor_pid).is_some(),
             "recently active hook session should not be evicted"
         );
     }

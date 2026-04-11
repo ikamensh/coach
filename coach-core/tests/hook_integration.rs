@@ -1,20 +1,15 @@
 /// Integration tests for the Coach hook server.
 ///
-/// The main tests verify session tracking via direct HTTP calls to the hook
-/// endpoints — this covers the contract between Claude Code and Coach without
-/// requiring Claude Code to be installed.
+/// These tests fire real HTTP at the hook endpoints and verify that
+/// session state lands correctly. Sessions are keyed by `session_id`
+/// in the payload; the PID recorded on each session is whatever the
+/// OS resolver returns for the TCP peer (generally 0 in tests, since
+/// the client and server run in the same process on loopback).
 ///
-/// PID resolution is normally handled by `lsof` against the request's TCP
-/// peer port. Tests run client and server in the same process, so we inject
-/// a fake resolver (`fake_resolver_from_sid`) that hashes the session_id to
-/// a deterministic non-zero u32. Tests can compute the same fake PID via
-/// `coach_core::server::fake_pid_for_sid` to look up state.
-///
-/// The `test_with_real_claude_code` test (ignored by default) launches the
-/// actual `claude` CLI against a temporary project and checks that its
-/// session appears in Coach state. Run it with:
+/// The `test_with_real_claude_code` test (ignored by default) launches
+/// the actual `claude` CLI against a temporary project and checks
+/// that its session appears in Coach state. Run with:
 ///     cargo test -p coach -- --ignored
-use coach_core::server::fake_pid_for_sid;
 use coach_core::settings::Settings;
 use coach_core::state::CoachState;
 use std::net::SocketAddr;
@@ -24,10 +19,7 @@ use tokio::sync::RwLock;
 /// Start the hook server on an OS-assigned port and return its base URL.
 async fn start_test_server() -> (String, Arc<RwLock<CoachState>>) {
     let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
-    let router = coach_core::server::create_router_headless(
-        state.clone(),
-        coach_core::server::fake_resolver_from_sid(),
-    );
+    let router = coach_core::server::create_router_headless(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -83,7 +75,6 @@ async fn post_tool_use_creates_session() {
     let sessions = snap["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["session_id"], "sess-1");
-    assert_eq!(sessions[0]["pid"], fake_pid_for_sid("sess-1"));
     assert_eq!(sessions[0]["cwd"], "/tmp/my-project");
     assert_eq!(sessions[0]["event_count"], 1);
 }
@@ -117,7 +108,6 @@ async fn cursor_after_shell_tracks_session() {
     let sessions = snap["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["session_id"], "cursor-sess-1");
-    assert_eq!(sessions[0]["pid"], fake_pid_for_sid("cursor-sess-1"));
     assert_eq!(sessions[0]["cwd"], "/tmp/cursor-proj");
     // Property: a session created by ANY cursor hook is tagged as
     // belonging to Cursor, so the frontend renders the cursor icon.
@@ -300,8 +290,7 @@ async fn permission_request_auto_approves_in_away_mode() {
     {
         let mut s = state.write().await;
         s.default_mode = coach_core::state::CoachMode::Away;
-        let pid = fake_pid_for_sid("away-sess");
-        if let Some(sess) = s.sessions.get_mut(&pid) {
+        if let Some(sess) = s.sessions.get_mut("away-sess") {
             sess.mode = coach_core::state::CoachMode::Away;
         }
     }
@@ -346,8 +335,7 @@ async fn stop_blocks_then_allows_on_cooldown() {
         let mut s = state.write().await;
         // This test exercises the rules/cooldown stop path, so force Rules mode.
         s.coach_mode = coach_core::settings::EngineMode::Rules;
-        let pid = fake_pid_for_sid("stop-sess");
-        if let Some(sess) = s.sessions.get_mut(&pid) {
+        if let Some(sess) = s.sessions.get_mut("stop-sess") {
             sess.mode = coach_core::state::CoachMode::Away;
         }
     }
@@ -393,81 +381,35 @@ async fn stop_blocks_then_allows_on_cooldown() {
 
 // ── /clear handling: same window, new conversation ────────────────────
 
-/// The big regression test: a /clear in a Claude Code window must NOT
-/// produce a duplicate row. Same fake PID, new session_id → existing
-/// session is replaced (counters reset, conversation id swapped) instead
-/// of a second session being created.
+/// Regression: `/clear` produces a fresh session entry under the new
+/// session_id and drops the old entry when it arrives from the same
+/// PID. The hook transport provides the PID via the kernel resolver,
+/// so we exercise the path directly on CoachState (the resolver
+/// returns 0 on loopback inside a single-process test).
 #[tokio::test]
 async fn clear_replaces_session_in_same_window() {
-    let (base, state) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let mut coach = CoachState::from_settings(Settings::default());
+    let pid = 4242;
+    coach.apply_hook_event(pid, "before-clear", Some("/projects/coach"));
+    coach.sessions.get_mut("before-clear").unwrap().record_tool("Read");
+    coach.sessions.get_mut("before-clear").unwrap().record_tool("Bash");
 
-    // Two PostToolUse events for the original conversation.
-    for tool in ["Read", "Bash"] {
-        client
-            .post(format!("{base}/hook/post-tool-use"))
-            .json(&serde_json::json!({
-                "session_id": "before-clear",
-                "hook_event_name": "PostToolUse",
-                "tool_name": tool,
-                "cwd": "/projects/coach"
-            }))
-            .send()
-            .await
-            .unwrap();
-    }
+    // /clear: new session_id for the same PID.
+    coach.apply_hook_event(pid, "after-clear", Some("/projects/coach"));
 
-    // SessionStart fires immediately after /clear with the new conv id.
-    // Critical: in real Claude Code the source TCP port stays inside the
-    // same Claude Code process, so the resolver returns the same PID.
-    // Our fake resolver hashes session_id, so we need to spoof: instead
-    // of a new session_id giving a new fake PID (which would fail to
-    // simulate /clear), we directly inject the cache entry.
-    {
-        let mut s = state.write().await;
-        let pid = fake_pid_for_sid("before-clear");
-        s.session_id_to_pid.insert("after-clear".to_string(), pid);
-    }
-
-    client
-        .post(format!("{base}/hook/session-start"))
-        .json(&serde_json::json!({
-            "session_id": "after-clear",
-            "hook_event_name": "SessionStart",
-            "source": "clear",
-            "cwd": "/projects/coach"
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    // Session list still has exactly ONE entry, but it's now the new
-    // conversation with reset counters.
-    let snap: serde_json::Value = client
-        .get(format!("{base}/state"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let sessions = snap["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1, "no duplicate row after /clear");
-    assert_eq!(sessions[0]["session_id"], "after-clear");
-    // apply_hook_event resets counters; event_count stays 0 until record_tool.
-    assert_eq!(sessions[0]["event_count"], 0);
-    let tool_counts = sessions[0]["tool_counts"].as_object().unwrap();
-    assert!(tool_counts.is_empty(), "tool counts reset on /clear");
-    // PID is still the same window.
-    assert_eq!(sessions[0]["pid"], fake_pid_for_sid("before-clear"));
+    assert!(!coach.sessions.contains_key("before-clear"), "old entry evicted");
+    let sess = coach.sessions.get("after-clear").unwrap();
+    assert_eq!(sess.pid, pid, "pid carries over to the new conversation");
+    assert_eq!(sess.event_count, 0, "fresh entry starts at 0");
+    assert!(sess.tool_counts.is_empty());
 }
 
 // ── Scanner / hook integration ────────────────────────────────────────
 
 /// The scanner should populate one entry per live PID found in
 /// ~/.claude/sessions/. The launch-time sessionId in the file is
-/// ignored — sessions start with empty current_session_id until a hook
-/// fills it in.
+/// ignored — sessions start with empty session_id until a hook fills
+/// it in.
 #[tokio::test]
 async fn scanner_discovers_real_sessions() {
     let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
@@ -479,8 +421,7 @@ async fn scanner_discovers_real_sessions() {
 
     for file in &live_files {
         let sess = coach
-            .sessions
-            .get(&file.pid)
+            .session_for_pid(file.pid)
             .unwrap_or_else(|| panic!("PID {} from session file should be in state", file.pid));
         assert_eq!(sess.pid, file.pid);
         // Sessions are bootstrapped from their JSONL, so event_count may be > 0.
@@ -488,45 +429,30 @@ async fn scanner_discovers_real_sessions() {
     }
 }
 
-/// A hook event arriving for a scanner-discovered PID should adopt the
-/// conversation id without resetting started_at — the scanner already
-/// populated it from the file.
+/// A hook arriving for a scanner-discovered PID adopts the placeholder
+/// without resetting started_at — the scanner already populated it
+/// from the file. The placeholder is rekeyed from its sentinel key
+/// under the real conversation id.
 #[tokio::test]
 async fn hook_adopts_scanner_discovered_pid() {
-    let (base, state) = start_test_server().await;
-
-    // Simulate scanner discovering a process. Use the hash for the
-    // hook session_id we're about to send so the resolver lines up.
-    let sid = "adopt-me";
-    let scanner_pid = fake_pid_for_sid(sid);
+    let mut coach = CoachState::from_settings(Settings::default());
+    let pid = 7777;
     let scanner_started = chrono::Utc::now() - chrono::Duration::hours(1);
-    {
-        let mut coach = state.write().await;
-        coach.register_discovered_pid(scanner_pid, Some("/tmp/project"), scanner_started);
-    }
+    coach.register_discovered_pid(pid, Some("/tmp/project"), scanner_started);
+    assert!(coach.session_for_pid(pid).is_some());
+    assert!(!coach.sessions.contains_key("adopt-me"));
 
-    // Hook event arrives.
-    let client = reqwest::Client::new();
-    client
-        .post(format!("{base}/hook/post-tool-use"))
-        .json(&serde_json::json!({
-            "session_id": sid,
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Read",
-            "cwd": "/tmp/project"
-        }))
-        .send()
-        .await
-        .unwrap();
+    coach.apply_hook_event(pid, "adopt-me", Some("/tmp/project"));
 
-    let coach = state.read().await;
-    let sess = coach.sessions.get(&scanner_pid).unwrap();
-    assert_eq!(sess.current_session_id, sid);
-    assert_eq!(sess.event_count, 1);
+    let sess = coach.sessions.get("adopt-me").unwrap();
+    assert_eq!(sess.pid, pid);
+    assert_eq!(sess.session_id, "adopt-me");
     assert_eq!(
         sess.started_at, scanner_started,
         "scanner started_at must survive the first hook"
     );
+    // No other entries for this pid.
+    assert_eq!(coach.sessions.values().filter(|s| s.pid == pid).count(), 1);
 }
 
 // ── Outdated models rule ────────────────────────────────────────────────
@@ -707,8 +633,7 @@ async fn all_hook_responses_conform_to_claude_code_schema() {
     {
         let mut s = state.write().await;
         s.default_mode = coach_core::state::CoachMode::Away;
-        let pid = fake_pid_for_sid("schema-present");
-        if let Some(sess) = s.sessions.get_mut(&pid) {
+        if let Some(sess) = s.sessions.get_mut("schema-present") {
             sess.mode = coach_core::state::CoachMode::Away;
         }
     }
@@ -830,8 +755,7 @@ async fn stop_in_llm_mode_falls_back_to_fixed_when_no_key() {
     put_in_llm_mode_no_key(&state).await;
     {
         let mut s = state.write().await;
-        let pid = fake_pid_for_sid("llm-fallback");
-        if let Some(sess) = s.sessions.get_mut(&pid) {
+        if let Some(sess) = s.sessions.get_mut("llm-fallback") {
             sess.mode = coach_core::state::CoachMode::Away;
         }
     }
@@ -878,11 +802,10 @@ async fn observer_fires_in_llm_mode_and_records_failure() {
         .unwrap();
     assert_eq!(resp.status(), 200, "hook must respond immediately");
 
-    let pid = fake_pid_for_sid("obs-fires");
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         let s = state.read().await;
-        if let Some(sess) = s.sessions.get(&pid) {
+        if let Some(sess) = s.sessions.get("obs-fires") {
             if sess.activity.iter().any(|a| a.hook_event == "Observer") {
                 let observer_entry = sess
                     .activity
@@ -937,8 +860,7 @@ async fn observer_does_not_fire_in_rules_mode() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let s = state.read().await;
-    let pid = fake_pid_for_sid("rules-only");
-    let sess = s.sessions.get(&pid).expect("session should exist");
+    let sess = s.sessions.get("rules-only").expect("session should exist");
     let observer_entries: Vec<_> = sess
         .activity
         .iter()
@@ -985,8 +907,7 @@ async fn observer_does_not_fire_for_non_capable_provider() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let s = state.read().await;
-    let pid = fake_pid_for_sid("openrouter-llm");
-    let sess = s.sessions.get(&pid).expect("session should exist");
+    let sess = s.sessions.get("openrouter-llm").expect("session should exist");
     assert!(
         sess.activity.iter().all(|a| a.hook_event != "Observer"),
         "non-capable provider must not spawn observer"
@@ -1286,9 +1207,8 @@ async fn user_prompt_submit_records_activity() {
     assert_eq!(activity[0]["action"], "user spoke");
     assert_eq!(activity[0]["detail"], "make the sessions stop jumping around");
 
-    let pid = fake_pid_for_sid("talk-1");
     let guard = state.read().await;
-    let session = guard.sessions.get(&pid).expect("session should exist in state");
+    let session = guard.sessions.get("talk-1").expect("session should exist in state");
     assert_eq!(
         session.coach.memory.last_user_prompt.as_deref(),
         Some("make the sessions stop jumping around")
@@ -1378,7 +1298,7 @@ async fn api_set_all_sessions_mode_flips_every_session() {
 }
 
 #[tokio::test]
-async fn api_set_session_mode_targets_one_pid() {
+async fn api_set_session_mode_targets_one_session() {
     let (base, state) = start_test_server().await;
     let client = reqwest::Client::new();
 
@@ -1395,11 +1315,8 @@ async fn api_set_session_mode_targets_one_pid() {
             .unwrap();
     }
 
-    let alpha_pid = fake_pid_for_sid("alpha");
-    let beta_pid = fake_pid_for_sid("beta");
-
     let resp = client
-        .post(format!("{base}/api/sessions/{alpha_pid}/mode"))
+        .post(format!("{base}/api/sessions/alpha/mode"))
         .json(&serde_json::json!({ "mode": "away" }))
         .send()
         .await
@@ -1408,28 +1325,28 @@ async fn api_set_session_mode_targets_one_pid() {
 
     let s = state.read().await;
     assert_eq!(
-        s.sessions.get(&alpha_pid).unwrap().mode,
+        s.sessions.get("alpha").unwrap().mode,
         coach_core::state::CoachMode::Away
     );
     assert_eq!(
-        s.sessions.get(&beta_pid).unwrap().mode,
+        s.sessions.get("beta").unwrap().mode,
         coach_core::state::CoachMode::Present,
-        "beta must NOT be touched by a per-pid POST to alpha"
+        "beta must NOT be touched by a per-session POST to alpha"
     );
 }
 
 #[tokio::test]
-async fn api_set_session_mode_404_for_unknown_pid() {
+async fn api_set_session_mode_404_for_unknown_session() {
     let (base, _state) = start_test_server().await;
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{base}/api/sessions/999999/mode"))
+        .post(format!("{base}/api/sessions/nope-xyz/mode"))
         .json(&serde_json::json!({ "mode": "away" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404, "unknown pid must yield 404, not silent no-op");
+    assert_eq!(resp.status(), 404, "unknown session must yield 404, not silent no-op");
 }
 
 #[tokio::test]
@@ -1561,260 +1478,48 @@ async fn user_prompt_submit_truncates_long_prompts() {
     // 200 x's plus the ellipsis character.
     assert_eq!(detail.chars().count(), 201);
 
-    let pid = fake_pid_for_sid("longwinded");
     let guard = state.read().await;
-    let session = guard.sessions.get(&pid).expect("session should exist in state");
+    let session = guard.sessions.get("longwinded").expect("session should exist in state");
     assert_eq!(
         session.coach.memory.last_user_prompt.as_deref(),
         Some(long_prompt.as_str())
     );
 }
 
-// ── Command-hook ghost session bug ─────────────────────────────────────
+// ── Nested Claude and command-hook routing ────────────────────────────
 //
-// With command-type hooks the TCP peer is curl/sh, not Claude Code.
-// resolve_peer_pid returns curl's PID, which differs from the scanner-
-// discovered Claude Code PID. This created a ghost session for curl
-// while the real session got no activity.
+// Before the session_id rekey, hooks from a nested `claude -p` child
+// could land on the parent's entry because everything was keyed by PID
+// and the parent-walk resolver would climb the process tree. After the
+// rekey, session identity comes from the hook payload's session_id —
+// the parent and nested child carry different session_ids, so they
+// naturally get separate entries. These tests lock in that property
+// against the CoachState directly (the transport PID is metadata).
 
-/// Reproduce the ghost-session bug: scanner discovers Claude Code PID,
-/// then a hook arrives from a different PID (simulating curl in the
-/// command-hook shim). Activity must land on the scanner session.
 #[tokio::test]
-async fn command_hook_updates_scanner_session_not_ghost() {
-    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
-    let claude_pid: u32 = 100;
-    let curl_pid: u32 = 200;
+async fn nested_claude_sessions_do_not_collide() {
+    let mut coach = CoachState::from_settings(Settings::default());
+    let parent_pid = 1000;
+    let nested_pid = 2000;
 
-    // Scanner discovers Claude Code before any hooks arrive.
-    state
-        .write()
-        .await
-        .register_discovered_pid(claude_pid, Some("/projects"), chrono::Utc::now());
+    coach.apply_hook_event(parent_pid, "parent-sid", Some("/home/me/work"));
+    coach.sessions.get_mut("parent-sid").unwrap().record_tool("Bash");
+    coach.sessions.get_mut("parent-sid").unwrap().coach.memory.chain =
+        coach_core::state::CoachChain::ServerId { id: "resp_established".into() };
 
-    // Resolver returns curl's PID; parent walk maps curl → Claude Code.
-    let resolver: coach_core::server::PidResolver =
-        Arc::new(move |_peer_port, _sid| Some(curl_pid));
-    let parent_fn: coach_core::server::ParentPidFn = Arc::new(move |pid| {
-        if pid == curl_pid { Some(claude_pid) } else { None }
-    });
-    let router = coach_core::server::create_router_headless_with_parent(
-        state.clone(),
-        resolver,
-        parent_fn,
-    );
+    // Nested Claude fires a hook — different session_id, different pid.
+    coach.apply_hook_event(nested_pid, "nested-sid", Some("/tmp/sandbox"));
+    coach.sessions.get_mut("nested-sid").unwrap().record_tool("Read");
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-
-    // Send a UserPromptSubmit hook (the path the user reported).
-    client
-        .post(format!("{base}/hook/user-prompt-submit"))
-        .json(&serde_json::json!({
-            "session_id": "conv-1",
-            "prompt": "hello",
-            "cwd": "/projects"
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    let s = state.read().await;
-    assert_eq!(
-        s.sessions[&claude_pid].current_session_id, "conv-1",
-        "scanner session should receive the hook event"
-    );
-    assert!(
-        !s.sessions.contains_key(&curl_pid),
-        "no ghost session should be created for curl's PID"
-    );
-}
-
-// ── Nested-claude parent walk ─────────────────────────────────────────
-//
-// When a user runs `claude -p` from inside an already-running Claude
-// Code session (e.g. via a Bash tool call), the spawned child's hook
-// curl is a process descendant of the parent claude. The previous
-// parent walk climbed straight up to the parent's PID and stomped its
-// conversation via `apply_hook_event`'s `/clear` branch. The fix is
-// twofold: (1) unknown Claude-looking ancestors short-circuit the walk,
-// and (2) a known ancestor is only returned when its current
-// session_id is empty or matches the incoming sid.
-
-/// Regression: a hook from a spawned Claude must not touch the parent
-/// Claude's established session. Models the real process tree:
-///   curl → shim sh → spawned_claude → bash → parent_claude
-#[tokio::test]
-async fn nested_claude_hook_does_not_stomp_parent_session() {
-    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
-    let parent_claude_pid: u32 = 1000;
-    let bash_pid: u32 = 1500;
-    let spawned_claude_pid: u32 = 2000;
-    let shim_pid: u32 = 2500;
-    let curl_pid: u32 = 3000;
-
-    // Seed an established session for the parent Claude.
-    {
-        let mut s = state.write().await;
-        s.register_discovered_pid(
-            parent_claude_pid,
-            Some("/home/me/work"),
-            chrono::Utc::now(),
-        );
-        s.apply_hook_event(parent_claude_pid, "parent-sid", Some("/home/me/work"));
-        let sess = s.sessions.get_mut(&parent_claude_pid).unwrap();
-        sess.record_tool("Bash");
-        sess.coach.memory.chain = coach_core::state::CoachChain::ServerId {
-            id: "resp_established".into(),
-        };
-    }
-
-    let resolver: coach_core::server::PidResolver =
-        Arc::new(move |_peer_port, _sid| Some(curl_pid));
-    let parent_fn: coach_core::server::ParentPidFn = Arc::new(move |pid| match pid {
-        p if p == curl_pid => Some(shim_pid),
-        p if p == shim_pid => Some(spawned_claude_pid),
-        p if p == spawned_claude_pid => Some(bash_pid),
-        p if p == bash_pid => Some(parent_claude_pid),
-        _ => None,
-    });
-    // Only the two claude pids "look like" Claude Code.
-    let is_claude_fn: coach_core::server::IsClaudeFn =
-        Arc::new(move |pid| pid == spawned_claude_pid || pid == parent_claude_pid);
-
-    let router = coach_core::server::create_router_headless_with_ancestry(
-        state.clone(),
-        resolver,
-        parent_fn,
-        is_claude_fn,
-    );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-
-    client
-        .post(format!("{base}/hook/post-tool-use"))
-        .json(&serde_json::json!({
-            "session_id": "spawned-sid",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Read",
-            "cwd": "/tmp/sandbox",
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    let s = state.read().await;
-
-    // Parent session must still be intact — nothing got stomped.
-    let parent = s.sessions.get(&parent_claude_pid).expect("parent persists");
-    assert_eq!(parent.current_session_id, "parent-sid");
+    let parent = coach.sessions.get("parent-sid").expect("parent persists");
     assert_eq!(parent.tool_counts.get("Bash"), Some(&1));
-    assert!(
-        matches!(
-            &parent.coach.memory.chain,
-            coach_core::state::CoachChain::ServerId { id } if id == "resp_established"
-        ),
-        "parent chain must survive the nested hook"
-    );
+    assert!(matches!(
+        &parent.coach.memory.chain,
+        coach_core::state::CoachChain::ServerId { id } if id == "resp_established"
+    ));
 
-    // The spawned session is registered under its own PID — the
-    // unknown Claude-looking ancestor the walk short-circuits on.
-    let spawned = s
-        .sessions
-        .get(&spawned_claude_pid)
-        .expect("spawned session must be tracked on its own pid");
-    assert_eq!(spawned.current_session_id, "spawned-sid");
-    assert_eq!(spawned.tool_counts.get("Read"), Some(&1));
-}
-
-/// Follow-up: once a spawned session is registered, subsequent hooks
-/// from it should land on the same pid, not bounce back to the parent.
-/// This is the `compatible(known, pid, sid)` branch of the walk.
-#[tokio::test]
-async fn nested_claude_second_hook_lands_on_same_pid() {
-    let state = Arc::new(RwLock::new(CoachState::from_settings(Settings::default())));
-    let parent_claude_pid: u32 = 1000;
-    let spawned_claude_pid: u32 = 2000;
-    let curl_pid: u32 = 3000;
-
-    {
-        let mut s = state.write().await;
-        s.register_discovered_pid(parent_claude_pid, Some("/p"), chrono::Utc::now());
-        s.apply_hook_event(parent_claude_pid, "parent-sid", Some("/p"));
-    }
-
-    let resolver: coach_core::server::PidResolver =
-        Arc::new(move |_peer_port, _sid| Some(curl_pid));
-    let parent_fn: coach_core::server::ParentPidFn = Arc::new(move |pid| match pid {
-        p if p == curl_pid => Some(spawned_claude_pid),
-        p if p == spawned_claude_pid => Some(parent_claude_pid),
-        _ => None,
-    });
-    let is_claude_fn: coach_core::server::IsClaudeFn =
-        Arc::new(move |pid| pid == spawned_claude_pid || pid == parent_claude_pid);
-
-    let router = coach_core::server::create_router_headless_with_ancestry(
-        state.clone(),
-        resolver,
-        parent_fn,
-        is_claude_fn,
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-
-    for _ in 0..3 {
-        client
-            .post(format!("{base}/hook/post-tool-use"))
-            .json(&serde_json::json!({
-                "session_id": "spawned-sid",
-                "hook_event_name": "PostToolUse",
-                "tool_name": "Read",
-                "cwd": "/tmp/sandbox",
-            }))
-            .send()
-            .await
-            .unwrap();
-    }
-
-    let s = state.read().await;
-    let spawned = s.sessions.get(&spawned_claude_pid).unwrap();
-    assert_eq!(spawned.tool_counts.get("Read"), Some(&3));
-    assert_eq!(spawned.current_session_id, "spawned-sid");
-    let parent = s.sessions.get(&parent_claude_pid).unwrap();
-    assert_eq!(parent.current_session_id, "parent-sid");
-    assert!(
-        parent.tool_counts.is_empty(),
-        "parent must not have inherited the spawned session's Read tool"
-    );
+    let nested = coach.sessions.get("nested-sid").expect("nested tracked");
+    assert_eq!(nested.pid, nested_pid);
+    assert_eq!(nested.tool_counts.get("Read"), Some(&1));
+    assert_eq!(coach.sessions.len(), 2);
 }

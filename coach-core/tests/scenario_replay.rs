@@ -11,7 +11,6 @@
 /// Real coach scenarios:
 ///     cargo test -p coach --test scenario_replay -- --ignored --nocapture
 
-use coach_core::server::fake_pid_for_sid;
 use coach_core::settings::{EngineMode, ModelConfig, Settings};
 use coach_core::state::{CoachMode, CoachState, CoachUsage, MockSessionSend};
 use serde_json::{json, Value};
@@ -59,10 +58,7 @@ impl Harness {
     }
 
     async fn boot(state: Arc<RwLock<CoachState>>) -> Self {
-        let router = coach_core::server::create_router_headless(
-            state.clone(),
-            coach_core::server::fake_resolver_from_sid(),
-        );
+        let router = coach_core::server::create_router_headless(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -95,21 +91,19 @@ impl Harness {
     }
 
     async fn set_away(&self, sid: &str) {
-        let pid = fake_pid_for_sid(sid);
         let mut s = self.state.write().await;
-        if let Some(sess) = s.sessions.get_mut(&pid) {
+        if let Some(sess) = s.sessions.get_mut(sid) {
             sess.mode = CoachMode::Away;
         }
     }
 
     /// Wait for N observer entries, return how many actually appeared.
     async fn wait_observers(&self, sid: &str, n: usize, timeout_ms: u64) -> usize {
-        let pid = fake_pid_for_sid(sid);
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
         loop {
             let count = {
                 let s = self.state.read().await;
-                s.sessions.get(&pid)
+                s.sessions.get(sid)
                     .map(|sess| sess.activity.iter().filter(|a| a.hook_event == "Observer").count())
                     .unwrap_or(0)
             };
@@ -120,9 +114,8 @@ impl Harness {
     }
 
     async fn dump(&self, sid: &str) {
-        let pid = fake_pid_for_sid(sid);
         let s = self.state.read().await;
-        let sess = s.sessions.get(&pid).expect("session should exist");
+        let sess = s.sessions.get(sid).expect("session should exist");
         eprintln!("\n── {sid} ──");
         if let Some(ref t) = sess.coach.memory.session_title { eprintln!("  title: {t}"); }
         eprintln!("  events: {}  coach_calls: {}  errors: {}", sess.event_count, sess.coach.telemetry.calls, sess.coach.telemetry.errors);

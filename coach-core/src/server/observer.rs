@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::coach::{LlmCoach, NameSessionInput, ObserveToolUseInput};
-use crate::state::SharedState;
+use crate::state::{SessionId, SharedState};
 use crate::EventEmitter;
 
 /// Sequential observer consumer for one session. Reads chain from
@@ -11,21 +11,16 @@ use crate::EventEmitter;
 pub(crate) async fn observer_consumer(
     coach: SharedState,
     emitter: Arc<dyn EventEmitter>,
-    pid: u32,
+    session_id: SessionId,
     mut rx: tokio::sync::mpsc::Receiver<crate::state::ObserverQueueItem>,
 ) {
     let llm_coach = LlmCoach::new(coach.clone());
     while let Some(item) = rx.recv().await {
-        // Read the current chain and session_id — chain includes all
-        // previous observations; session_id routes JSONL logging.
-        let (chain, session_id) = {
+        let chain = {
             let s = coach.read().await;
-            s.sessions.get(&pid)
-                .map(|sess| {
-                    let sid = sess.current_session_id.clone();
-                    let sid = if sid.is_empty() { None } else { Some(sid) };
-                    (sess.coach.memory.chain.clone(), sid)
-                })
+            s.sessions
+                .get(&session_id)
+                .map(|sess| sess.coach.memory.chain.clone())
                 .unwrap_or_default()
         };
 
@@ -37,7 +32,7 @@ pub(crate) async fn observer_consumer(
                 tool_name: item.tool_name,
                 tool_input: item.tool_input,
                 user_prompt: item.user_prompt,
-                session_id,
+                session_id: Some(session_id.clone()),
             })
             .await
         {
@@ -45,7 +40,7 @@ pub(crate) async fn observer_consumer(
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let (assessment, intervention) = parse_intervention(&result.assessment);
                 crate::state::mutate(&coach, &emitter, |s| {
-                    if let Some(sess) = s.sessions.get_mut(&pid) {
+                    if let Some(sess) = s.sessions.get_mut(&session_id) {
                         sess.coach.record_success(latency_ms, result.usage, Some(result.chain));
                         sess.coach.memory.last_assessment = Some(assessment.clone());
                         sess.coach.memory.last_system_prompt = Some(result.system_prompt);
@@ -55,9 +50,9 @@ pub(crate) async fn observer_consumer(
                             sess.coach.telemetry.intervention_count += 1;
                         }
                     }
-                    s.log(pid, "Observer", "noted", Some(assessment));
+                    s.log(&session_id, "Observer", "noted", Some(assessment));
                     if let Some(ref msg) = intervention {
-                        s.log(pid, "Observer", "intervention pending", Some(msg.clone()));
+                        s.log(&session_id, "Observer", "intervention pending", Some(msg.clone()));
                     }
                 })
                 .await;
@@ -65,10 +60,10 @@ pub(crate) async fn observer_consumer(
             Err(e) => {
                 eprintln!("[coach] observer call failed: {e}");
                 crate::state::mutate(&coach, &emitter, |s| {
-                    if let Some(sess) = s.sessions.get_mut(&pid) {
+                    if let Some(sess) = s.sessions.get_mut(&session_id) {
                         sess.coach.record_error(&e);
                     }
-                    s.log(pid, "Observer", "error", Some(e));
+                    s.log(&session_id, "Observer", "error", Some(e));
                 })
                 .await;
             }
@@ -93,30 +88,30 @@ pub(crate) fn parse_intervention(text: &str) -> (String, Option<String>) {
 pub(crate) async fn run_session_namer(
     coach: SharedState,
     emitter: Arc<dyn EventEmitter>,
-    pid: u32,
+    session_id: SessionId,
     input: NameSessionInput,
 ) {
     let llm_coach = LlmCoach::new(coach.clone());
     match llm_coach.name_session(input).await {
         Ok(result) => {
             crate::state::mutate(&coach, &emitter, |s| {
-                if let Some(sess) = s.sessions.get_mut(&pid) {
+                if let Some(sess) = s.sessions.get_mut(&session_id) {
                     // Namer doesn't update the chain — pass 0 latency since
                     // it's a stateless call and latency isn't worth tracking.
                     sess.coach.record_success(0, result.usage, None);
                     sess.coach.memory.session_title = Some(result.title.clone());
                 }
-                s.log(pid, "Namer", "renamed", Some(result.title));
+                s.log(&session_id, "Namer", "renamed", Some(result.title));
             })
             .await;
         }
         Err(e) => {
             eprintln!("[coach] name_session failed: {e}");
             crate::state::mutate(&coach, &emitter, |s| {
-                if let Some(sess) = s.sessions.get_mut(&pid) {
+                if let Some(sess) = s.sessions.get_mut(&session_id) {
                     sess.coach.record_error(&e);
                 }
-                s.log(pid, "Namer", "error", Some(e));
+                s.log(&session_id, "Namer", "error", Some(e));
             })
             .await;
         }

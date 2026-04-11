@@ -142,10 +142,9 @@ fn should_request_title(event_count: usize) -> bool {
         || (event_count > TITLE_FIRST_EVENT && event_count.is_multiple_of(TITLE_INTERVAL_EVENTS))
 }
 
-/// Adopt the session for `pid` and tag it with the source's client.
-/// Runs inside an existing `state::mutate` closure — setting the client
-/// here (instead of via a second `mark_client` mutate after the event)
-/// means the snapshot goes out once with the right icon, no flicker.
+/// Adopt the session for `session_id` and tag it with the source's
+/// client. Runs inside an existing `state::mutate` closure so the
+/// snapshot goes out once with the right icon — no flicker.
 fn adopt<'a>(
     coach: &'a mut CoachState,
     pid: u32,
@@ -158,8 +157,9 @@ fn adopt<'a>(
     sess
 }
 
-/// `SessionStart` — log it and move on. `apply_hook_event` takes care of
-/// the `/clear` reset if the session_id changed in the same window.
+/// `SessionStart` — log it and move on. `apply_hook_event` takes care
+/// of evicting the previous conversation's entry if `/clear` happened
+/// in the same window.
 async fn on_session_started(
     state: &AppState,
     pid: u32,
@@ -170,7 +170,7 @@ async fn on_session_started(
 ) -> Json<Value> {
     crate::state::mutate(&state.coach, &state.emitter, |coach| {
         adopt(coach, pid, &session_id, cwd.as_deref(), source);
-        coach.log(pid, "SessionStart", &source_label, None);
+        coach.log(&session_id, "SessionStart", &source_label, None);
     })
     .await;
     passthrough()
@@ -199,7 +199,7 @@ async fn on_user_prompt_submitted(
     crate::state::mutate(&state.coach, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.coach.memory.last_user_prompt = prompt;
-        coach.log(pid, "UserPromptSubmit", "user spoke", detail);
+        coach.log(&session_id, "UserPromptSubmit", "user spoke", detail);
     })
     .await;
     passthrough()
@@ -224,7 +224,7 @@ async fn on_permission_requested(
         } else {
             "passed through"
         };
-        coach.log(pid, "PermissionRequest", action, Some(tool_name));
+        coach.log(&session_id, "PermissionRequest", action, Some(tool_name));
         mode
     })
     .await;
@@ -255,7 +255,7 @@ async fn on_tool_starting(
     crate::state::mutate(&state.coach, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.record_agent_start();
-        coach.log(pid, "PreToolUse", "agent starting", None);
+        coach.log(&session_id, "PreToolUse", "agent starting", None);
     })
     .await;
     passthrough()
@@ -288,19 +288,19 @@ async fn on_tool_completed(
 
             if let Some(ref msg) = rule_message {
                 coach.log(
-                    pid,
+                    &session_id,
                     "PostToolUse",
                     "rule triggered",
                     Some(format!("{}: {}", tool_name, msg)),
                 );
             } else {
-                coach.log(pid, "PostToolUse", "observed", Some(tool_name.clone()));
+                coach.log(&session_id, "PostToolUse", "observed", Some(tool_name.clone()));
             }
 
             let (pending, muted) = {
                 let sess = coach
                     .sessions
-                    .get_mut(&pid)
+                    .get_mut(&session_id)
                     .expect("apply_hook_event populated");
                 (
                     sess.coach.memory.pending_intervention.take(),
@@ -309,11 +309,11 @@ async fn on_tool_completed(
             };
             let intervention_to_deliver = match pending {
                 Some(msg) if !muted => {
-                    coach.log(pid, "Intervention", "delivered", Some(msg.clone()));
+                    coach.log(&session_id, "Intervention", "delivered", Some(msg.clone()));
                     Some(msg)
                 }
                 Some(msg) => {
-                    coach.log(pid, "Intervention", "muted", Some(msg));
+                    coach.log(&session_id, "Intervention", "muted", Some(msg));
                     None
                 }
                 None => None,
@@ -327,7 +327,7 @@ async fn on_tool_completed(
                 let priorities = coach.priorities.clone();
                 let sess = coach
                     .sessions
-                    .get_mut(&pid)
+                    .get_mut(&session_id)
                     .expect("apply_hook_event populated");
                 if sess.coach.observer_tx.is_none() {
                     let (tx, rx) = tokio::sync::mpsc::channel(
@@ -336,8 +336,9 @@ async fn on_tool_completed(
                     sess.coach.observer_tx = Some(tx);
                     let coach_state = state.coach.clone();
                     let emitter = state.emitter.clone();
+                    let sid_for_task = session_id.clone();
                     sess.coach.observer_task = Some(tokio::spawn(async move {
-                        observer::observer_consumer(coach_state, emitter, pid, rx).await;
+                        observer::observer_consumer(coach_state, emitter, sid_for_task, rx).await;
                     }));
                 }
                 let item = crate::state::ObserverQueueItem {
@@ -351,7 +352,7 @@ async fn on_tool_completed(
                 {
                     sess.coach.observer_dropped += 1;
                     eprintln!(
-                        "[coach] observer queue full (pid={pid}, dropped={})",
+                        "[coach] observer queue full (sid={session_id}, dropped={})",
                         sess.coach.observer_dropped
                     );
                 }
@@ -360,15 +361,14 @@ async fn on_tool_completed(
             let namer_input = if llm_active && should_request_title(event_count) {
                 let sess = coach
                     .sessions
-                    .get(&pid)
+                    .get(&session_id)
                     .expect("apply_hook_event populated");
-                let sid = sess.current_session_id.clone();
                 Some(NameSessionInput {
                     priorities: coach.priorities.clone(),
                     cwd: sess.cwd.clone(),
                     tool_counts: sess.tool_counts.clone(),
                     last_assessment: sess.coach.memory.last_assessment.clone(),
-                    session_id: if sid.is_empty() { None } else { Some(sid) },
+                    session_id: Some(session_id.clone()),
                 })
             } else {
                 None
@@ -381,8 +381,9 @@ async fn on_tool_completed(
     if let Some(input) = namer_input {
         let coach_state = state.coach.clone();
         let emitter = state.emitter.clone();
+        let sid = session_id.clone();
         tokio::spawn(async move {
-            observer::run_session_namer(coach_state, emitter, pid, input).await;
+            observer::run_session_namer(coach_state, emitter, sid, input).await;
         });
     }
 
@@ -435,12 +436,11 @@ async fn on_stop_requested(
         sess.stop_count += 1;
 
         if sess.mode != CoachMode::Away {
-            coach.log(pid, "Stop", "passed through", None);
+            coach.log(&session_id, "Stop", "passed through", None);
             return Phase1::PassThrough;
         }
 
         let prev_chain = sess.coach.memory.chain.clone();
-        let session_id_owned = sess.current_session_id.clone();
         let ctx = StopContext {
             priorities,
             cwd: sess.cwd.clone(),
@@ -448,11 +448,7 @@ async fn on_stop_requested(
             stop_count: sess.stop_count,
             stop_blocked_count: sess.stop_blocked_count,
             stop_reason,
-            session_id: if session_id_owned.is_empty() {
-                None
-            } else {
-                Some(session_id_owned)
-            },
+            session_id: Some(session_id.clone()),
         };
         Phase1::Evaluate {
             coach_mode,
@@ -502,11 +498,11 @@ async fn on_stop_requested(
             Ok((decision, new_chain, usage)) if decision.allow => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 crate::state::mutate(&state.coach, &state.emitter, |coach| {
-                    if let Some(s) = coach.sessions.get_mut(&pid) {
+                    if let Some(s) = coach.sessions.get_mut(&session_id) {
                         let u = usage.unwrap_or_default();
                         s.coach.record_success(latency_ms, u, new_chain);
                     }
-                    coach.log(pid, "Stop", "allowed (LLM)", None);
+                    coach.log(&session_id, "Stop", "allowed (LLM)", None);
                 })
                 .await;
                 return passthrough();
@@ -518,13 +514,13 @@ async fn on_stop_requested(
                         .message
                         .filter(|m| !m.trim().is_empty())
                         .unwrap_or_else(|| crate::state::away_message(&coach.priorities));
-                    if let Some(s) = coach.sessions.get_mut(&pid) {
+                    if let Some(s) = coach.sessions.get_mut(&session_id) {
                         s.last_stop_blocked = Some(std::time::Instant::now());
                         s.stop_blocked_count += 1;
                         let u = usage.unwrap_or_default();
                         s.coach.record_success(latency_ms, u, new_chain);
                     }
-                    coach.log(pid, "Stop", "blocked (LLM)", Some(message.clone()));
+                    coach.log(&session_id, "Stop", "blocked (LLM)", Some(message.clone()));
                     message
                 })
                 .await;
@@ -536,7 +532,7 @@ async fn on_stop_requested(
             Err(e) => {
                 eprintln!("[coach] LLM evaluate_stop failed, falling back: {e}");
                 crate::state::mutate(&state.coach, &state.emitter, |coach| {
-                    if let Some(s) = coach.sessions.get_mut(&pid) {
+                    if let Some(s) = coach.sessions.get_mut(&session_id) {
                         s.coach.record_error(&e);
                     }
                 })
@@ -552,21 +548,21 @@ async fn on_stop_requested(
     let phase3 = crate::state::mutate(&state.coach, &state.emitter, |coach| {
         let on_cooldown = coach
             .sessions
-            .get(&pid)
+            .get(&session_id)
             .and_then(|s| s.last_stop_blocked)
             .is_some_and(|last| last.elapsed() < STOP_COOLDOWN);
 
         if on_cooldown {
-            coach.log(pid, "Stop", "allowed (cooldown)", None);
+            coach.log(&session_id, "Stop", "allowed (cooldown)", None);
             return Phase3::Cooldown;
         }
 
-        if let Some(s) = coach.sessions.get_mut(&pid) {
+        if let Some(s) = coach.sessions.get_mut(&session_id) {
             s.last_stop_blocked = Some(std::time::Instant::now());
             s.stop_blocked_count += 1;
         }
         let message = crate::state::away_message(&coach.priorities);
-        coach.log(pid, "Stop", "blocked — user away", Some(message.clone()));
+        coach.log(&session_id, "Stop", "blocked — user away", Some(message.clone()));
         Phase3::Blocked(message)
     })
     .await;

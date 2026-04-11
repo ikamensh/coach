@@ -19,6 +19,23 @@ use snapshot::{derive_display_name, SESSION_ACTIVITY_CAP};
 #[cfg(test)]
 use snapshot::{activity_bucket, SESSION_ACTIVE_WINDOW_SECS};
 
+/// Stable conversation identifier emitted by the coding agent (Claude
+/// Code, Cursor, Codex). A session lives for the duration of one
+/// conversation — `/clear` mints a new one. This is the key the
+/// `CoachState.sessions` map is indexed by; the OS PID is metadata.
+pub type SessionId = String;
+
+/// Key scanner-discovered placeholders under a sentinel prefix + pid
+/// so multiple windows can live side-by-side before any hook fires.
+/// The first hook rekeys the placeholder to the real session_id.
+pub(crate) fn placeholder_key(pid: u32) -> String {
+    format!("<pending:{pid}>")
+}
+
+fn is_placeholder_key(k: &str) -> bool {
+    k.starts_with("<pending:")
+}
+
 pub const EVENT_STATE_UPDATED: &str = "coach-state-updated";
 pub const EVENT_THEME_CHANGED: &str = "coach-theme-changed";
 
@@ -255,12 +272,13 @@ pub enum SessionClient {
     Codex,
 }
 
-/// Per-window state. The owning `CoachState.sessions` map is keyed by
-/// `pid` — `current_session_id` is just the label of the conversation
-/// currently running in that window.
+/// Per-conversation state. The owning `CoachState.sessions` map is
+/// keyed by `session_id`; `pid` is metadata used for display and
+/// scanner liveness checks. `/clear` mints a new `session_id`, so a
+/// window that has been cleared shows up as a fresh `SessionState`.
 pub struct SessionState {
+    pub session_id: SessionId,
     pub pid: u32,
-    pub current_session_id: String,
     pub mode: CoachMode,
     /// Launch directory for this window — set once on first observation
     /// (scanner or hook) and frozen. Claude Code may chdir during a
@@ -319,17 +337,13 @@ impl SessionState {
         self.active_agents = self.active_agents.saturating_sub(1);
     }
 
-    /// Reset conversation-scoped state. Called on `/clear`, stale bootstrap
-    /// discard, and session-id mismatch.
-    pub fn reset_conversation(&mut self) {
+    /// Discard the scanner bootstrap for this session — used when the
+    /// bootstrap loaded tools from a stale JSONL that doesn't match the
+    /// conversation this session actually represents.
+    pub fn discard_bootstrap(&mut self) {
         self.event_count = 0;
         self.tool_counts.clear();
         self.active_agents = 0;
-        self.stop_count = 0;
-        self.stop_blocked_count = 0;
-        self.last_stop_blocked = None;
-        self.coach.reset_conversation();
-        self.activity.clear();
         self.bootstrapped = false;
         self.bootstrapped_session_id = None;
     }
@@ -352,12 +366,11 @@ pub struct ObserverQueueItem {
 }
 
 pub struct CoachState {
-    /// Keyed by PID — one entry per Claude Code window.
-    pub sessions: HashMap<u32, SessionState>,
-    /// Cache: hook session_id → PID. Populated on the first hook of a
-    /// new conversation; lets later hooks for the same conversation skip
-    /// the lsof lookup. Cleared for any PID that dies.
-    pub session_id_to_pid: HashMap<String, u32>,
+    /// Keyed by session_id — one entry per live conversation. `/clear`
+    /// mints a new conversation and therefore a new entry; the old one
+    /// is evicted when the next hook arrives for the same PID under the
+    /// new session_id, or when the scanner notices the owning PID died.
+    pub sessions: HashMap<SessionId, SessionState>,
     pub priorities: Vec<String>,
     pub port: u16,
     pub theme: Theme,
@@ -433,7 +446,6 @@ impl CoachState {
     pub fn from_settings(settings: Settings) -> Self {
         Self {
             sessions: HashMap::new(),
-            session_id_to_pid: HashMap::new(),
             priorities: settings.priorities,
             port: settings.port,
             theme: settings.theme,
@@ -453,6 +465,27 @@ impl CoachState {
             #[cfg(feature = "pycoach")]
             pycoach: None,
         }
+    }
+
+    /// Reverse lookup: find any session owned by `pid`. The map is
+    /// small (single-digit sessions in practice), so a linear scan is
+    /// fine.
+    pub fn session_for_pid(&self, pid: u32) -> Option<&SessionState> {
+        self.sessions.values().find(|s| s.pid == pid)
+    }
+
+    pub fn session_for_pid_mut(&mut self, pid: u32) -> Option<&mut SessionState> {
+        self.sessions.values_mut().find(|s| s.pid == pid)
+    }
+
+    /// Map key for the session owned by `pid`, if any. Scanner
+    /// placeholders live under a sentinel key, so `session_id` alone
+    /// can't find them.
+    pub fn session_key_for_pid(&self, pid: u32) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .find(|(_, s)| s.pid == pid)
+            .map(|(k, _)| k.clone())
     }
 
     pub fn set_all_modes(&mut self, mode: CoachMode) {
@@ -506,14 +539,14 @@ impl CoachState {
         self.save();
     }
 
-    pub fn set_session_mode(&mut self, pid: u32, mode: CoachMode) {
-        if let Some(session) = self.sessions.get_mut(&pid) {
+    pub fn set_session_mode(&mut self, session_id: &str, mode: CoachMode) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
             session.mode = mode;
         }
     }
 
-    pub fn set_intervention_muted(&mut self, pid: u32, muted: bool) {
-        if let Some(session) = self.sessions.get_mut(&pid) {
+    pub fn set_intervention_muted(&mut self, session_id: &str, muted: bool) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
             session.coach.intervention_muted = muted;
         }
     }
@@ -547,12 +580,15 @@ impl CoachState {
         self.to_settings().save();
     }
 
-    /// Session lifecycle: create, adopt, or reset.
+    /// Session lifecycle: create, adopt scanner placeholder, or `/clear`.
     ///
-    /// 1. **No session for this PID yet** → create one.
-    /// 2. **PID has a session and `session_id` matches** → touch timestamps.
-    /// 3. **PID has a session under a different `session_id`** → `/clear`
-    ///    (or `/resume` / `/compact`): reset conversation-scoped state.
+    /// 1. **Entry exists under `session_id`** → touch timestamps.
+    /// 2. **Placeholder exists under the PID** (scanner beat the hook)
+    ///    → rekey it to `session_id`, discard bootstrap if it doesn't
+    ///    match.
+    /// 3. **Another entry exists under the PID with a different
+    ///    session_id** (`/clear`) → evict it and create fresh.
+    /// 4. **Nothing for this PID** → create a new entry.
     ///
     /// Does NOT increment event_count — callers record tool activity via
     /// `record_tool` / `record_agent_start` / `record_agent_end`, keeping
@@ -563,95 +599,94 @@ impl CoachState {
         session_id: &str,
         cwd: Option<&str>,
     ) -> &mut SessionState {
-        self.session_id_to_pid.insert(session_id.to_string(), pid);
-
-        let default_mode = self.default_mode;
         let now = Utc::now();
 
-        match self.sessions.get_mut(&pid) {
-            Some(sess) if sess.current_session_id == session_id => {
-                sess.last_event = Instant::now();
-                sess.last_event_time = now;
-                adopt_cwd_if_unset(sess, cwd);
-            }
-            Some(sess) if sess.current_session_id.is_empty() => {
-                // First hook for a scanner-discovered placeholder.
-                sess.current_session_id = session_id.to_string();
+        if let Some(sess) = self.sessions.get_mut(session_id) {
+            sess.pid = pid;
+            sess.last_event = Instant::now();
+            sess.last_event_time = now;
+            adopt_cwd_if_unset(sess, cwd);
+            return self.sessions.get_mut(session_id).expect("just touched");
+        }
+
+        // Any prior entry for this PID belongs to either a scanner
+        // placeholder (rekey into the real session_id) or a previous
+        // conversation in the same window (`/clear` → evict).
+        //
+        // PID 0 means the kernel resolver failed; treating it as a
+        // match would let unrelated sessions stomp each other.
+        let old_key: Option<SessionId> = (pid != 0)
+            .then(|| self.session_key_for_pid(pid))
+            .flatten();
+
+        if let Some(old_key) = old_key {
+            if is_placeholder_key(&old_key) {
+                let mut sess = self.sessions.remove(&old_key).expect("just found");
+                sess.session_id = session_id.to_string();
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
                 if sess.bootstrapped_session_id.as_deref() != Some(session_id) {
-                    // Stale bootstrap — wipe and re-bootstrap from correct JSONL.
-                    sess.reset_conversation();
+                    sess.discard_bootstrap();
                 }
-                adopt_cwd_if_unset(sess, cwd);
+                adopt_cwd_if_unset(&mut sess, cwd);
+                self.sessions.insert(session_id.to_string(), sess);
+                return self.sessions.get_mut(session_id).expect("just inserted");
             }
-            Some(sess) => {
-                // /clear: new conversation in the same window. If the
-                // previous conversation had accumulated real coach
-                // context, log it — a legitimate /clear is normal, but
-                // if this ever fires for a session the user hasn't
-                // touched in seconds it usually means `resolve_pid`
-                // cross-attributed a nested-claude hook to this pid.
-                let prior_sid = sess.current_session_id.clone();
-                let prior_chain_kind = sess.coach.memory.chain.kind();
-                let prior_events = sess.event_count;
-                if prior_chain_kind != "empty" || prior_events > 0 {
-                    eprintln!(
-                        "[coach] apply_hook_event: resetting pid {pid} \
-                         (old_sid={prior_sid}, new_sid={session_id}, \
-                         chain_kind={prior_chain_kind}, events={prior_events})"
-                    );
-                }
-                sess.current_session_id = session_id.to_string();
-                sess.last_event = Instant::now();
-                sess.last_event_time = now;
-                sess.started_at = now;
-                sess.reset_conversation();
-                adopt_cwd_if_unset(sess, cwd);
-            }
-            None => {
-                let display_name = derive_display_name(cwd, pid);
-                self.sessions.insert(
-                    pid,
-                    SessionState {
-                        pid,
-                        current_session_id: session_id.to_string(),
-                        mode: default_mode,
-                        cwd: cwd.map(String::from),
-                        last_event: Instant::now(),
-                        last_event_time: now,
-                        event_count: 0,
-                        last_stop_blocked: None,
-                        started_at: now,
-                        display_name,
-                        tool_counts: HashMap::new(),
-                        stop_count: 0,
-                        stop_blocked_count: 0,
-                        coach: SessionCoachState::new(),
-                        activity: VecDeque::new(),
-                        active_agents: 0,
-                        client: SessionClient::default(),
-                        is_worktree: cwd.map_or(false, is_git_worktree),
-                        bootstrapped: false,
-                        bootstrapped_session_id: None,
-                    },
+
+            // `/clear`: evict the old conversation entry.
+            let old = self.sessions.remove(&old_key).expect("just found");
+            if old.coach.memory.chain.kind() != "empty" || old.event_count > 0 {
+                eprintln!(
+                    "[coach] apply_hook_event: evicting pid {pid} \
+                     (old_sid={old_key}, new_sid={session_id}, \
+                     chain_kind={}, events={})",
+                    old.coach.memory.chain.kind(),
+                    old.event_count
                 );
             }
+            drop(old);
         }
-        self.sessions.get_mut(&pid).expect("just inserted")
+
+        let display_name = derive_display_name(cwd, pid);
+        self.sessions.insert(
+            session_id.to_string(),
+            SessionState {
+                session_id: session_id.to_string(),
+                pid,
+                mode: self.default_mode,
+                cwd: cwd.map(String::from),
+                last_event: Instant::now(),
+                last_event_time: now,
+                event_count: 0,
+                last_stop_blocked: None,
+                started_at: now,
+                display_name,
+                tool_counts: HashMap::new(),
+                stop_count: 0,
+                stop_blocked_count: 0,
+                coach: SessionCoachState::new(),
+                activity: VecDeque::new(),
+                active_agents: 0,
+                client: SessionClient::default(),
+                is_worktree: cwd.map_or(false, is_git_worktree),
+                bootstrapped: false,
+                bootstrapped_session_id: None,
+            },
+        );
+        self.sessions.get_mut(session_id).expect("just inserted")
     }
 
-    /// Append an activity entry to the session for `pid`. Silent no-op
-    /// if the PID has no session — log calls are best-effort and must
-    /// never crash the hook server.
+    /// Append an activity entry to the session for `session_id`. Silent
+    /// no-op if the session is unknown — log calls are best-effort and
+    /// must never crash the hook server.
     pub fn log(
         &mut self,
-        pid: u32,
+        session_id: &str,
         hook_event: &str,
         action: &str,
         detail: Option<String>,
     ) {
-        let Some(session) = self.sessions.get_mut(&pid) else {
+        let Some(session) = self.sessions.get_mut(session_id) else {
             return;
         };
         session.activity.push_back(ActivityEntry {
@@ -665,28 +700,28 @@ impl CoachState {
         }
     }
 
-    /// Register a PID discovered by the file scanner. Creates a placeholder
-    /// session entry if no hook has populated one yet, so a freshly-launched
-    /// Claude Code window appears in the UI before the user types anything.
-    ///
-    /// If a session for this PID already exists (because a hook beat the
-    /// scanner), this is a no-op and returns false.
+    /// Register a PID discovered by the file scanner. Creates a
+    /// placeholder session entry (keyed under a `<pending:pid>`
+    /// sentinel) if no hook has populated one yet, so a freshly-
+    /// launched window appears in the UI before the user types
+    /// anything. The `session_id` field stays empty until the first
+    /// hook lands and rekeys the entry. Returns false if a
+    /// placeholder or real session already exists for this PID.
     pub fn register_discovered_pid(
         &mut self,
         pid: u32,
         cwd: Option<&str>,
         started_at: DateTime<Utc>,
     ) -> bool {
-        if self.sessions.contains_key(&pid) {
+        if self.sessions.values().any(|s| s.pid == pid) {
             return false;
         }
         let display_name = derive_display_name(cwd, pid);
         self.sessions.insert(
-            pid,
+            placeholder_key(pid),
             SessionState {
+                session_id: String::new(),
                 pid,
-                // No current conversation yet — first hook will fill this in.
-                current_session_id: String::new(),
                 mode: self.default_mode,
                 cwd: cwd.map(String::from),
                 last_event: Instant::now(),
@@ -712,31 +747,28 @@ impl CoachState {
         true
     }
 
-    /// Tag the session for `pid` with the given client. Used by the
-    /// cursor hook handlers right after the shared `run_*` path creates
-    /// the session, since those functions don't know which agent the
-    /// hook came from.
-    pub fn mark_client(&mut self, pid: u32, client: SessionClient) {
-        if let Some(s) = self.sessions.get_mut(&pid) {
+    /// Tag the session for `session_id` with the given client. Used by
+    /// the cursor hook handlers right after the shared `run_*` path
+    /// creates the session, since those functions don't know which
+    /// agent the hook came from.
+    pub fn mark_client(&mut self, session_id: &str, client: SessionClient) {
+        if let Some(s) = self.sessions.get_mut(session_id) {
             s.client = client;
         }
     }
 
-    /// Remove sessions whose PID is not in the live set. Returns the
-    /// removed PIDs. Also drops any cached `session_id → pid` entries
-    /// pointing at the dead PIDs so the cache doesn't grow unbounded.
-    pub fn remove_dead_pids(&mut self, live_pids: &HashSet<u32>) -> Vec<u32> {
-        let dead: Vec<u32> = self
+    /// Remove sessions whose owning PID is not in the live set. Returns
+    /// the removed session_ids.
+    pub fn remove_dead_pids(&mut self, live_pids: &HashSet<u32>) -> Vec<SessionId> {
+        let dead: Vec<SessionId> = self
             .sessions
-            .keys()
-            .copied()
-            .filter(|pid| !live_pids.contains(pid))
+            .iter()
+            .filter(|(_, s)| !live_pids.contains(&s.pid))
+            .map(|(k, _)| k.clone())
             .collect();
-        for pid in &dead {
-            self.sessions.remove(pid);
+        for key in &dead {
+            self.sessions.remove(key);
         }
-        self.session_id_to_pid
-            .retain(|_, pid| live_pids.contains(pid));
         dead
     }
 }
@@ -766,7 +798,6 @@ where
 pub(crate) fn test_state() -> CoachState {
     CoachState {
         sessions: HashMap::new(),
-        session_id_to_pid: HashMap::new(),
         priorities: vec!["Simplicity".into()],
         port: 7700,
         theme: Theme::System,
@@ -831,54 +862,54 @@ mod tests {
 
     // ── apply_hook_event lifecycle ──────────────────────────────────────
 
-    /// First hook for a PID creates a session under that PID with
-    /// event_count=1 and the right mode.
+    /// First hook mints a session keyed by session_id and records the
+    /// PID as metadata. event_count starts at 0 and only record_tool
+    /// moves it.
     #[test]
-    fn apply_hook_event_creates_session_for_new_pid() {
+    fn apply_hook_event_creates_session_for_new_sid() {
         let mut state = test_state();
         state.default_mode = CoachMode::Away;
 
         state.apply_hook_event(42, "conv-1", Some("/tmp"));
 
-        let sess = state.sessions.get(&42).unwrap();
+        let sess = state.sessions.get("conv-1").unwrap();
         assert_eq!(sess.pid, 42);
-        assert_eq!(sess.current_session_id, "conv-1");
+        assert_eq!(sess.session_id, "conv-1");
         assert_eq!(sess.event_count, 0);
         assert_eq!(sess.mode, CoachMode::Away);
         assert_eq!(sess.cwd, Some("/tmp".into()));
-        assert_eq!(state.session_id_to_pid.get("conv-1"), Some(&42));
 
         // record_tool is how event_count grows — same path as bootstrap.
-        let sess = state.sessions.get_mut(&42).unwrap();
+        let sess = state.sessions.get_mut("conv-1").unwrap();
         sess.record_tool("Bash");
         assert_eq!(sess.event_count, 1);
         assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
     }
 
-    /// Same (pid, session_id) on a second hook touches timestamps but
-    /// does not change event_count. Only record_tool does that.
+    /// Second hook with the same session_id touches timestamps but does
+    /// not change event_count. Only record_tool does that.
     #[test]
-    fn apply_hook_event_increments_existing_session() {
+    fn apply_hook_event_touches_existing_session() {
         let mut state = test_state();
         state.apply_hook_event(42, "conv-1", Some("/a"));
-        state.sessions.get_mut(&42).unwrap().mode = CoachMode::Away;
+        state.sessions.get_mut("conv-1").unwrap().mode = CoachMode::Away;
 
         state.apply_hook_event(42, "conv-1", Some("/b"));
 
-        let sess = state.sessions.get(&42).unwrap();
+        let sess = state.sessions.get("conv-1").unwrap();
         assert_eq!(sess.event_count, 0, "apply_hook_event doesn't touch event_count");
         assert_eq!(sess.cwd, Some("/a".into()), "launch cwd is frozen");
         assert_eq!(sess.mode, CoachMode::Away, "mode survives hook updates");
     }
 
-    /// /clear: same PID, new session_id. Counters reset, started_at moves
-    /// forward, activity is wiped, but pid/mode/cwd persist.
+    /// /clear: same PID, new session_id. Old entry is evicted, new one
+    /// is created fresh — no shared state between conversations.
     #[test]
-    fn apply_hook_event_resets_on_clear() {
+    fn apply_hook_event_evicts_old_entry_on_clear() {
         let mut state = test_state();
         state.apply_hook_event(42, "old", Some("/projects/coach"));
         {
-            let s = state.sessions.get_mut(&42).unwrap();
+            let s = state.sessions.get_mut("old").unwrap();
             s.mode = CoachMode::Away;
             s.record_tool("Bash");
             s.record_tool("Bash");
@@ -892,41 +923,43 @@ mod tests {
                 detail: None,
             });
         }
-        let original_started = state.sessions.get(&42).unwrap().started_at;
-        std::thread::sleep(std::time::Duration::from_millis(2));
 
         state.apply_hook_event(42, "new", Some("/projects/coach"));
 
-        let sess = state.sessions.get(&42).unwrap();
-        assert_eq!(sess.current_session_id, "new");
+        assert!(!state.sessions.contains_key("old"), "old entry evicted");
+        let sess = state.sessions.get("new").unwrap();
+        assert_eq!(sess.session_id, "new");
         assert_eq!(sess.event_count, 0);
         assert!(sess.tool_counts.is_empty());
         assert_eq!(sess.stop_count, 0);
         assert_eq!(sess.stop_blocked_count, 0);
-        assert_eq!(sess.coach.memory.chain, CoachChain::Empty, "/clear must reset chain");
+        assert_eq!(sess.coach.memory.chain, CoachChain::Empty);
         assert!(sess.activity.is_empty());
-        assert!(sess.started_at > original_started);
-        assert_eq!(sess.pid, 42);
-        assert_eq!(sess.mode, CoachMode::Away, "mode is window-scoped");
-        assert_eq!(sess.cwd, Some("/projects/coach".into()), "cwd preserved");
-        assert_eq!(state.session_id_to_pid.get("old"), Some(&42));
-        assert_eq!(state.session_id_to_pid.get("new"), Some(&42));
+        assert_eq!(sess.pid, 42, "pid carries over (same window)");
+        assert_eq!(sess.cwd, Some("/projects/coach".into()));
+        // Default mode is Present — `/clear` shouldn't preserve the old mode.
     }
 
-    /// First hook for a scanner-discovered placeholder adopts the
-    /// conversation id without treating it as a /clear. started_at is
-    /// preserved (the scanner read it from the session file).
+    /// First hook for a scanner-discovered placeholder rekeys it under
+    /// the real session_id. started_at is preserved (the scanner read
+    /// it from the session file).
     #[test]
     fn apply_hook_event_adopts_scanner_placeholder() {
         use chrono::Duration;
         let mut state = test_state();
         let scanner_started = Utc::now() - Duration::hours(2);
         state.register_discovered_pid(42, Some("/p"), scanner_started);
+        assert!(state.sessions.contains_key(&placeholder_key(42)));
 
         state.apply_hook_event(42, "conv-X", Some("/p"));
 
-        let sess = state.sessions.get(&42).unwrap();
-        assert_eq!(sess.current_session_id, "conv-X");
+        assert!(
+            !state.sessions.contains_key(&placeholder_key(42)),
+            "placeholder rekeyed"
+        );
+        let sess = state.sessions.get("conv-X").unwrap();
+        assert_eq!(sess.session_id, "conv-X");
+        assert_eq!(sess.pid, 42);
         assert_eq!(sess.event_count, 0, "no tools recorded yet");
         assert_eq!(
             sess.started_at, scanner_started,
@@ -935,8 +968,7 @@ mod tests {
     }
 
     /// Two distinct PIDs are tracked as two distinct sessions even when
-    /// they share a cwd. This is the multi-window-same-cwd case that
-    /// every other heuristic fails on.
+    /// they share a cwd.
     #[test]
     fn distinct_pids_in_same_cwd_are_separate_sessions() {
         let mut state = test_state();
@@ -944,8 +976,8 @@ mod tests {
         state.apply_hook_event(200, "conv-b", Some("/projects/coach"));
 
         assert_eq!(state.sessions.len(), 2);
-        assert_eq!(state.sessions.get(&100).unwrap().current_session_id, "conv-a");
-        assert_eq!(state.sessions.get(&200).unwrap().current_session_id, "conv-b");
+        assert_eq!(state.sessions.get("conv-a").unwrap().pid, 100);
+        assert_eq!(state.sessions.get("conv-b").unwrap().pid, 200);
     }
 
     // ── log() ───────────────────────────────────────────────────────────
@@ -954,19 +986,19 @@ mod tests {
     fn log_adds_entries_to_session() {
         let mut state = test_state();
         state.apply_hook_event(1, "s", None);
-        state.log(1, "PostToolUse", "observed", None);
-        state.log(1, "Stop", "blocked", Some("priorities".into()));
+        state.log("s", "PostToolUse", "observed", None);
+        state.log("s", "Stop", "blocked", Some("priorities".into()));
 
-        let activity = &state.sessions.get(&1).unwrap().activity;
+        let activity = &state.sessions.get("s").unwrap().activity;
         assert_eq!(activity.len(), 2);
         assert_eq!(activity[0].action, "observed");
         assert_eq!(activity[1].detail, Some("priorities".into()));
     }
 
     #[test]
-    fn log_for_unknown_pid_is_silent_noop() {
+    fn log_for_unknown_session_id_is_silent_noop() {
         let mut state = test_state();
-        state.log(9999, "PostToolUse", "observed", None);
+        state.log("ghost", "PostToolUse", "observed", None);
         assert!(state.sessions.is_empty());
     }
 
@@ -975,9 +1007,9 @@ mod tests {
         let mut state = test_state();
         state.apply_hook_event(1, "s", None);
         for i in 0..SESSION_ACTIVITY_CAP + 10 {
-            state.log(1, "PostToolUse", &format!("entry-{i}"), None);
+            state.log("s", "PostToolUse", &format!("entry-{i}"), None);
         }
-        let activity = &state.sessions.get(&1).unwrap().activity;
+        let activity = &state.sessions.get("s").unwrap().activity;
         assert_eq!(activity.len(), SESSION_ACTIVITY_CAP);
         assert_eq!(activity[0].action, "entry-10");
         assert_eq!(
@@ -992,13 +1024,13 @@ mod tests {
         let mut state = test_state();
         state.apply_hook_event(1, "quiet", None);
         state.apply_hook_event(2, "busy", None);
-        state.log(1, "PostToolUse", "first", Some("Read".into()));
+        state.log("quiet", "PostToolUse", "first", Some("Read".into()));
 
         for i in 0..SESSION_ACTIVITY_CAP * 3 {
-            state.log(2, "PostToolUse", &format!("noise-{i}"), None);
+            state.log("busy", "PostToolUse", &format!("noise-{i}"), None);
         }
 
-        let quiet = &state.sessions.get(&1).unwrap().activity;
+        let quiet = &state.sessions.get("quiet").unwrap().activity;
         assert_eq!(quiet.len(), 1, "quiet session keeps its only entry");
         assert_eq!(quiet[0].action, "first");
     }
@@ -1018,20 +1050,20 @@ mod tests {
         state.apply_hook_event(3, "s3", None);
 
         let now = Utc::now();
-        // All three are active. started_at: pid 1 oldest, pid 2 middle, pid 3 newest.
-        state.sessions.get_mut(&1).unwrap().started_at = now - Duration::seconds(300);
-        state.sessions.get_mut(&2).unwrap().started_at = now - Duration::seconds(200);
-        state.sessions.get_mut(&3).unwrap().started_at = now - Duration::seconds(100);
-        // last_event jitters: pid 1 most recent, pid 3 oldest. Old sort would
+        // All three are active. started_at: s1 oldest, s2 middle, s3 newest.
+        state.sessions.get_mut("s1").unwrap().started_at = now - Duration::seconds(300);
+        state.sessions.get_mut("s2").unwrap().started_at = now - Duration::seconds(200);
+        state.sessions.get_mut("s3").unwrap().started_at = now - Duration::seconds(100);
+        // last_event jitters: s1 most recent, s3 oldest. Old sort would
         // have produced [1, 2, 3]; new sort must ignore last_event
         // within a bucket and use started_at desc.
-        state.sessions.get_mut(&1).unwrap().last_event_time = now;
-        state.sessions.get_mut(&2).unwrap().last_event_time = now - Duration::seconds(5);
-        state.sessions.get_mut(&3).unwrap().last_event_time = now - Duration::seconds(10);
+        state.sessions.get_mut("s1").unwrap().last_event_time = now;
+        state.sessions.get_mut("s2").unwrap().last_event_time = now - Duration::seconds(5);
+        state.sessions.get_mut("s3").unwrap().last_event_time = now - Duration::seconds(10);
 
         let snap = state.snapshot();
-        let pids: Vec<u32> = snap.sessions.iter().map(|s| s.pid).collect();
-        assert_eq!(pids, vec![3, 2, 1], "newest-started first, stable");
+        let sids: Vec<&str> = snap.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(sids, vec!["s3", "s2", "s1"], "newest-started first, stable");
     }
 
     /// Idle sessions sit below active sessions regardless of when they started.
@@ -1045,15 +1077,16 @@ mod tests {
 
         let now = Utc::now();
         // idle started recently but hasn't seen events for an hour.
-        state.sessions.get_mut(&20).unwrap().started_at = now - Duration::seconds(60);
-        state.sessions.get_mut(&20).unwrap().last_event_time = now - Duration::seconds(60 * 60);
+        state.sessions.get_mut("idle_new").unwrap().started_at = now - Duration::seconds(60);
+        state.sessions.get_mut("idle_new").unwrap().last_event_time =
+            now - Duration::seconds(60 * 60);
         // active started long ago but is still active.
-        state.sessions.get_mut(&10).unwrap().started_at = now - Duration::seconds(3000);
-        state.sessions.get_mut(&10).unwrap().last_event_time = now;
+        state.sessions.get_mut("active_old").unwrap().started_at = now - Duration::seconds(3000);
+        state.sessions.get_mut("active_old").unwrap().last_event_time = now;
 
         let snap = state.snapshot();
-        let pids: Vec<u32> = snap.sessions.iter().map(|s| s.pid).collect();
-        assert_eq!(pids, vec![10, 20], "active outranks idle");
+        let sids: Vec<&str> = snap.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(sids, vec!["active_old", "idle_new"], "active outranks idle");
     }
 
     /// activity_bucket is the only thing that can change a session's rank,
@@ -1091,11 +1124,11 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_exposes_pid_and_current_session_id() {
+    fn snapshot_exposes_pid_and_session_id() {
         let mut state = test_state();
         state.apply_hook_event(77, "conv-X", Some("/Users/foo/projects/coach"));
         {
-            let s = state.sessions.get_mut(&77).unwrap();
+            let s = state.sessions.get_mut("conv-X").unwrap();
             s.tool_counts.insert("Read".into(), 3);
         }
         let snap = state.snapshot();
@@ -1116,7 +1149,7 @@ mod tests {
         let usage = CoachUsage { input_tokens: 100, output_tokens: 20, cached_input_tokens: 10 };
         let now = Utc::now();
         {
-            let s = state.sessions.get_mut(&7).unwrap();
+            let s = state.sessions.get_mut("s").unwrap();
             s.coach.memory.chain = CoachChain::History {
                 messages: vec![
                     CoachMessage { role: CoachRole::User, content: "u1".into() },
@@ -1165,7 +1198,7 @@ mod tests {
         let mut state = test_state();
         state.apply_hook_event(8, "s", Some("/p"));
         {
-            let s = state.sessions.get_mut(&8).unwrap();
+            let s = state.sessions.get_mut("s").unwrap();
             s.coach.memory.chain = CoachChain::ServerId { id: "resp_xyz".into() };
             s.coach.telemetry.calls = 5;
         }
@@ -1174,15 +1207,16 @@ mod tests {
         assert_eq!(snap.sessions[0].coach_chain_messages, 10);
     }
 
-    /// Regression: /clear must wipe coach telemetry along with the chain.
-    /// Otherwise the panel would show stale call counts and "12s ago" for a
-    /// brand-new conversation that has yet to call the LLM.
+    /// Regression: /clear must not carry coach telemetry over from the
+    /// previous conversation. Since `/clear` evicts the old entry and
+    /// creates a fresh one, this falls out of the rekey automatically —
+    /// the new entry's SessionCoachState starts empty.
     #[test]
-    fn clear_resets_coach_telemetry() {
+    fn clear_starts_with_empty_coach_telemetry() {
         let mut state = test_state();
         state.apply_hook_event(9, "old", Some("/p"));
         {
-            let s = state.sessions.get_mut(&9).unwrap();
+            let s = state.sessions.get_mut("old").unwrap();
             s.coach.memory.chain = CoachChain::ServerId { id: "resp_old".into() };
             s.coach.memory.session_title = Some("old topic".into());
             s.coach.telemetry.calls = 7;
@@ -1201,17 +1235,15 @@ mod tests {
             };
         }
         state.apply_hook_event(9, "new", Some("/p"));
-        let s = state.sessions.get(&9).unwrap();
+        assert!(!state.sessions.contains_key("old"), "old entry evicted");
+        let s = state.sessions.get("new").unwrap();
         assert_eq!(s.coach.telemetry.calls, 0);
         assert_eq!(s.coach.telemetry.errors, 0);
         assert!(s.coach.telemetry.last_called_at.is_none());
         assert!(s.coach.telemetry.last_latency_ms.is_none());
         assert!(s.coach.telemetry.last_usage.is_none());
         assert_eq!(s.coach.telemetry.total_usage, CoachUsage::default());
-        assert!(
-            s.coach.memory.session_title.is_none(),
-            "/clear must drop the previous conversation's LLM title"
-        );
+        assert!(s.coach.memory.session_title.is_none());
     }
 
     // ── from_settings / to_settings roundtrip ───────────────────────────
@@ -1267,7 +1299,7 @@ mod tests {
     fn to_settings_excludes_transient_state() {
         let mut state = test_state();
         state.apply_hook_event(1, "s", Some("/tmp"));
-        state.log(1, "PostToolUse", "observed", None);
+        state.log("s", "PostToolUse", "observed", None);
 
         let settings = state.to_settings();
         let json = serde_json::to_value(&settings).unwrap();
@@ -1319,7 +1351,7 @@ mod tests {
         state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach/src-tauri"));
         state.apply_hook_event(1, "s", Some("/tmp/elsewhere"));
 
-        let sess = state.sessions.get(&1).unwrap();
+        let sess = state.sessions.get("s").unwrap();
         assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
         assert_eq!(sess.display_name, "coach");
     }
@@ -1332,20 +1364,20 @@ mod tests {
         state.apply_hook_event(1, "s", None);
         state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
 
-        let sess = state.sessions.get(&1).unwrap();
+        let sess = state.sessions.get("s").unwrap();
         assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
         assert_eq!(sess.display_name, "coach");
     }
 
-    /// `/clear` keeps the launch cwd — it's window-scoped, not
-    /// conversation-scoped.
+    /// `/clear` mints a fresh session_id; the new conversation is a new
+    /// entry with its own cwd inherited from the first hook.
     #[test]
-    fn launch_cwd_persists_across_clear() {
+    fn launch_cwd_captured_per_conversation() {
         let mut state = test_state();
         state.apply_hook_event(1, "old", Some("/Users/foo/projects/coach"));
         state.apply_hook_event(1, "new", Some("/Users/foo/projects/coach/src"));
-        let sess = state.sessions.get(&1).unwrap();
-        assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
+        let sess = state.sessions.get("new").unwrap();
+        assert_eq!(sess.cwd, Some("/Users/foo/projects/coach/src".into()));
     }
 
     // ── register_discovered_pid ─────────────────────────────────────────
@@ -1358,13 +1390,13 @@ mod tests {
         let created = state.register_discovered_pid(12345, Some("/projects/foo"), started);
 
         assert!(created);
-        let sess = state.sessions.get(&12345).unwrap();
+        let sess = state.session_for_pid(12345).unwrap();
         assert_eq!(sess.event_count, 0);
         assert_eq!(sess.pid, 12345);
         assert_eq!(sess.started_at, started);
         assert_eq!(sess.cwd, Some("/projects/foo".into()));
         // No conversation yet — first hook will set this.
-        assert_eq!(sess.current_session_id, "");
+        assert_eq!(sess.session_id, "");
     }
 
     /// If a hook beat the scanner, the discovered PID is already in
@@ -1373,13 +1405,13 @@ mod tests {
     fn register_discovered_pid_is_noop_when_pid_known() {
         let mut state = test_state();
         state.apply_hook_event(42, "from-hook", None);
-        let event_count_before = state.sessions.get(&42).unwrap().event_count;
+        let event_count_before = state.session_for_pid(42).unwrap().event_count;
 
         let created = state.register_discovered_pid(42, Some("/anywhere"), Utc::now());
 
         assert!(!created);
         assert_eq!(
-            state.sessions.get(&42).unwrap().event_count,
+            state.session_for_pid(42).unwrap().event_count,
             event_count_before,
             "discovered should not stomp on hook-populated state"
         );
@@ -1395,30 +1427,13 @@ mod tests {
         state.apply_hook_event(3, "dead-3", None);
 
         let live: HashSet<u32> = [1].into_iter().collect();
-        let dead = state.remove_dead_pids(&live);
+        let mut dead = state.remove_dead_pids(&live);
+        dead.sort();
 
-        let mut dead_sorted = dead.clone();
-        dead_sorted.sort();
-        assert_eq!(dead_sorted, vec![2, 3]);
-        assert!(state.sessions.contains_key(&1));
-        assert!(!state.sessions.contains_key(&2));
-        assert!(!state.sessions.contains_key(&3));
-    }
-
-    /// Dead PIDs should also be evicted from the session_id cache to
-    /// prevent unbounded growth.
-    #[test]
-    fn remove_dead_pids_clears_cache_entries_for_dead_pids() {
-        let mut state = test_state();
-        state.apply_hook_event(1, "alive", None);
-        state.apply_hook_event(2, "dead", None);
-        assert!(state.session_id_to_pid.contains_key("dead"));
-
-        let live: HashSet<u32> = [1].into_iter().collect();
-        state.remove_dead_pids(&live);
-
-        assert!(state.session_id_to_pid.contains_key("alive"));
-        assert!(!state.session_id_to_pid.contains_key("dead"));
+        assert_eq!(dead, vec!["dead-2".to_string(), "dead-3".to_string()]);
+        assert!(state.sessions.contains_key("alive-1"));
+        assert!(!state.sessions.contains_key("dead-2"));
+        assert!(!state.sessions.contains_key("dead-3"));
     }
 
     #[test]

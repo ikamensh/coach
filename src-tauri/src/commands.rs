@@ -18,10 +18,13 @@ pub async fn get_state(state: tauri::State<'_, SharedState>) -> Result<CoachSnap
 pub async fn set_session_mode(
     state: tauri::State<'_, SharedState>,
     emitter: Emitter<'_>,
-    pid: u32,
+    session_id: String,
     mode: CoachMode,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.set_session_mode(pid, mode)).await;
+    state::mutate(&state, emitter.inner(), |s| {
+        s.set_session_mode(&session_id, mode)
+    })
+    .await;
     Ok(())
 }
 
@@ -298,10 +301,13 @@ pub async fn set_auto_uninstall_hooks_on_exit(
 pub async fn set_intervention_muted(
     state: tauri::State<'_, SharedState>,
     emitter: Emitter<'_>,
-    pid: u32,
+    session_id: String,
     muted: bool,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.set_intervention_muted(pid, muted)).await;
+    state::mutate(&state, emitter.inner(), |s| {
+        s.set_intervention_muted(&session_id, muted)
+    })
+    .await;
     Ok(())
 }
 

@@ -36,12 +36,12 @@ interface CoachState {
   initialized: boolean;
   initError: string | null;
   view: CoachView;
-  selectedPid: number | null;
+  selectedSessionId: string | null;
 }
 
 interface CoachActions {
   init: () => Promise<void>;
-  setSessionMode: (pid: number, mode: CoachMode) => Promise<void>;
+  setSessionMode: (sessionId: string, mode: CoachMode) => Promise<void>;
   setAllMode: (mode: CoachMode) => Promise<void>;
   setPriorities: (priorities: string[]) => Promise<void>;
   addPriority: (priority: string) => Promise<void>;
@@ -51,7 +51,7 @@ interface CoachActions {
   setApiToken: (provider: string, token: string) => Promise<void>;
   setModel: (model: ModelConfig) => Promise<void>;
   setView: (view: CoachView) => void;
-  openSession: (pid: number) => void;
+  openSession: (sessionId: string) => void;
   setEngineMode: (mode: EngineMode) => Promise<void>;
   setRules: (rules: CoachRule[]) => Promise<void>;
   toggleRule: (id: string) => Promise<void>;
@@ -68,7 +68,7 @@ interface CoachActions {
   installPath: () => Promise<void>;
   uninstallPath: () => Promise<void>;
   setAutoUninstallHooksOnExit: (enabled: boolean) => Promise<void>;
-  setInterventionMuted: (pid: number, muted: boolean) => Promise<void>;
+  setInterventionMuted: (sessionId: string, muted: boolean) => Promise<void>;
 }
 
 type CoachStore = CoachState & CoachActions;
@@ -109,7 +109,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   initialized: false,
   initError: null,
   view: "main",
-  selectedPid: null,
+  selectedSessionId: null,
 
   init: async () => {
     if (get().initialized) return;
@@ -167,11 +167,11 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
       });
   },
 
-  setSessionMode: async (pid, mode) => {
-    await invoke("set_session_mode", { pid, mode });
+  setSessionMode: async (sessionId, mode) => {
+    await invoke("set_session_mode", { sessionId, mode });
     set((s) => ({
       sessions: s.sessions.map((sess) =>
-        sess.pid === pid ? { ...sess, mode } : sess,
+        sess.session_id === sessionId ? { ...sess, mode } : sess,
       ),
     }));
   },
@@ -232,7 +232,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
 
   setView: (view) => set({ view }),
 
-  openSession: (pid) => set({ selectedPid: pid, view: "session" }),
+  openSession: (sessionId) => set({ selectedSessionId: sessionId, view: "session" }),
 
   setEngineMode: async (coachMode) => {
     await invoke("set_coach_mode", { coachMode });
@@ -316,11 +316,11 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
     set({ autoUninstallHooksOnExit: enabled });
   },
 
-  setInterventionMuted: async (pid, muted) => {
-    await invoke("set_intervention_muted", { pid, muted });
+  setInterventionMuted: async (sessionId, muted) => {
+    await invoke("set_intervention_muted", { sessionId, muted });
     set((s) => ({
       sessions: s.sessions.map((sess) =>
-        sess.pid === pid ? { ...sess, intervention_muted: muted } : sess,
+        sess.session_id === sessionId ? { ...sess, intervention_muted: muted } : sess,
       ),
     }));
   },

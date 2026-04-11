@@ -21,13 +21,13 @@ function formatLatency(ms: number): string {
 
 export function SessionDetail() {
   const sessions = useCoachStore((s) => s.sessions);
-  const selectedPid = useCoachStore((s) => s.selectedPid);
+  const selectedSessionId = useCoachStore((s) => s.selectedSessionId);
   const setSessionMode = useCoachStore((s) => s.setSessionMode);
   const setInterventionMuted = useCoachStore((s) => s.setInterventionMuted);
   const setView = useCoachStore((s) => s.setView);
   const engineMode = useCoachStore((s) => s.engineMode);
 
-  const session = sessions.find((s) => s.pid === selectedPid);
+  const session = sessions.find((s) => s.session_id === selectedSessionId);
 
   // Newest-first for the timeline display.
   const sessionEntries = useMemo(
@@ -60,7 +60,7 @@ export function SessionDetail() {
           <button
             onClick={() =>
               setSessionMode(
-                session.pid,
+                session.session_id,
                 session.mode === "present" ? "away" : "present",
               )
             }
@@ -112,7 +112,7 @@ export function SessionDetail() {
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setInterventionMuted(session.pid, !session.intervention_muted)}
+              onClick={() => setInterventionMuted(session.session_id, !session.intervention_muted)}
               className={`text-[10px] px-2 py-0.5 rounded font-medium transition-colors ${
                 session.intervention_muted
                   ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-300 dark:hover:bg-zinc-600"

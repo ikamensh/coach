@@ -1139,7 +1139,7 @@ mod live_tests {
         let token = std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty())?;
         let state = CoachState {
             sessions: HashMap::new(),
-            session_id_to_pid: HashMap::new(),
+
             priorities: vec!["Test priority".into()],
             port: 7700,
             theme: Theme::System,
@@ -1362,7 +1362,7 @@ mod live_tests {
             .filter(|v| !v.is_empty())?;
         let state = CoachState {
             sessions: HashMap::new(),
-            session_id_to_pid: HashMap::new(),
+
             priorities: vec!["Test priority".into()],
             port: 7700,
             theme: Theme::System,
@@ -1546,7 +1546,7 @@ mod live_tests {
             .filter(|v| !v.is_empty())?;
         let state = CoachState {
             sessions: HashMap::new(),
-            session_id_to_pid: HashMap::new(),
+
             priorities: vec!["Test priority".into()],
             port: 7700,
             theme: Theme::System,

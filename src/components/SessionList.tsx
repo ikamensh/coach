@@ -68,8 +68,8 @@ export function SessionList() {
             const tint = session.mode === "away" ? "#a1a1aa" : "#e8743c";
             return (
             <li
-              key={session.pid}
-              onClick={() => openSession(session.pid)}
+              key={session.session_id || `pid:${session.pid}`}
+              onClick={() => openSession(session.session_id)}
               className="flex items-start gap-3 bg-zinc-100 dark:bg-zinc-800/50 rounded-lg px-3 py-2 cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors"
             >
               <div className="flex flex-col items-center flex-shrink-0 mt-0.5">
@@ -110,7 +110,7 @@ export function SessionList() {
                     onClick={(e) => {
                       e.stopPropagation();
                       setSessionMode(
-                        session.pid,
+                        session.session_id,
                         session.mode === "present" ? "away" : "present",
                       );
                     }}

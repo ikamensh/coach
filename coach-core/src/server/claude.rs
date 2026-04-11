@@ -1,10 +1,15 @@
 //! Claude Code hooks (`~/.claude/settings.json` → `/hook/*`).
 //!
 //! Claude Code POSTs directly from its own process, so the TCP peer
-//! really is the agent — PIDs are resolved via lsof against the
-//! listener port. The `HookPayload` shape below is Claude Code's native
-//! format; it also happens to be what Codex emits, which is why the
-//! Codex adapter re-uses it rather than defining its own struct.
+//! really is the agent — we look up the PID via lsof against the
+//! listener port. The resolution is best-effort metadata now: session
+//! identity comes from the hook payload's `session_id`, and failing to
+//! resolve the PID just means the session displays pid 0 until a
+//! future hook lands with a resolvable peer.
+//!
+//! The `HookPayload` shape below is Claude Code's native format; it
+//! also happens to be what Codex emits, which is why the Codex adapter
+//! re-uses it rather than defining its own struct.
 
 use axum::{
     extract::{ConnectInfo, State as AxumState},
@@ -12,11 +17,11 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::net::SocketAddr;
 
 use super::events::{dispatch, SessionEvent, SessionSource};
-use super::{resolve_pid, AppState};
+use super::AppState;
 
 const SOURCE: SessionSource = SessionSource::ClaudeCode;
 
@@ -39,19 +44,22 @@ impl HookPayload {
     }
 }
 
+/// Resolve the TCP peer port to a PID for display. Returns 0 when the
+/// resolver can't find a match — sessions still work, they just show
+/// pid 0 until a hook arrives with a resolvable peer.
+fn peer_pid(addr: SocketAddr) -> u32 {
+    crate::pid_resolver::resolve_peer_pid(addr.port(), 0).unwrap_or(0)
+}
+
 async fn handle_permission_request(
     AxumState(state): AxumState<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let sid = payload.sid();
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] PermissionRequest: PID resolution failed for {sid}");
-        return Json(json!({}));
-    };
     dispatch(
         &state,
-        pid,
+        peer_pid(addr),
         SOURCE,
         SessionEvent::PermissionRequested {
             session_id: sid,
@@ -68,13 +76,9 @@ async fn handle_session_start(
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let sid = payload.sid();
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] SessionStart: PID resolution failed for {sid}");
-        return Json(json!({}));
-    };
     dispatch(
         &state,
-        pid,
+        peer_pid(addr),
         SOURCE,
         SessionEvent::SessionStarted {
             session_id: sid,
@@ -91,13 +95,9 @@ async fn handle_user_prompt_submit(
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let sid = payload.sid();
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] UserPromptSubmit: PID resolution failed for {sid}");
-        return Json(json!({}));
-    };
     dispatch(
         &state,
-        pid,
+        peer_pid(addr),
         SOURCE,
         SessionEvent::UserPromptSubmitted {
             session_id: sid,
@@ -114,13 +114,9 @@ async fn handle_stop(
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let sid = payload.sid();
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] Stop: PID resolution failed for {sid}");
-        return Json(json!({}));
-    };
     dispatch(
         &state,
-        pid,
+        peer_pid(addr),
         SOURCE,
         SessionEvent::StopRequested {
             session_id: sid,
@@ -137,12 +133,9 @@ async fn handle_pre_tool_use(
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let sid = payload.sid();
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        return Json(json!({}));
-    };
     dispatch(
         &state,
-        pid,
+        peer_pid(addr),
         SOURCE,
         SessionEvent::ToolStarting {
             session_id: sid,
@@ -159,13 +152,9 @@ async fn handle_post_tool_use(
     Json(payload): Json<HookPayload>,
 ) -> Json<Value> {
     let sid = payload.sid();
-    let Some(pid) = resolve_pid(&state, &sid, addr.port()).await else {
-        eprintln!("[coach] PostToolUse: PID resolution failed for {sid}");
-        return Json(json!({}));
-    };
     dispatch(
         &state,
-        pid,
+        peer_pid(addr),
         SOURCE,
         SessionEvent::ToolCompleted {
             session_id: sid,

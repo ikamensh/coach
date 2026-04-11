@@ -55,16 +55,16 @@ pub(super) fn activity_bucket(last_event: DateTime<Utc>, now: DateTime<Utc>) -> 
     }
 }
 
-/// Snapshot of one Claude Code window — keyed by PID, surfacing the
-/// **current** conversation in that window. See docs/SESSION_TRACKING.md.
+/// Snapshot of one live coding conversation. Keyed by `session_id`
+/// on the wire; `pid` is carried along as metadata for display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
-    /// OS PID of the Claude Code process. Stable across `/clear`.
-    pub pid: u32,
-    /// Current conversation id. Changes when the user runs `/clear`,
-    /// `/resume`, or `/compact`. Empty string if the scanner saw the
-    /// process before any hook fired.
+    /// Stable conversation identifier from the coding agent. Empty
+    /// string if the scanner saw the process before any hook fired.
     pub session_id: String,
+    /// OS PID of the coding-agent process. Metadata only — the
+    /// session's identity is `session_id`.
+    pub pid: u32,
     pub mode: CoachMode,
     /// The directory the window was launched in. Set once on first
     /// observation (scanner or hook) and never overwritten — Claude Code
@@ -246,8 +246,8 @@ impl super::CoachState {
 
 fn snapshot_session(s: &SessionState, now: DateTime<Utc>) -> SessionSnapshot {
     SessionSnapshot {
+        session_id: s.session_id.clone(),
         pid: s.pid,
-        session_id: s.current_session_id.clone(),
         mode: s.mode,
         cwd: s.cwd.clone(),
         last_event: s.last_event_time,

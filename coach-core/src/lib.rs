@@ -88,7 +88,7 @@ pub async fn serve(port_override: Option<u16>) -> Result<(), String> {
     let server_task = tokio::spawn({
         let s = state.clone();
         let e = emitter.clone();
-        async move { server::serve_on_listener(listener, s, e, port).await }
+        async move { server::serve_on_listener(listener, s, e).await }
     });
     let scanner_task = tokio::spawn({
         let s = state.clone();
