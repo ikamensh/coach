@@ -339,6 +339,18 @@ impl SessionState {
         self.active_agents = self.active_agents.saturating_sub(1);
     }
 
+    /// Append an activity entry with an explicit timestamp, enforcing
+    /// the ring cap. Used by the JSONL bootstrap to feed replayed events
+    /// through at their real historical time rather than `Utc::now()`,
+    /// so the ActivityBar's opacity fade reflects when work actually
+    /// happened.
+    pub fn push_activity(&mut self, entry: ActivityEntry) {
+        self.activity.push_back(entry);
+        while self.activity.len() > SESSION_ACTIVITY_CAP {
+            self.activity.pop_front();
+        }
+    }
+
     /// Discard the scanner bootstrap for this session — used when the
     /// bootstrap loaded tools from a stale JSONL that doesn't match the
     /// conversation this session actually represents.
@@ -346,6 +358,7 @@ impl SessionState {
         self.event_count = 0;
         self.tool_counts.clear();
         self.active_agents = 0;
+        self.activity.clear();
         self.bootstrapped = false;
         self.bootstrapped_session_id = None;
     }
@@ -656,15 +669,12 @@ impl SessionRegistry {
         let Some(session) = self.inner.get_mut(session_id) else {
             return;
         };
-        session.activity.push_back(ActivityEntry {
+        session.push_activity(ActivityEntry {
             timestamp: Utc::now(),
             hook_event: hook_event.to_string(),
             action: action.to_string(),
             detail,
         });
-        while session.activity.len() > SESSION_ACTIVITY_CAP {
-            session.activity.pop_front();
-        }
     }
 
     /// Register a PID discovered by the file scanner. Creates a

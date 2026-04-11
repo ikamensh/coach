@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::server::fake_pid_for_sid;
-use crate::state::{SessionClient, SharedState};
+use crate::state::{ActivityEntry, SessionClient, SharedState};
 use crate::EventEmitter;
 
 /// Minimal view of `~/.claude/sessions/<pid>.json`.
@@ -432,7 +432,10 @@ fn mangle_cwd(cwd: &str) -> String {
 /// State bootstrapped from a JSONL conversation log.
 /// Replay a JSONL conversation log into a session, using the same
 /// `record_tool` / `record_agent_start` / `record_agent_end` methods
-/// that live hooks use. Returns the number of tool events replayed.
+/// that live hooks use. Also pushes ActivityBar entries at their real
+/// historical timestamps (from each JSONL line's `timestamp` field), so
+/// the activity bar reflects past work — faded by age, like live events
+/// are. Returns the number of tool events replayed.
 pub fn replay_jsonl(
     path: &Path,
     session: &mut crate::state::SessionState,
@@ -448,6 +451,12 @@ pub fn replay_jsonl(
             Err(_) => continue,
         };
 
+        let ts = entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc));
+
         match entry.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
                 let blocks = entry
@@ -458,6 +467,14 @@ pub fn replay_jsonl(
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                 session.record_tool(name);
+                                if let Some(timestamp) = ts {
+                                    session.push_activity(ActivityEntry {
+                                        timestamp,
+                                        hook_event: "PostToolUse".to_string(),
+                                        action: "observed".to_string(),
+                                        detail: Some(name.to_string()),
+                                    });
+                                }
                                 if name == "Agent" {
                                     session.record_agent_start();
                                     if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
@@ -484,12 +501,45 @@ pub fn replay_jsonl(
                         }
                     }
                 }
+                if let Some(timestamp) = ts {
+                    if is_user_prompt(&entry) {
+                        session.push_activity(ActivityEntry {
+                            timestamp,
+                            hook_event: "UserPromptSubmit".to_string(),
+                            action: "submitted".to_string(),
+                            detail: None,
+                        });
+                    }
+                }
             }
             _ => {}
         }
     }
 
     Ok(session.event_count)
+}
+
+/// True when a `type: "user"` JSONL entry is a real user prompt
+/// (text content), not a tool_result delivery. Used by the bootstrap
+/// replayer to decide whether to log a UserPromptSubmit activity chip.
+fn is_user_prompt(entry: &serde_json::Value) -> bool {
+    let Some(content) = entry.pointer("/message/content") else {
+        return false;
+    };
+    if let Some(text) = content.as_str() {
+        return !text.trim().is_empty();
+    }
+    if let Some(arr) = content.as_array() {
+        return arr.iter().any(|block| {
+            block.get("type").and_then(|t| t.as_str()) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+        });
+    }
+    false
 }
 
 #[cfg(test)]
@@ -687,6 +737,81 @@ mod tests {
         assert_eq!(sess.tool_counts.get("Agent"), Some(&1));
         assert_eq!(sess.active_agents, 1);
         assert_eq!(total, 3);
+    }
+
+    /// Regression: bootstrapped sessions used to render an empty
+    /// ActivityBar because `replay_jsonl` populated `tool_counts` but
+    /// never pushed to `session.activity`. The activity entries fed by
+    /// bootstrap must carry the real JSONL timestamps (not `Utc::now()`)
+    /// so the ActivityBar fade reflects when work actually happened.
+    #[test]
+    fn bootstrap_populates_activity_with_jsonl_timestamps() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        // One real user prompt (text), one tool_use, one tool_result
+        // (must NOT be logged as UserPromptSubmit).
+        let lines = vec![
+            r#"{"type":"user","timestamp":"2024-01-01T10:00:00Z","message":{"content":"how do I build this?"}}"#,
+            r#"{"type":"assistant","timestamp":"2024-01-01T10:00:05Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"user","timestamp":"2024-01-01T10:00:06Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let mut sess = blank_session();
+        replay_jsonl(&path, &mut sess).unwrap();
+
+        assert_eq!(
+            sess.activity.len(),
+            2,
+            "expected 1 UserPromptSubmit + 1 PostToolUse, got: {:?}",
+            sess.activity.iter().collect::<Vec<_>>()
+        );
+
+        let user = &sess.activity[0];
+        assert_eq!(user.hook_event, "UserPromptSubmit");
+        assert_eq!(
+            user.timestamp.to_rfc3339(),
+            "2024-01-01T10:00:00+00:00",
+            "user prompt must use the JSONL timestamp, not Utc::now()"
+        );
+
+        let tool = &sess.activity[1];
+        assert_eq!(tool.hook_event, "PostToolUse");
+        assert_eq!(tool.detail.as_deref(), Some("Bash"));
+        assert_eq!(
+            tool.timestamp.to_rfc3339(),
+            "2024-01-01T10:00:05+00:00",
+            "tool use must use the JSONL timestamp, not Utc::now()"
+        );
+    }
+
+    /// A user message containing only a `tool_result` block is a tool
+    /// delivery, not a user prompt — it must not emit a
+    /// UserPromptSubmit chip (those render as yellow spikes in the bar
+    /// and would be deeply misleading if faked).
+    #[test]
+    fn bootstrap_does_not_log_tool_result_as_user_prompt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        let lines = vec![
+            r#"{"type":"assistant","timestamp":"2024-01-01T10:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#,
+            r#"{"type":"user","timestamp":"2024-01-01T10:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let mut sess = blank_session();
+        replay_jsonl(&path, &mut sess).unwrap();
+
+        assert!(
+            sess.activity
+                .iter()
+                .all(|e| e.hook_event != "UserPromptSubmit"),
+            "tool_result user message must not produce UserPromptSubmit chips"
+        );
+        assert_eq!(sess.activity.len(), 1);
+        assert_eq!(sess.activity[0].hook_event, "PostToolUse");
     }
 
     /// When an Agent's tool_result appears, it's no longer active.
