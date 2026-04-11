@@ -18,11 +18,16 @@ pub(crate) async fn observer_consumer(
 ) {
     let llm_coach = LlmCoach::new(coach.clone());
     while let Some(item) = rx.recv().await {
-        // Read the current chain — includes all previous observations.
-        let chain = {
+        // Read the current chain and session_id — chain includes all
+        // previous observations; session_id routes JSONL logging.
+        let (chain, session_id) = {
             let s = coach.read().await;
             s.sessions.get(&pid)
-                .map(|sess| sess.coach.memory.chain.clone())
+                .map(|sess| {
+                    let sid = sess.current_session_id.clone();
+                    let sid = if sid.is_empty() { None } else { Some(sid) };
+                    (sess.coach.memory.chain.clone(), sid)
+                })
                 .unwrap_or_default()
         };
 
@@ -34,6 +39,7 @@ pub(crate) async fn observer_consumer(
                 tool_name: item.tool_name,
                 tool_input: item.tool_input,
                 user_prompt: item.user_prompt,
+                session_id,
             })
             .await
         {

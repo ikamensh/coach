@@ -420,6 +420,7 @@ pub async fn replay_session(
                     tool_name: ev.tool_name.clone(),
                     tool_input: ev.tool_input.clone(),
                     user_prompt: ev.user_prompt.clone(),
+                    session_id: Some(session_id.to_string()),
                 })
                 .await
             {
@@ -444,6 +445,7 @@ pub async fn replay_session(
                     priorities: priorities.clone(),
                     chain: chain.clone(),
                     stop_reason: ev.stop_reason.clone(),
+                    session_id: Some(session_id.to_string()),
                 })
                 .await
             {

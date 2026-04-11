@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::llm_log::{LlmCallRecord, LogContext};
 use crate::settings::ModelConfig;
 use crate::state::SharedState;
 
@@ -37,6 +38,9 @@ pub struct StopContext {
     pub stop_count: usize,
     pub stop_blocked_count: usize,
     pub stop_reason: Option<String>,
+    /// Coding-session id (e.g. Claude Code session UUID). Used as a
+    /// routing key when JSONL logging is enabled.
+    pub session_id: Option<String>,
 }
 
 /// Per-call constraints for `session_send`. Everything is optional /
@@ -133,6 +137,7 @@ pub async fn evaluate_stop(
         "You evaluate whether an AI agent should stop. Respond with JSON only.",
         &prompt,
         CallConstraints { max_output_tokens: Some(200), require_json: true },
+        LogContext::new("stop_oneshot", ctx.session_id.as_deref()),
     )
     .await?;
     parse_stop_decision(&text)
@@ -264,23 +269,74 @@ pub async fn session_send(
     system_prompt: &str,
     message: &str,
     constraints: CallConstraints,
+    log_ctx: LogContext<'_>,
+) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
+    use crate::state::CoachChain;
+
+    // Snapshot logger, provider, and mock once so we can record the
+    // request and outcome without re-acquiring the lock around the await.
+    let (logger, provider_name, model_name, mock) = {
+        let s = state.read().await;
+        (
+            s.llm_logger.clone(),
+            s.model.provider.clone(),
+            s.model.model.clone(),
+            s.mock_session_send.clone(),
+        )
+    };
+    let started = std::time::Instant::now();
+
+    // Mock interception: lets tests exercise the full pipeline without a
+    // real LLM provider. Mock calls are logged too so tests can assert
+    // on the logging path without needing real providers.
+    let result: Result<(String, CoachChain, crate::state::CoachUsage), String> =
+        if let Some(mock) = mock {
+            mock(system_prompt, message).map(|(text, usage)| {
+                let new_chain = grow_mock_chain(chain, message, &text);
+                (text, new_chain, usage)
+            })
+        } else {
+            dispatch_real(state, chain, system_prompt, message, constraints).await
+        };
+
+    if let Some(logger) = logger {
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let record = LlmCallRecord {
+            ts: chrono::Utc::now(),
+            caller: log_ctx.caller.to_string(),
+            session_id: log_ctx.session_id.map(str::to_string),
+            provider: provider_name,
+            model: model_name,
+            system_prompt: system_prompt.to_string(),
+            user_message: message.to_string(),
+            chain_in: chain.clone(),
+            require_json: constraints.require_json,
+            max_output_tokens: constraints.max_output_tokens,
+            response_text: result.as_ref().ok().map(|(t, _, _)| t.clone()),
+            error: result.as_ref().err().cloned(),
+            latency_ms,
+            usage: result.as_ref().ok().map(|(_, _, u)| *u),
+            chain_out: result.as_ref().ok().map(|(_, c, _)| c.clone()),
+        };
+        logger.append(&record);
+    }
+
+    result
+}
+
+/// Real-provider dispatch extracted from `session_send` so the logging
+/// shell can own the error plumbing. Mirrors the old `match provider`
+/// body 1-for-1; the only behavior change is that we no longer read the
+/// mock here (the caller already intercepted).
+async fn dispatch_real(
+    state: &SharedState,
+    chain: &crate::state::CoachChain,
+    system_prompt: &str,
+    message: &str,
+    constraints: CallConstraints,
 ) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
     use crate::state::CoachChain;
     use rig::completion::Completion;
-
-    // Mock interception: lets tests exercise the full pipeline without a
-    // real LLM provider.
-    {
-        let s = state.read().await;
-        if let Some(ref mock) = s.mock_session_send {
-            let result = mock(system_prompt, message);
-            drop(s);
-            return result.map(|(text, usage)| {
-                let new_chain = grow_mock_chain(chain, message, &text);
-                (text, new_chain, usage)
-            });
-        }
-    }
 
     let cfg = snapshot_config(state).await?;
     let provider = cfg.primary.provider.as_str();
@@ -425,6 +481,7 @@ pub async fn observe_event(
     priorities: &[String],
     chain: &crate::state::CoachChain,
     event: &str,
+    session_id: Option<&str>,
 ) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
     let system = coach_system_prompt(priorities)?;
     session_send(
@@ -436,6 +493,7 @@ pub async fn observe_event(
             max_output_tokens: Some(80),
             require_json: false,
         },
+        LogContext::new("observer", session_id),
     )
     .await
 }
@@ -447,6 +505,7 @@ pub async fn evaluate_stop_chained(
     priorities: &[String],
     chain: &crate::state::CoachChain,
     stop_reason: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<(StopDecision, crate::state::CoachChain, crate::state::CoachUsage), String> {
     let reason = stop_reason.unwrap_or("not specified");
     let stop_chained_template = crate::prompts::load("stop_chained")?;
@@ -461,6 +520,7 @@ pub async fn evaluate_stop_chained(
             max_output_tokens: Some(200),
             require_json: true,
         },
+        LogContext::new("stop_chained", session_id),
     )
     .await?;
     let decision = parse_stop_decision(&text)?;
@@ -481,6 +541,9 @@ pub struct NameSessionInput {
     /// for "what is this conversation actually about" because it already
     /// encodes the observer's running interpretation.
     pub last_assessment: Option<String>,
+    /// Coding-session id (e.g. Claude Code session UUID). Used as a
+    /// routing key when JSONL logging is enabled.
+    pub session_id: Option<String>,
 }
 
 /// Build the prompt for `name_session`. Pure function so the test can
@@ -575,6 +638,7 @@ pub async fn name_session(
             max_output_tokens: Some(20),
             require_json: false,
         },
+        LogContext::new("namer", input.session_id.as_deref()),
     )
     .await?;
     let cleaned = clean_session_title(&text)
@@ -616,6 +680,7 @@ mod tests {
             stop_count: 2,
             stop_blocked_count: 1,
             stop_reason: Some("end_turn".into()),
+            session_id: None,
         }
     }
 
@@ -644,6 +709,7 @@ mod tests {
             stop_count: 1,
             stop_blocked_count: 0,
             stop_reason: None,
+            session_id: None,
         };
         let p = build_stop_prompt(&ctx).unwrap();
         assert!(p.contains("none set"));
@@ -777,6 +843,7 @@ mod tests {
             cwd: cwd.map(String::from),
             tool_counts: tools.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             last_assessment: last_assessment.map(String::from),
+            session_id: None,
         }
     }
 
@@ -884,6 +951,171 @@ mod tests {
         warn_emulation_once("google", "test mechanism");
         warn_emulation_once("anthropic", "test mechanism");
     }
+
+    // ── session_send ↔ llm_log wiring ───────────────────────────────────
+    //
+    // These tests drive `session_send` through the mock path so we can
+    // verify the logger hook without touching a real provider. They set
+    // a mock closure on state + install a tempdir-backed logger, then
+    // assert on the on-disk JSONL.
+
+    use crate::llm_log::LlmLogger;
+    use crate::state::{CoachUsage, MockSessionSend};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// State wired with both a mock and a tempdir-backed logger.
+    fn mocked_state_with_logger(
+        tmpdir: &tempfile::TempDir,
+        mock: MockSessionSend,
+    ) -> crate::state::SharedState {
+        let mut cs = crate::state::test_state();
+        cs.mock_session_send = Some(mock);
+        cs.llm_logger = Some(LlmLogger::at(tmpdir.path().to_path_buf()).unwrap());
+        Arc::new(RwLock::new(cs))
+    }
+
+    /// Property: every successful `session_send` call writes exactly one
+    /// JSONL line with the full request + response + usage.
+    #[tokio::test]
+    async fn session_send_writes_one_line_per_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock: MockSessionSend = Arc::new(|_system, _user| {
+            Ok((
+                "mock response".to_string(),
+                CoachUsage {
+                    input_tokens: 11,
+                    output_tokens: 3,
+                    cached_input_tokens: 0,
+                },
+            ))
+        });
+        let state = mocked_state_with_logger(&tmp, mock);
+
+        let (text, _chain, _usage) = session_send(
+            &state,
+            &crate::state::CoachChain::Empty,
+            "sys prompt",
+            "user msg",
+            CallConstraints {
+                max_output_tokens: Some(40),
+                require_json: false,
+            },
+            crate::llm_log::LogContext::new("observer", Some("sess-xyz")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "mock response");
+
+        let contents =
+            std::fs::read_to_string(tmp.path().join("sess-xyz.jsonl")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["caller"], "observer");
+        assert_eq!(v["session_id"], "sess-xyz");
+        assert_eq!(v["system_prompt"], "sys prompt");
+        assert_eq!(v["user_message"], "user msg");
+        assert_eq!(v["response_text"], "mock response");
+        assert!(v["error"].is_null());
+        assert_eq!(v["usage"]["input_tokens"], 11);
+        assert_eq!(v["usage"]["output_tokens"], 3);
+        assert_eq!(v["max_output_tokens"], 40);
+        assert_eq!(v["require_json"], false);
+    }
+
+    /// Property: mock errors are logged too — error field carries the
+    /// failure text, response_text and usage are null.
+    #[tokio::test]
+    async fn session_send_logs_errors_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock: MockSessionSend = Arc::new(|_, _| Err("boom".to_string()));
+        let state = mocked_state_with_logger(&tmp, mock);
+
+        let result = session_send(
+            &state,
+            &crate::state::CoachChain::Empty,
+            "sys",
+            "msg",
+            CallConstraints::default(),
+            crate::llm_log::LogContext::new("namer", Some("sess-err")),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let contents =
+            std::fs::read_to_string(tmp.path().join("sess-err.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(v["caller"], "namer");
+        assert_eq!(v["error"], "boom");
+        assert!(v["response_text"].is_null());
+        assert!(v["usage"].is_null());
+        assert!(v["chain_out"].is_null());
+    }
+
+    /// Property: without a logger attached, `session_send` produces no
+    /// files at all — logging is opt-in and stays off by default.
+    #[tokio::test]
+    async fn session_send_writes_nothing_when_logger_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock: MockSessionSend = Arc::new(|_, _| {
+            Ok(("ok".into(), CoachUsage::default()))
+        });
+        let mut cs = crate::state::test_state();
+        cs.mock_session_send = Some(mock);
+        // No llm_logger installed.
+        let state = Arc::new(RwLock::new(cs));
+
+        session_send(
+            &state,
+            &crate::state::CoachChain::Empty,
+            "sys",
+            "msg",
+            CallConstraints::default(),
+            crate::llm_log::LogContext::new("observer", Some("sess-nolog")),
+        )
+        .await
+        .unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        assert!(entries.is_empty(), "no logger → no files");
+    }
+
+    /// Property: each wrapper tags its caller correctly so downstream
+    /// analysis can filter by call type. Uses `observe_event` (observer)
+    /// and `evaluate_stop_chained` (stop_chained) routed through the
+    /// mock so the call shape is checked, not the LLM behavior.
+    #[tokio::test]
+    async fn wrappers_tag_their_caller_in_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock: MockSessionSend = Arc::new(|_, _| {
+            Ok((
+                r#"{"allow": true, "message": null}"#.to_string(),
+                CoachUsage::default(),
+            ))
+        });
+        let state = mocked_state_with_logger(&tmp, mock);
+        let priorities = vec!["Simplicity".into()];
+        let chain = crate::state::CoachChain::Empty;
+
+        observe_event(&state, &priorities, &chain, "event", Some("sess-q"))
+            .await
+            .unwrap();
+        evaluate_stop_chained(&state, &priorities, &chain, Some("end_turn"), Some("sess-q"))
+            .await
+            .unwrap();
+
+        let contents =
+            std::fs::read_to_string(tmp.path().join("sess-q.jsonl")).unwrap();
+        let callers: Vec<String> = contents
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["caller"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(callers, vec!["observer", "stop_chained"]);
+    }
 }
 
 // ── Live tests ─────────────────────────────────────────────────────────
@@ -926,6 +1158,7 @@ mod live_tests {
             cursor_hooks_user_enabled: false,
             codex_hooks_user_enabled: false,
             mock_session_send: None,
+            llm_logger: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
         };
@@ -944,6 +1177,7 @@ mod live_tests {
             "You are a test bot.",
             "Reply with the single word: hello",
             CallConstraints { max_output_tokens: Some(20), require_json: false },
+            LogContext::new("test", None),
         )
         .await
         .expect("session_send failed");
@@ -967,6 +1201,7 @@ mod live_tests {
             system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
             constraints,
+            LogContext::new("test", None),
         )
         .await
         .expect("first call failed");
@@ -977,6 +1212,7 @@ mod live_tests {
             system,
             "What was the token I told you to remember? Reply with just the token.",
             constraints,
+            LogContext::new("test", None),
         )
         .await
         .expect("second call failed");
@@ -998,6 +1234,7 @@ mod live_tests {
             "You return JSON only.",
             "Return JSON of the form {\"answer\": <number>}. The number is 7.",
             CallConstraints { max_output_tokens: Some(60), require_json: true },
+            LogContext::new("test", None),
         )
         .await
         .expect("session_send (json) failed");
@@ -1026,7 +1263,7 @@ mod live_tests {
         )
         .unwrap();
         let (_text1, chain1, _u1) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None)
                 .await
                 .expect("first observe_event failed");
         let id1 = match &chain1 {
@@ -1041,7 +1278,7 @@ mod live_tests {
             None,
         )
         .unwrap();
-        let (_text2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
+        let (_text2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None)
             .await
             .expect("second observe_event failed");
         let id2 = match &chain2 {
@@ -1069,7 +1306,7 @@ mod live_tests {
         )
         .unwrap();
         let (_text, observed_chain, _u) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None)
                 .await
                 .expect("observe failed");
 
@@ -1078,6 +1315,7 @@ mod live_tests {
             &priorities,
             &observed_chain,
             Some("end_turn"),
+            None,
         )
         .await
         .expect("evaluate_stop_chained failed");
@@ -1105,6 +1343,7 @@ mod live_tests {
             &priorities,
             &crate::state::CoachChain::Empty,
             Some("end_turn"),
+            None,
         )
         .await
         .expect("first-turn evaluate_stop_chained failed");
@@ -1142,6 +1381,7 @@ mod live_tests {
             cursor_hooks_user_enabled: false,
             codex_hooks_user_enabled: false,
             mock_session_send: None,
+            llm_logger: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
         };
@@ -1159,6 +1399,7 @@ mod live_tests {
             "You are a test bot. Respond with one word.",
             "Reply with the single word: hello",
             CallConstraints { max_output_tokens: Some(20), require_json: false },
+            LogContext::new("test", None),
         )
         .await
         .expect("session_send failed");
@@ -1187,6 +1428,7 @@ mod live_tests {
             system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
             constraints,
+            LogContext::new("test", None),
         )
         .await
         .expect("first call failed");
@@ -1197,6 +1439,7 @@ mod live_tests {
             system,
             "What was the token I told you to remember? Reply with just the token.",
             constraints,
+            LogContext::new("test", None),
         )
         .await
         .expect("second call failed");
@@ -1226,7 +1469,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t1, chain1, _u1) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None)
                 .await
                 .expect("first observe_event failed");
         let h1 = match &chain1 {
@@ -1241,7 +1484,7 @@ mod live_tests {
             None,
         )
         .unwrap();
-        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
+        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None)
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
@@ -1267,7 +1510,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t, observed_chain, _u_obs) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None)
                 .await
                 .expect("observe failed");
 
@@ -1276,6 +1519,7 @@ mod live_tests {
             &priorities,
             &observed_chain,
             Some("end_turn"),
+            None,
         )
         .await
         .expect("evaluate_stop_chained failed");
@@ -1324,6 +1568,7 @@ mod live_tests {
             cursor_hooks_user_enabled: false,
             codex_hooks_user_enabled: false,
             mock_session_send: None,
+            llm_logger: None,
             #[cfg(feature = "pycoach")]
             pycoach: None,
         };
@@ -1341,6 +1586,7 @@ mod live_tests {
             "You are a test bot. Respond with one word.",
             "Reply with the single word: hello",
             CallConstraints { max_output_tokens: Some(20), require_json: false },
+            LogContext::new("test", None),
         )
         .await
         .expect("session_send failed");
@@ -1366,6 +1612,7 @@ mod live_tests {
             system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
             constraints,
+            LogContext::new("test", None),
         )
         .await
         .expect("first call failed");
@@ -1376,6 +1623,7 @@ mod live_tests {
             system,
             "What was the token I told you to remember? Reply with just the token.",
             constraints,
+            LogContext::new("test", None),
         )
         .await
         .expect("second call failed");
@@ -1405,7 +1653,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t1, chain1, _u1) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None)
                 .await
                 .expect("first observe_event failed");
         let h1 = match &chain1 {
@@ -1420,7 +1668,7 @@ mod live_tests {
             None,
         )
         .unwrap();
-        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2)
+        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None)
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
@@ -1446,7 +1694,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t, observed_chain, _u_obs) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None)
                 .await
                 .expect("observe failed");
 
@@ -1455,6 +1703,7 @@ mod live_tests {
             &priorities,
             &observed_chain,
             Some("end_turn"),
+            None,
         )
         .await
         .expect("evaluate_stop_chained failed");

@@ -269,6 +269,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
         }
 
         let prev_chain = session.coach.memory.chain.clone();
+        let session_id_owned = session.current_session_id.clone();
         let ctx = StopContext {
             priorities,
             cwd: session.cwd.clone(),
@@ -276,6 +277,11 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
             stop_count: session.stop_count,
             stop_blocked_count: session.stop_blocked_count,
             stop_reason: payload.stop_reason.clone(),
+            session_id: if session_id_owned.is_empty() {
+                None
+            } else {
+                Some(session_id_owned)
+            },
         };
         (coach_mode, provider_capable, prev_chain, ctx)
     };
@@ -293,6 +299,7 @@ pub(crate) async fn run_stop(state: &AppState, pid: u32, payload: HookPayload) -
                     priorities: ctx.priorities.clone(),
                     chain: prev_chain,
                     stop_reason: ctx.stop_reason.clone(),
+                    session_id: ctx.session_id.clone(),
                 })
                 .await
             {
@@ -519,11 +526,13 @@ pub(crate) async fn run_post_tool_use(
 
         namer_input = if llm_active && should_request_title(event_count) {
             let session = coach.sessions.get(&pid).expect("apply_hook_event populated");
+            let sid = session.current_session_id.clone();
             Some(NameSessionInput {
                 priorities: coach.priorities.clone(),
                 cwd: session.cwd.clone(),
                 tool_counts: session.tool_counts.clone(),
                 last_assessment: session.coach.memory.last_assessment.clone(),
+                session_id: if sid.is_empty() { None } else { Some(sid) },
             })
         } else {
             None

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
+use crate::llm_log::LlmLogger;
 #[cfg(feature = "pycoach")]
 use crate::pycoach::Pycoach;
 use crate::settings::{CoachRule, EngineMode, HookTarget, ModelConfig, Settings};
@@ -360,6 +361,11 @@ pub struct CoachState {
     /// When set, `llm::session_send` returns this function's result instead
     /// of calling a real provider. Used by scenario replay tests.
     pub mock_session_send: Option<MockSessionSend>,
+    /// When set, every call through `llm::session_send` appends a JSONL
+    /// record to a per-coding-session file in the logger's run dir.
+    /// Populated from `COACH_LLM_LOG_DIR` at startup; `None` disables
+    /// logging entirely with no overhead.
+    pub llm_logger: Option<Arc<LlmLogger>>,
     /// Optional Python sidecar (`pycoach serve`). `None` until/unless the
     /// user opts in via `COACH_PYCOACH_BIN` / `COACH_PYCOACH_CMD`. The Arc
     /// owns a child process with `kill_on_drop`, so dropping `CoachState`
@@ -424,6 +430,7 @@ impl CoachState {
             cursor_hooks_user_enabled: settings.cursor_hooks_user_enabled,
             codex_hooks_user_enabled: settings.codex_hooks_user_enabled,
             mock_session_send: None,
+            llm_logger: LlmLogger::from_env(),
             #[cfg(feature = "pycoach")]
             pycoach: None,
         }
@@ -728,6 +735,7 @@ pub(crate) fn test_state() -> CoachState {
         cursor_hooks_user_enabled: false,
         codex_hooks_user_enabled: false,
         mock_session_send: None,
+        llm_logger: None,
         #[cfg(feature = "pycoach")]
         pycoach: None,
     }

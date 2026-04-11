@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod coach;
 pub mod llm;
+pub mod llm_log;
 pub mod logging;
 pub mod path_install;
 pub mod pid_resolver;

@@ -9,6 +9,9 @@ pub struct ObserveToolUseInput {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub user_prompt: Option<String>,
+    /// Coding-session id (e.g. Claude Code session UUID). Used as a
+    /// routing key when JSONL logging is enabled.
+    pub session_id: Option<String>,
 }
 
 pub struct ObserveToolUseOutput {
@@ -26,6 +29,8 @@ pub struct ChainedStopInput {
     pub priorities: Vec<String>,
     pub chain: CoachChain,
     pub stop_reason: Option<String>,
+    /// Coding-session id for JSONL logging routing.
+    pub session_id: Option<String>,
 }
 
 pub struct ChainedStopOutput {
@@ -63,8 +68,14 @@ impl LlmCoach {
             input.user_prompt.as_deref(),
         )?;
         let system = crate::llm::coach_system_prompt(&input.priorities)?;
-        let (assessment, chain, usage) =
-            crate::llm::observe_event(&self.state, &input.priorities, &input.chain, &event).await?;
+        let (assessment, chain, usage) = crate::llm::observe_event(
+            &self.state,
+            &input.priorities,
+            &input.chain,
+            &event,
+            input.session_id.as_deref(),
+        )
+        .await?;
         Ok(ObserveToolUseOutput {
             assessment,
             chain,
@@ -87,6 +98,7 @@ impl LlmCoach {
             &input.priorities,
             &input.chain,
             input.stop_reason.as_deref(),
+            input.session_id.as_deref(),
         )
         .await?;
         Ok(ChainedStopOutput {
@@ -141,6 +153,7 @@ mod tests {
                 tool_name: "Edit".into(),
                 tool_input: serde_json::json!({ "new_string": "hello" }),
                 user_prompt: Some("keep the session list stable".into()),
+                session_id: None,
             })
             .await
             .unwrap();
@@ -168,6 +181,7 @@ mod tests {
                 stop_count: 1,
                 stop_blocked_count: 0,
                 stop_reason: Some("end_turn".into()),
+                session_id: None,
             })
             .await
             .unwrap();
@@ -193,6 +207,7 @@ mod tests {
                 cwd: Some("/tmp/project".into()),
                 tool_counts: HashMap::from([("Edit".into(), 3)]),
                 last_assessment: Some("Splitting the coach boundary.".into()),
+                session_id: None,
             })
             .await
             .unwrap();
