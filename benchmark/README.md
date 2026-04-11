@@ -38,11 +38,28 @@ scenario's one-line summary.
 
 ## Scenarios
 
+### Rules-mode (deterministic, always runs)
+
 | Scenario | Source | One-line purpose |
 |---|---|---|
 | [away_stop_blocks_with_priorities](away_stop_blocks_with_priorities.md) | USER_STORIES G6 | In Away mode the first Stop must be blocked with the priority list injected as the block reason. |
 | [away_stop_cooldown_passes_second](away_stop_cooldown_passes_second.md) | USER_STORIES G7 | After a Stop is blocked, a second Stop within the cooldown window must pass through — no stacked blocks. |
 | [away_permission_auto_approved](away_permission_auto_approved.md) | USER_STORIES G5 | In Away mode a PermissionRequest must be auto-approved so the user can walk away without a modal. |
+
+### LLM-mode (real API calls, `#[ignore]` by default)
+
+These scenarios drive the LLM-backed observer + stop evaluator with
+real coaching prompts and a real model. They need an API key in the
+environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+`GOOGLE_API_KEY`) and are `#[ignore]`d so a default `cargo test`
+run stays deterministic and costs nothing.
+
+| Scenario | Source | One-line purpose |
+|---|---|---|
+| [llm_agent_asks_instead_of_acting](llm_agent_asks_instead_of_acting.md) | `scenario_replay::agent_asks_instead_of_acting` | Agent stops to ask instead of deciding — coach must block. |
+| [llm_agent_gives_up_early](llm_agent_gives_up_early.md) | `scenario_replay::agent_gives_up_immediately` | Agent reads one file and stops with priorities unmet — coach must block. |
+| [llm_agent_completes_task](llm_agent_completes_task.md) | `scenario_replay::agent_completes_the_task` | Agent actually finishes the work — coach should allow. **Aspirational** — LLM judgment flaky. |
+| [llm_agent_scaffolds_project](llm_agent_scaffolds_project.md) | `scenario_replay::agent_scaffolds_new_project` | Agent scaffolds a full Express project — coach should allow. **Aspirational**. |
 
 ## Scenario file schema (`*.json`)
 
@@ -135,12 +152,29 @@ it's probably two scenarios pretending to be one.
 
 ## Running
 
-The runner is `coach-core/tests/benchmark_suite.rs` — a data-driven
-integration test that walks `benchmark/*.json`, boots a headless
-coach server for each, dispatches the events, and asserts. Run with:
+The runner is `coach-core/tests/benchmark_suite.rs`. Each scenario
+is a standalone `#[tokio::test]`, declared near the bottom of that
+file via the `scenario!` / `llm_scenario!` macros. That means:
+
+- Test nav in IDEs shows one entry per scenario.
+- `cargo test <prefix>` selectively runs a subset
+  (`cargo test away_stop` runs both stop scenarios, nothing else).
+- CI output lists pass/fail per scenario, not one monolithic test.
+
+Default run (rules-mode scenarios only — cheap and deterministic):
 
 ```
 cargo test -p coach-core --test benchmark_suite
+```
+
+Full run, including LLM-mode scenarios (needs an API key):
+
+```
+# Set one of these first:
+export ANTHROPIC_API_KEY=...
+# or OPENAI_API_KEY / GOOGLE_API_KEY
+
+cargo test -p coach-core --test benchmark_suite -- --ignored
 ```
 
 A failure points at the specific scenario, the specific event
@@ -150,12 +184,25 @@ isolated `AppState`.
 
 ## Adding a scenario
 
-1. Copy an existing pair as a starting point (`cp away_stop_blocks_with_priorities.{md,json} new_name.{md,json}`).
-2. Edit the JSON: `name`, `description`, `events`, `expect`.
-3. Edit the `.md`: tell the story, explain why it's here.
+1. Copy an existing pair as a starting point:
+   `cp away_stop_blocks_with_priorities.{md,json} new_name.{md,json}`
+2. Edit the JSON: `name` (must match the filename stem),
+   `description`, `mode`, `events`, `expect`.
+3. Edit the `.md`: tell the story, explain why it's here, cover the
+   *What's happening / Why / Expected / Known limits* sections
+   described below in "`.md` file contract".
 4. Add a row to the **Scenarios** table in this README.
-5. `cargo test -p coach-core --test benchmark_suite` should pick it
-   up automatically — no code changes to the runner.
+5. Register the test in `coach-core/tests/benchmark_suite.rs` — one
+   line near the bottom:
+
+   ```rust
+   scenario!(new_name, "new_name");
+   // …or, for LLM-mode scenarios:
+   llm_scenario!(new_name, "new_name");
+   ```
+
+6. `cargo test -p coach-core --test benchmark_suite new_name`
+   should pick up and run the new scenario.
 
 ## What belongs here, what doesn't
 

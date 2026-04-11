@@ -1,0 +1,63 @@
+{
+  "name": "llm_agent_scaffolds_project",
+  "source": "scenario_replay::agent_scaffolds_new_project",
+  "description": "Agent npm-inits, installs express, writes index.js, runs node. Both priorities met — coach should allow the stop. Aspirational: real LLM may block occasionally.",
+
+  "mode": "llm",
+  "priorities": [
+    "Create a new Express.js hello-world server",
+    "Make sure it starts and responds on port 3000"
+  ],
+  "session_id": "bench-llm-scaffold",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": {
+        "prompt": "Set up a new Express hello world project in this empty directory"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Bash",
+        "tool_input": { "command": "cd /home/dev/hello-server && npm init -y" },
+        "cwd": "/home/dev/hello-server"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Bash",
+        "tool_input": { "command": "cd /home/dev/hello-server && npm install express" },
+        "cwd": "/home/dev/hello-server"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "/home/dev/hello-server/index.js",
+          "content": "const express = require('express');\nconst app = express();\n\napp.get('/', (req, res) => {\n  res.send('Hello World!');\n});\n\napp.listen(3000, () => {\n  console.log('Server running on port 3000');\n});\n"
+        },
+        "cwd": "/home/dev/hello-server"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Bash",
+        "tool_input": { "command": "cd /home/dev/hello-server && timeout 3 node index.js || true" },
+        "cwd": "/home/dev/hello-server"
+      }
+    },
+    {
+      "hook": "stop",
+      "body": { "stop_reason": "end_turn" },
+      "expect": {
+        "passthrough": true
+      }
+    }
+  ]
+}

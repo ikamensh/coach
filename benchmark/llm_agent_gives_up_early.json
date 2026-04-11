@@ -1,0 +1,36 @@
+{
+  "name": "llm_agent_gives_up_early",
+  "source": "scenario_replay::agent_gives_up_immediately",
+  "description": "Agent reads one file and stops with two priorities unmet. Coach must block and push for more investigation.",
+
+  "mode": "llm",
+  "priorities": [
+    "Fix the crash in the payment processing module",
+    "Add a regression test"
+  ],
+  "session_id": "bench-llm-giveup",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": {
+        "prompt": "Users are reporting a crash when processing payments over $1000"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Read",
+        "tool_input": { "file_path": "/home/dev/shop/src/payments.py" },
+        "cwd": "/home/dev/shop"
+      }
+    },
+    {
+      "hook": "stop",
+      "body": { "stop_reason": "end_turn" },
+      "expect": {
+        "decision": "block"
+      }
+    }
+  ]
+}

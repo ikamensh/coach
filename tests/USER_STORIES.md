@@ -10,6 +10,10 @@ of state they need. Each story has:
 - **Coverage** — `Auto via <test>` if a Rust test already proves this
   property, or `VM only` if it can only be exercised against a real
   binary on a real OS
+- **Behavior** — pointer to a `benchmark/*.md` scenario that pins
+  down the coach's *reaction*, when the story has one. VM stories
+  prove the wire is alive; benchmark scenarios prove the brain
+  reacts correctly. They're complementary — a full run wants both.
 
 See `tests/README.md` for the full test stack and where each layer
 fits. **The high-value stories on a VM run are the ones tagged
@@ -321,6 +325,10 @@ Code's debug log doesn't ship a regression that breaks the wire
   `hook_integration::permission_request_auto_approves_in_away_mode`.
   Mark as **interactive-claude only** until the upstream regression
   is fixed.
+- **Behavior**: `benchmark/away_permission_auto_approved.md` —
+  same intervention contract, exercised through the HTTP dispatch
+  path without needing a real claude process. Run via `cargo test
+  -p coach-core --test benchmark_suite away_permission`.
 
 ### G6. Away mode blocks Stop and injects priorities
 - **Setup**: as G5; `coach config set priorities "ship the test,fix the bug"`.
@@ -330,6 +338,9 @@ Code's debug log doesn't ship a regression that breaks the wire
   PID.
 - **Coverage**: HTTP contract via `hook_integration::stop_blocks_then_allows_on_cooldown`;
   end-to-end live wire is `VM only`.
+- **Behavior**: `benchmark/away_stop_blocks_with_priorities.md` —
+  the canonical "away-mode interrupt" scenario, rules-mode. Run via
+  `cargo test -p coach-core --test benchmark_suite away_stop_blocks`.
 
 ### G7. Cooldown: only one block per N seconds
 - **Steps**: trigger Stop twice within the cooldown window.
@@ -337,6 +348,10 @@ Code's debug log doesn't ship a regression that breaks the wire
   `stop_blocked_count` only incremented once.
 - **Coverage**: HTTP contract via `hook_integration::stop_blocks_then_allows_on_cooldown`
   (15 s `STOP_COOLDOWN`); end-to-end live wire is `VM only`.
+- **Behavior**: `benchmark/away_stop_cooldown_passes_second.md` —
+  asserts the second-stop-passes-through half of the cooldown
+  contract. Run via `cargo test -p coach-core --test benchmark_suite
+  away_stop_cooldown`.
 
 ---
 

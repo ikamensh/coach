@@ -1,0 +1,42 @@
+{
+  "name": "llm_agent_asks_instead_of_acting",
+  "source": "scenario_replay::agent_asks_instead_of_acting",
+  "description": "Agent stops to ask instead of deciding, despite a priority that explicitly permits deciding. Coach must block.",
+
+  "mode": "llm",
+  "priorities": [
+    "Build a hello world web server",
+    "Use whatever language the project already uses"
+  ],
+  "session_id": "bench-llm-asks",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": { "prompt": "Build me a hello world web server" }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Read",
+        "tool_input": { "file_path": "/home/dev/myproject/package.json" },
+        "cwd": "/home/dev/myproject"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Glob",
+        "tool_input": { "pattern": "src/**/*.ts" },
+        "cwd": "/home/dev/myproject"
+      }
+    },
+    {
+      "hook": "stop",
+      "body": { "stop_reason": "end_turn" },
+      "expect": {
+        "decision": "block"
+      }
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "name": "llm_agent_completes_task",
+  "source": "scenario_replay::agent_completes_the_task",
+  "description": "Agent adds a /health endpoint, writes a test, runs it, and stops. Both priorities are done — coach should allow the stop. Aspirational: real LLM may block occasionally.",
+
+  "mode": "llm",
+  "priorities": [
+    "Add a /health endpoint that returns 200 OK with {\"status\": \"ok\"}",
+    "Write a test for it"
+  ],
+  "session_id": "bench-llm-done",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": {
+        "prompt": "Add a /health endpoint to the API server"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Read",
+        "tool_input": { "file_path": "/home/dev/api-server/src/server.py" },
+        "cwd": "/home/dev/api-server"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Edit",
+        "tool_input": {
+          "file_path": "/home/dev/api-server/src/server.py",
+          "old_string": "app = Flask(__name__)\n\n@app.route('/')",
+          "new_string": "app = Flask(__name__)\n\n@app.route('/health')\ndef health():\n    return jsonify({\"status\": \"ok\"}), 200\n\n@app.route('/')"
+        },
+        "cwd": "/home/dev/api-server"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "/home/dev/api-server/tests/test_health.py",
+          "content": "import pytest\nfrom src.server import app\n\n@pytest.fixture\ndef client():\n    return app.test_client()\n\ndef test_health_returns_200(client):\n    resp = client.get('/health')\n    assert resp.status_code == 200\n    assert resp.json == {\"status\": \"ok\"}\n"
+        },
+        "cwd": "/home/dev/api-server"
+      }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Bash",
+        "tool_input": { "command": "cd /home/dev/api-server && python -m pytest tests/test_health.py -v" },
+        "cwd": "/home/dev/api-server"
+      }
+    },
+    {
+      "hook": "stop",
+      "body": { "stop_reason": "end_turn" },
+      "expect": {
+        "passthrough": true
+      }
+    }
+  ]
+}
