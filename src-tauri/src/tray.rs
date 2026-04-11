@@ -75,11 +75,11 @@ fn toggle_all(state: &SharedState, handle: &tauri::AppHandle) {
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         let new_mode = state::mutate(&state, &emitter, |s| {
-            let new_mode = match s.default_mode {
+            let new_mode = match s.sessions.default_mode {
                 CoachMode::Present => CoachMode::Away,
                 CoachMode::Away => CoachMode::Present,
             };
-            s.set_all_modes(new_mode);
+            s.sessions.set_all_modes(new_mode);
             new_mode
         })
         .await;

@@ -337,7 +337,7 @@ pub async fn replay_session(
 
     // Snapshot priorities before any awaits — LLM calls below acquire
     // their own short-lived read locks.
-    let priorities: Vec<String> = state.read().await.priorities.clone();
+    let priorities: Vec<String> = state.read().await.config.priorities.clone();
 
     // Extract hook events from the transcript, tracking the last user
     // message so each event carries the same `user_prompt` the live
@@ -624,7 +624,7 @@ mod tests {
         // the user's `~/.coach/settings.json` (which might point at a
         // model the test environment can't reach).
         let mut coach = crate::state::test_state();
-        coach.env_tokens.insert("google".into(), google_key);
+        coach.services.env_tokens.insert("google".into(), google_key);
         let state: SharedState = Arc::new(RwLock::new(coach));
 
         let result = replay_session(&session.id, "llm", &state)

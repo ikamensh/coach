@@ -22,7 +22,7 @@ pub async fn set_session_mode(
     mode: CoachMode,
 ) -> Result<(), String> {
     state::mutate(&state, emitter.inner(), |s| {
-        s.set_session_mode(&session_id, mode)
+        s.sessions.set_session_mode(&session_id, mode)
     })
     .await;
     Ok(())
@@ -35,7 +35,7 @@ pub async fn set_all_sessions_mode(
     app: tauri::AppHandle,
     mode: CoachMode,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.set_all_modes(mode)).await;
+    state::mutate(&state, emitter.inner(), |s| s.sessions.set_all_modes(mode)).await;
     crate::tray::update_icon(&app, &mode);
     Ok(())
 }
@@ -46,7 +46,10 @@ pub async fn set_priorities(
     emitter: Emitter<'_>,
     priorities: Vec<String>,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.update_priorities(priorities)).await;
+    state::mutate(&state, emitter.inner(), |s| {
+        s.config.update_priorities(priorities)
+    })
+    .await;
     Ok(())
 }
 
@@ -56,7 +59,7 @@ pub async fn set_theme(
     emitter: Emitter<'_>,
     theme: Theme,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.update_theme(theme.clone())).await;
+    state::mutate(&state, emitter.inner(), |s| s.config.update_theme(theme.clone())).await;
     emitter.emit_theme_changed(&theme);
     Ok(())
 }
@@ -68,7 +71,10 @@ pub async fn set_api_token(
     provider: String,
     token: String,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.update_api_token(&provider, &token)).await;
+    state::mutate(&state, emitter.inner(), |s| {
+        s.config.update_api_token(&provider, &token)
+    })
+    .await;
     Ok(())
 }
 
@@ -78,7 +84,7 @@ pub async fn set_model(
     emitter: Emitter<'_>,
     model: ModelConfig,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.update_model(model)).await;
+    state::mutate(&state, emitter.inner(), |s| s.config.update_model(model)).await;
     Ok(())
 }
 
@@ -120,7 +126,7 @@ pub async fn validate_model(
         .effective_token(&provider)
         .ok_or("No API key configured")?
         .to_string();
-    let client = s.http_client.clone();
+    let client = s.services.http_client.clone();
     drop(s);
 
     match provider.as_str() {
@@ -175,7 +181,7 @@ pub async fn validate_model(
 
 async fn do_get_hook_status(state: &SharedState, target: HookTarget) -> Result<HookStatus, String> {
     let s = state.read().await;
-    Ok(target.check_status(s.port))
+    Ok(target.check_status(s.config.port))
 }
 
 async fn do_install_hooks(
@@ -184,8 +190,8 @@ async fn do_install_hooks(
     target: HookTarget,
 ) -> Result<HookStatus, String> {
     let port = state::mutate(state, emitter, |s| {
-        s.set_hook_enabled(target, true);
-        s.port
+        s.config.set_hook_enabled(target, true);
+        s.config.port
     })
     .await;
     target.install(port)?;
@@ -198,8 +204,8 @@ async fn do_uninstall_hooks(
     target: HookTarget,
 ) -> Result<HookStatus, String> {
     let port = state::mutate(state, emitter, |s| {
-        s.set_hook_enabled(target, false);
-        s.port
+        s.config.set_hook_enabled(target, false);
+        s.config.port
     })
     .await;
     target.uninstall(port)?;
@@ -273,7 +279,10 @@ pub async fn set_coach_mode(
     emitter: Emitter<'_>,
     coach_mode: EngineMode,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.update_coach_mode(coach_mode)).await;
+    state::mutate(&state, emitter.inner(), |s| {
+        s.config.update_coach_mode(coach_mode)
+    })
+    .await;
     Ok(())
 }
 
@@ -283,7 +292,7 @@ pub async fn set_rules(
     emitter: Emitter<'_>,
     rules: Vec<CoachRule>,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.update_rules(rules)).await;
+    state::mutate(&state, emitter.inner(), |s| s.config.update_rules(rules)).await;
     Ok(())
 }
 
@@ -293,7 +302,10 @@ pub async fn set_auto_uninstall_hooks_on_exit(
     emitter: Emitter<'_>,
     enabled: bool,
 ) -> Result<(), String> {
-    state::mutate(&state, emitter.inner(), |s| s.update_auto_uninstall(enabled)).await;
+    state::mutate(&state, emitter.inner(), |s| {
+        s.config.update_auto_uninstall(enabled)
+    })
+    .await;
     Ok(())
 }
 
@@ -305,7 +317,7 @@ pub async fn set_intervention_muted(
     muted: bool,
 ) -> Result<(), String> {
     state::mutate(&state, emitter.inner(), |s| {
-        s.set_intervention_muted(&session_id, muted)
+        s.sessions.set_intervention_muted(&session_id, muted)
     })
     .await;
     Ok(())

@@ -283,14 +283,16 @@ pub async fn sync_all_sessions_with(
 
     // ── Claude Code sessions ────────────────────────────────────────
     for session in claude_live {
-        let created = coach.register_discovered_pid(
+        let created = coach.sessions.register_discovered_pid(
             session.pid,
             session.cwd.as_deref(),
             session.started_at_utc(),
         );
         if created {
-            if let Some(key) = coach.session_key_for_pid(session.pid) {
-                coach.log(&key, "Scanner", "process discovered", session.cwd.clone());
+            if let Some(key) = coach.sessions.session_key_for_pid(session.pid) {
+                coach
+                    .sessions
+                    .log(&key, "Scanner", "process discovered", session.cwd.clone());
             }
             changed = true;
         }
@@ -300,18 +302,18 @@ pub async fn sync_all_sessions_with(
     // ── Codex CLI sessions ──────────────────────────────────────────
     for session in codex_live {
         let pid = fake_pid_for_sid(&session.thread_id);
-        let created = coach.register_discovered_pid(
+        let created = coach.sessions.register_discovered_pid(
             pid,
             session.cwd.as_deref(),
             session.started_at_utc(),
         );
         // Placeholders live under a sentinel key until a hook fills in
         // the real session_id, so we look them up by pid.
-        let Some(current_key) = coach.session_key_for_pid(pid) else {
+        let Some(current_key) = coach.sessions.session_key_for_pid(pid) else {
             continue;
         };
         if created {
-            coach.log(
+            coach.sessions.log(
                 &current_key,
                 "Scanner",
                 "codex session discovered",
@@ -319,7 +321,7 @@ pub async fn sync_all_sessions_with(
             );
             changed = true;
         }
-        coach.mark_client(&current_key, SessionClient::Codex);
+        coach.sessions.mark_client(&current_key, SessionClient::Codex);
         // Set thread name as session title if we have one and coach hasn't set its own.
         if let (Some(name), Some(sess)) =
             (&session.thread_name, coach.sessions.get_mut(&current_key))
@@ -331,7 +333,7 @@ pub async fn sync_all_sessions_with(
     }
 
     // ── Cleanup ─────────────────────────────────────────────────────
-    let dead = coach.remove_dead_pids(&live_pids);
+    let dead = coach.sessions.remove_dead_pids(&live_pids);
     if !dead.is_empty() {
         changed = true;
     }
@@ -359,7 +361,7 @@ fn bootstrap_claude_session(
     projects_dir: &Path,
     changed: &mut bool,
 ) {
-    let Some(key) = coach.session_key_for_pid(session.pid) else {
+    let Some(key) = coach.sessions.session_key_for_pid(session.pid) else {
         return;
     };
     let sess_state_sid = {
@@ -392,7 +394,7 @@ fn bootstrap_claude_session(
             sess.bootstrapped_session_id = Some(effective_sid);
             sess.bootstrapped = true;
             let agents = sess.active_agents;
-            coach.log(
+            coach.sessions.log(
                 &key,
                 "Scanner",
                 "bootstrapped from JSONL",
@@ -798,7 +800,7 @@ mod tests {
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
 
         let coach = state.read().await;
-        let sess = coach.session_for_pid(my_pid).expect("session should exist");
+        let sess = coach.sessions.session_for_pid(my_pid).expect("session should exist");
         assert!(sess.bootstrapped);
         assert_eq!(sess.tool_counts.get("Read"), Some(&1));
         assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
@@ -836,7 +838,7 @@ mod tests {
         // Hook creates session first — empty tool_counts.
         {
             let mut coach = state.write().await;
-            coach.apply_hook_event(my_pid, sid, Some(cwd));
+            coach.sessions.apply_hook_event(my_pid, sid, Some(cwd));
             let sess = coach.sessions.get(sid).unwrap();
             assert!(sess.tool_counts.is_empty(), "hook-created session starts empty");
             assert!(!sess.bootstrapped);
@@ -889,7 +891,7 @@ mod tests {
         // Hook arrives first with the CURRENT conversation id.
         {
             let mut coach = state.write().await;
-            coach.apply_hook_event(my_pid, hook_sid, Some(cwd));
+            coach.sessions.apply_hook_event(my_pid, hook_sid, Some(cwd));
         }
 
         // Scanner bootstraps — should load the hook_sid's JSONL.
@@ -912,7 +914,7 @@ mod tests {
         drop(coach);
         {
             let mut coach = state.write().await;
-            let sess = coach.apply_hook_event(my_pid, hook_sid, Some(cwd));
+            let sess = coach.sessions.apply_hook_event(my_pid, hook_sid, Some(cwd));
             assert!(sess.event_count > 1,
                 "next hook should increment, not reset; got event_count={}",
                 sess.event_count);
@@ -949,7 +951,7 @@ mod tests {
 
         {
             let coach = state.read().await;
-            let sess = coach.session_for_pid(my_pid).unwrap();
+            let sess = coach.sessions.session_for_pid(my_pid).unwrap();
             assert!(sess.bootstrapped);
             assert!(sess.session_id.is_empty());
             assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
@@ -960,7 +962,7 @@ mod tests {
         // its bootstrapped_session_id doesn't match.
         {
             let mut coach = state.write().await;
-            let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
+            let sess = coach.sessions.apply_hook_event(my_pid, real_sid, Some(cwd));
             assert_eq!(sess.session_id, real_sid);
             assert_eq!(sess.event_count, 0, "stale data discarded, no tools yet");
             assert!(sess.tool_counts.is_empty(),
@@ -1010,7 +1012,7 @@ mod tests {
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
         {
             let coach = state.read().await;
-            let sess = coach.session_for_pid(my_pid).unwrap();
+            let sess = coach.sessions.session_for_pid(my_pid).unwrap();
             assert_eq!(sess.tool_counts.get("Bash"), Some(&1), "stale bootstrap loaded");
             assert_eq!(sess.event_count, 1);
         }
@@ -1018,7 +1020,7 @@ mod tests {
         // ── Step 2: First hook with real session_id → discard stale ──
         {
             let mut coach = state.write().await;
-            let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
+            let sess = coach.sessions.apply_hook_event(my_pid, real_sid, Some(cwd));
             assert_eq!(sess.event_count, 0, "stale data discarded");
             assert!(sess.tool_counts.is_empty());
         }
@@ -1039,7 +1041,7 @@ mod tests {
         // ── Step 4: Subsequent hooks don't change event_count (record_tool does) ──
         {
             let mut coach = state.write().await;
-            let sess = coach.apply_hook_event(my_pid, real_sid, Some(cwd));
+            let sess = coach.sessions.apply_hook_event(my_pid, real_sid, Some(cwd));
             assert_eq!(sess.event_count, 4, "apply_hook_event doesn't touch event_count");
             sess.record_tool("Bash");
             assert_eq!(sess.event_count, 5);
@@ -1074,7 +1076,7 @@ mod tests {
 
         {
             let coach = state.read().await;
-            let sess = coach.session_for_pid(my_pid).unwrap();
+            let sess = coach.sessions.session_for_pid(my_pid).unwrap();
             assert_eq!(sess.event_count, 2);
         }
 
@@ -1083,7 +1085,7 @@ mod tests {
         // matches.
         {
             let mut coach = state.write().await;
-            let sess = coach.apply_hook_event(my_pid, sid, Some(cwd));
+            let sess = coach.sessions.apply_hook_event(my_pid, sid, Some(cwd));
             assert_eq!(sess.event_count, 2,
                 "bootstrap counts preserved, hook doesn't increment");
             assert_eq!(sess.tool_counts.get("Read"), Some(&1));
@@ -1160,7 +1162,7 @@ mod tests {
 
         let coach = state.read().await;
         let pid = fake_pid_for_sid("codex-thread-001");
-        let sess = coach.session_for_pid(pid).expect("codex session should exist");
+        let sess = coach.sessions.session_for_pid(pid).expect("codex session should exist");
         assert_eq!(sess.client, SessionClient::Codex);
         assert_eq!(sess.cwd, Some("/tmp/codex-project".into()));
         assert_eq!(
@@ -1187,7 +1189,7 @@ mod tests {
         // Hook creates session first.
         {
             let mut coach = state.write().await;
-            coach.apply_hook_event(pid, thread_id, Some("/tmp/hook-cwd"));
+            coach.sessions.apply_hook_event(pid, thread_id, Some("/tmp/hook-cwd"));
             let sess = coach.sessions.get_mut(thread_id).unwrap();
             sess.record_tool("Bash");
         }
@@ -1235,7 +1237,7 @@ mod tests {
         let cursor_pid = fake_pid_for_sid("cursor-session-xyz");
         {
             let mut coach = state.write().await;
-            coach.apply_hook_event(cursor_pid, "cursor-session-xyz", Some("/tmp/cursor"));
+            coach.sessions.apply_hook_event(cursor_pid, "cursor-session-xyz", Some("/tmp/cursor"));
         }
 
         // Run scanner with no Claude or Codex sessions — the hook session
@@ -1251,7 +1253,7 @@ mod tests {
 
         let coach = state.read().await;
         assert!(
-            coach.session_for_pid(cursor_pid).is_some(),
+            coach.sessions.session_for_pid(cursor_pid).is_some(),
             "recently active hook session should not be evicted"
         );
     }

@@ -37,6 +37,8 @@ impl SessionSource {
     }
 }
 
+
+
 /// Domain event: transport-agnostic description of what just happened
 /// in a coding session. Variants hold only what the current handlers
 /// actually consume.
@@ -152,7 +154,7 @@ fn adopt<'a>(
     cwd: Option<&str>,
     source: SessionSource,
 ) -> &'a mut SessionState {
-    let sess = coach.apply_hook_event(pid, sid, cwd);
+    let sess = coach.sessions.apply_hook_event(pid, sid, cwd);
     sess.client = source.client();
     sess
 }
@@ -170,7 +172,9 @@ async fn on_session_started(
 ) -> Json<Value> {
     crate::state::mutate(&state.coach, &state.emitter, |coach| {
         adopt(coach, pid, &session_id, cwd.as_deref(), source);
-        coach.log(&session_id, "SessionStart", &source_label, None);
+        coach
+            .sessions
+            .log(&session_id, "SessionStart", &source_label, None);
     })
     .await;
     passthrough()
@@ -199,7 +203,9 @@ async fn on_user_prompt_submitted(
     crate::state::mutate(&state.coach, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.coach.memory.last_user_prompt = prompt;
-        coach.log(&session_id, "UserPromptSubmit", "user spoke", detail);
+        coach
+            .sessions
+            .log(&session_id, "UserPromptSubmit", "user spoke", detail);
     })
     .await;
     passthrough()
@@ -224,7 +230,9 @@ async fn on_permission_requested(
         } else {
             "passed through"
         };
-        coach.log(&session_id, "PermissionRequest", action, Some(tool_name));
+        coach
+            .sessions
+            .log(&session_id, "PermissionRequest", action, Some(tool_name));
         mode
     })
     .await;
@@ -255,7 +263,9 @@ async fn on_tool_starting(
     crate::state::mutate(&state.coach, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.record_agent_start();
-        coach.log(&session_id, "PreToolUse", "agent starting", None);
+        coach
+            .sessions
+            .log(&session_id, "PreToolUse", "agent starting", None);
     })
     .await;
     passthrough()
@@ -284,17 +294,23 @@ async fn on_tool_completed(
                 sess.event_count
             };
 
-            let rule_message = rules::check_rules(&coach.rules, &tool_name, &tool_input);
+            let rule_message =
+                rules::check_rules(&coach.config.rules, &tool_name, &tool_input);
 
             if let Some(ref msg) = rule_message {
-                coach.log(
+                coach.sessions.log(
                     &session_id,
                     "PostToolUse",
                     "rule triggered",
                     Some(format!("{}: {}", tool_name, msg)),
                 );
             } else {
-                coach.log(&session_id, "PostToolUse", "observed", Some(tool_name.clone()));
+                coach.sessions.log(
+                    &session_id,
+                    "PostToolUse",
+                    "observed",
+                    Some(tool_name.clone()),
+                );
             }
 
             let (pending, muted) = {
@@ -309,22 +325,29 @@ async fn on_tool_completed(
             };
             let intervention_to_deliver = match pending {
                 Some(msg) if !muted => {
-                    coach.log(&session_id, "Intervention", "delivered", Some(msg.clone()));
+                    coach.sessions.log(
+                        &session_id,
+                        "Intervention",
+                        "delivered",
+                        Some(msg.clone()),
+                    );
                     Some(msg)
                 }
                 Some(msg) => {
-                    coach.log(&session_id, "Intervention", "muted", Some(msg));
+                    coach
+                        .sessions
+                        .log(&session_id, "Intervention", "muted", Some(msg));
                     None
                 }
                 None => None,
             };
 
-            let llm_active = coach.coach_mode == EngineMode::Llm
+            let llm_active = coach.config.coach_mode == EngineMode::Llm
                 && crate::settings::OBSERVER_CAPABLE_PROVIDERS
-                    .contains(&coach.model.provider.as_str());
+                    .contains(&coach.config.model.provider.as_str());
 
             if llm_active {
-                let priorities = coach.priorities.clone();
+                let priorities = coach.config.priorities.clone();
                 let sess = coach
                     .sessions
                     .get_mut(&session_id)
@@ -364,7 +387,7 @@ async fn on_tool_completed(
                     .get(&session_id)
                     .expect("apply_hook_event populated");
                 Some(NameSessionInput {
-                    priorities: coach.priorities.clone(),
+                    priorities: coach.config.priorities.clone(),
                     cwd: sess.cwd.clone(),
                     tool_counts: sess.tool_counts.clone(),
                     last_assessment: sess.coach.memory.last_assessment.clone(),
@@ -428,15 +451,17 @@ async fn on_stop_requested(
         },
     }
     let phase1 = crate::state::mutate(&state.coach, &state.emitter, |coach| {
-        let priorities = coach.priorities.clone();
+        let priorities = coach.config.priorities.clone();
         let provider_capable = crate::settings::OBSERVER_CAPABLE_PROVIDERS
-            .contains(&coach.model.provider.as_str());
-        let coach_mode = coach.coach_mode.clone();
+            .contains(&coach.config.model.provider.as_str());
+        let coach_mode = coach.config.coach_mode.clone();
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.stop_count += 1;
 
         if sess.mode != CoachMode::Away {
-            coach.log(&session_id, "Stop", "passed through", None);
+            coach
+                .sessions
+                .log(&session_id, "Stop", "passed through", None);
             return Phase1::PassThrough;
         }
 
@@ -502,7 +527,9 @@ async fn on_stop_requested(
                         let u = usage.unwrap_or_default();
                         s.coach.record_success(latency_ms, u, new_chain);
                     }
-                    coach.log(&session_id, "Stop", "allowed (LLM)", None);
+                    coach
+                        .sessions
+                        .log(&session_id, "Stop", "allowed (LLM)", None);
                 })
                 .await;
                 return passthrough();
@@ -513,14 +540,21 @@ async fn on_stop_requested(
                     let message = decision
                         .message
                         .filter(|m| !m.trim().is_empty())
-                        .unwrap_or_else(|| crate::state::away_message(&coach.priorities));
+                        .unwrap_or_else(|| {
+                            crate::state::away_message(&coach.config.priorities)
+                        });
                     if let Some(s) = coach.sessions.get_mut(&session_id) {
                         s.last_stop_blocked = Some(std::time::Instant::now());
                         s.stop_blocked_count += 1;
                         let u = usage.unwrap_or_default();
                         s.coach.record_success(latency_ms, u, new_chain);
                     }
-                    coach.log(&session_id, "Stop", "blocked (LLM)", Some(message.clone()));
+                    coach.sessions.log(
+                        &session_id,
+                        "Stop",
+                        "blocked (LLM)",
+                        Some(message.clone()),
+                    );
                     message
                 })
                 .await;
@@ -553,7 +587,9 @@ async fn on_stop_requested(
             .is_some_and(|last| last.elapsed() < STOP_COOLDOWN);
 
         if on_cooldown {
-            coach.log(&session_id, "Stop", "allowed (cooldown)", None);
+            coach
+                .sessions
+                .log(&session_id, "Stop", "allowed (cooldown)", None);
             return Phase3::Cooldown;
         }
 
@@ -561,8 +597,13 @@ async fn on_stop_requested(
             s.last_stop_blocked = Some(std::time::Instant::now());
             s.stop_blocked_count += 1;
         }
-        let message = crate::state::away_message(&coach.priorities);
-        coach.log(&session_id, "Stop", "blocked — user away", Some(message.clone()));
+        let message = crate::state::away_message(&coach.config.priorities);
+        coach.sessions.log(
+            &session_id,
+            "Stop",
+            "blocked — user away",
+            Some(message.clone()),
+        );
         Phase3::Blocked(message)
     })
     .await;

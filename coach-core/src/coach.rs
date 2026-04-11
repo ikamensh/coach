@@ -131,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn observe_tool_use_routes_through_the_coach_boundary() {
         let state = test_state();
-        state.write().await.mock_session_send = Some(Arc::new(|_system, user| {
+        state.write().await.services.mock_session_send = Some(Arc::new(|_system, user| {
             assert!(user.contains("Edit"));
             assert!(user.contains("hello"));
             assert!(user.contains("keep the session list stable"));
@@ -165,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn evaluate_stop_routes_through_the_coach_boundary() {
         let state = test_state();
-        state.write().await.mock_session_send = Some(Arc::new(|_system, _user| {
+        state.write().await.services.mock_session_send = Some(Arc::new(|_system, _user| {
             Ok((
                 r#"{"allow":false,"message":"Keep going"}"#.to_string(),
                 crate::state::CoachUsage::default(),
@@ -193,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn name_session_routes_through_the_coach_boundary() {
         let state = test_state();
-        state.write().await.mock_session_send = Some(Arc::new(|_system, _user| {
+        state.write().await.services.mock_session_send = Some(Arc::new(|_system, _user| {
             Ok((
                 "Title: Extract Coach Interface".to_string(),
                 crate::state::CoachUsage::default(),

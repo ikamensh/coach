@@ -206,19 +206,23 @@ impl super::CoachState {
 
         CoachSnapshot {
             sessions,
-            priorities: self.priorities.clone(),
-            port: self.port,
-            theme: self.theme.clone(),
-            model: self.model.clone(),
+            priorities: self.config.priorities.clone(),
+            port: self.config.port,
+            theme: self.config.theme.clone(),
+            model: self.config.model.clone(),
             token_status: {
                 let mut status = HashMap::new();
                 for (provider, vars) in crate::settings::PROVIDER_ENV_VARS {
-                    let has_user = self.api_tokens.get(*provider).is_some_and(|v| !v.is_empty());
-                    let has_env = self.env_tokens.contains_key(*provider);
+                    let has_user = self
+                        .config
+                        .api_tokens
+                        .get(*provider)
+                        .is_some_and(|v| !v.is_empty());
+                    let has_env = self.services.env_tokens.contains_key(*provider);
                     let env_var_name = if !has_user && has_env {
-                        vars.iter().find(|_| {
-                            self.env_tokens.contains_key(*provider)
-                        }).map(|v| v.to_string())
+                        vars.iter()
+                            .find(|_| self.services.env_tokens.contains_key(*provider))
+                            .map(|v| v.to_string())
                     } else {
                         None
                     };
@@ -233,13 +237,13 @@ impl super::CoachState {
                 }
                 status
             },
-            coach_mode: self.coach_mode.clone(),
-            rules: self.rules.clone(),
+            coach_mode: self.config.coach_mode.clone(),
+            rules: self.config.rules.clone(),
             observer_capable_providers: crate::settings::OBSERVER_CAPABLE_PROVIDERS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            auto_uninstall_hooks_on_exit: self.auto_uninstall_hooks_on_exit,
+            auto_uninstall_hooks_on_exit: self.config.auto_uninstall_hooks_on_exit,
         }
     }
 }

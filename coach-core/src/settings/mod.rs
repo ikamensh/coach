@@ -242,6 +242,60 @@ impl Settings {
             Err(e) => eprintln!("Warning: failed to serialize settings: {}", e),
         }
     }
+
+    // ── Mutation helpers ─────────────────────────────────────────────
+    //
+    // Each sets one field and persists. Callers invoke them inside a
+    // `state::mutate` closure so the snapshot emission stays in one place.
+
+    pub fn update_priorities(&mut self, priorities: Vec<String>) {
+        self.priorities = priorities;
+        self.save();
+    }
+
+    pub fn update_model(&mut self, model: ModelConfig) {
+        self.model = model;
+        self.save();
+    }
+
+    pub fn update_api_token(&mut self, provider: &str, token: &str) {
+        if token.is_empty() {
+            self.api_tokens.remove(provider);
+        } else {
+            self.api_tokens
+                .insert(provider.to_string(), token.to_string());
+        }
+        self.save();
+    }
+
+    pub fn update_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.save();
+    }
+
+    pub fn update_coach_mode(&mut self, mode: EngineMode) {
+        self.coach_mode = mode;
+        self.save();
+    }
+
+    pub fn update_rules(&mut self, rules: Vec<CoachRule>) {
+        self.rules = rules;
+        self.save();
+    }
+
+    pub fn update_auto_uninstall(&mut self, enabled: bool) {
+        self.auto_uninstall_hooks_on_exit = enabled;
+        self.save();
+    }
+
+    pub fn set_hook_enabled(&mut self, target: HookTarget, enabled: bool) {
+        match target {
+            HookTarget::Claude => self.hooks_user_enabled = enabled,
+            HookTarget::Cursor => self.cursor_hooks_user_enabled = enabled,
+            HookTarget::Codex => self.codex_hooks_user_enabled = enabled,
+        }
+        self.save();
+    }
 }
 
 #[cfg(test)]

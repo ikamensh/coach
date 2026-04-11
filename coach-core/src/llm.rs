@@ -71,7 +71,7 @@ struct ProviderConfig {
 
 async fn snapshot_config(state: &SharedState) -> Result<ProviderConfig, String> {
     let s = state.read().await;
-    let primary = s.model.clone();
+    let primary = s.config.model.clone();
     let primary_token = s
         .effective_token(&primary.provider)
         .ok_or("No API token for primary model")?
@@ -278,10 +278,10 @@ pub async fn session_send(
     let (logger, provider_name, model_name, mock) = {
         let s = state.read().await;
         (
-            s.llm_logger.clone(),
-            s.model.provider.clone(),
-            s.model.model.clone(),
-            s.mock_session_send.clone(),
+            s.services.llm_logger.clone(),
+            s.config.model.provider.clone(),
+            s.config.model.model.clone(),
+            s.services.mock_session_send.clone(),
         )
     };
     let started = std::time::Instant::now();
@@ -970,8 +970,9 @@ mod tests {
         mock: MockSessionSend,
     ) -> crate::state::SharedState {
         let mut cs = crate::state::test_state();
-        cs.mock_session_send = Some(mock);
-        cs.llm_logger = Some(LlmLogger::at(tmpdir.path().to_path_buf()).unwrap());
+        cs.services.mock_session_send = Some(mock);
+        cs.services.llm_logger =
+            Some(LlmLogger::at(tmpdir.path().to_path_buf()).unwrap());
         Arc::new(RwLock::new(cs))
     }
 
@@ -1062,7 +1063,7 @@ mod tests {
             Ok(("ok".into(), CoachUsage::default()))
         });
         let mut cs = crate::state::test_state();
-        cs.mock_session_send = Some(mock);
+        cs.services.mock_session_send = Some(mock);
         // No llm_logger installed.
         let state = Arc::new(RwLock::new(cs));
 
@@ -1128,8 +1129,7 @@ mod tests {
 mod live_tests {
     use super::*;
     use crate::settings::{EngineMode, ModelConfig};
-    use crate::state::{CoachMode, CoachState, SharedState, Theme};
-    use std::collections::HashMap;
+    use crate::state::SharedState;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -1137,31 +1137,14 @@ mod live_tests {
     /// Returns None when the key is missing so tests no-op cleanly.
     fn live_state() -> Option<SharedState> {
         let token = std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty())?;
-        let state = CoachState {
-            sessions: HashMap::new(),
-
-            priorities: vec!["Test priority".into()],
-            port: 7700,
-            theme: Theme::System,
-            default_mode: CoachMode::Present,
-            model: ModelConfig {
-                provider: "openai".into(),
-                model: "gpt-5.4-mini".into(),
-            },
-            api_tokens: HashMap::from([("openai".into(), token)]),
-            env_tokens: HashMap::new(),
-            http_client: reqwest::Client::new(),
-            coach_mode: EngineMode::Llm,
-            rules: vec![],
-            auto_uninstall_hooks_on_exit: true,
-            hooks_user_enabled: false,
-            cursor_hooks_user_enabled: false,
-            codex_hooks_user_enabled: false,
-            mock_session_send: None,
-            llm_logger: None,
-            #[cfg(feature = "pycoach")]
-            pycoach: None,
+        let mut state = crate::state::test_state();
+        state.config.priorities = vec!["Test priority".into()];
+        state.config.coach_mode = EngineMode::Llm;
+        state.config.model = ModelConfig {
+            provider: "openai".into(),
+            model: "gpt-5.4-mini".into(),
         };
+        state.config.api_tokens.insert("openai".into(), token);
         Some(Arc::new(RwLock::new(state)))
     }
 
@@ -1360,31 +1343,14 @@ mod live_tests {
         let token = std::env::var("ANTHROPIC_API_KEY")
             .ok()
             .filter(|v| !v.is_empty())?;
-        let state = CoachState {
-            sessions: HashMap::new(),
-
-            priorities: vec!["Test priority".into()],
-            port: 7700,
-            theme: Theme::System,
-            default_mode: CoachMode::Present,
-            model: ModelConfig {
-                provider: "anthropic".into(),
-                model: "claude-haiku-4-5-20251001".into(),
-            },
-            api_tokens: HashMap::from([("anthropic".into(), token)]),
-            env_tokens: HashMap::new(),
-            http_client: reqwest::Client::new(),
-            coach_mode: EngineMode::Llm,
-            rules: vec![],
-            auto_uninstall_hooks_on_exit: true,
-            hooks_user_enabled: false,
-            cursor_hooks_user_enabled: false,
-            codex_hooks_user_enabled: false,
-            mock_session_send: None,
-            llm_logger: None,
-            #[cfg(feature = "pycoach")]
-            pycoach: None,
+        let mut state = crate::state::test_state();
+        state.config.priorities = vec!["Test priority".into()];
+        state.config.coach_mode = EngineMode::Llm;
+        state.config.model = ModelConfig {
+            provider: "anthropic".into(),
+            model: "claude-haiku-4-5-20251001".into(),
         };
+        state.config.api_tokens.insert("anthropic".into(), token);
         Some(Arc::new(RwLock::new(state)))
     }
 
@@ -1544,34 +1510,17 @@ mod live_tests {
             .ok()
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             .filter(|v| !v.is_empty())?;
-        let state = CoachState {
-            sessions: HashMap::new(),
-
-            priorities: vec!["Test priority".into()],
-            port: 7700,
-            theme: Theme::System,
-            default_mode: CoachMode::Present,
-            model: ModelConfig {
-                provider: "google".into(),
-                // Cheap fast default — pick the current Flash model that
-                // rig 0.34 knows about. Override by editing locally if a
-                // newer Flash ships.
-                model: "gemini-2.5-flash".into(),
-            },
-            api_tokens: HashMap::from([("google".into(), token)]),
-            env_tokens: HashMap::new(),
-            http_client: reqwest::Client::new(),
-            coach_mode: EngineMode::Llm,
-            rules: vec![],
-            auto_uninstall_hooks_on_exit: true,
-            hooks_user_enabled: false,
-            cursor_hooks_user_enabled: false,
-            codex_hooks_user_enabled: false,
-            mock_session_send: None,
-            llm_logger: None,
-            #[cfg(feature = "pycoach")]
-            pycoach: None,
+        let mut state = crate::state::test_state();
+        state.config.priorities = vec!["Test priority".into()];
+        state.config.coach_mode = EngineMode::Llm;
+        state.config.model = ModelConfig {
+            provider: "google".into(),
+            // Cheap fast default — pick the current Flash model that
+            // rig 0.34 knows about. Override by editing locally if a
+            // newer Flash ships.
+            model: "gemini-2.5-flash".into(),
         };
+        state.config.api_tokens.insert("google".into(), token);
         Some(Arc::new(RwLock::new(state)))
     }
 

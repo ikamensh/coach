@@ -57,7 +57,7 @@ pub(crate) async fn set_session_mode(
         }
     }
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.set_session_mode(&session_id, payload.mode);
+        s.sessions.set_session_mode(&session_id, payload.mode);
         s.snapshot()
     })
     .await;
@@ -69,7 +69,7 @@ pub(crate) async fn set_all_modes(
     Json(payload): Json<ModePayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.set_all_modes(payload.mode);
+        s.sessions.set_all_modes(payload.mode);
         s.snapshot()
     })
     .await;
@@ -81,7 +81,7 @@ pub(crate) async fn set_priorities(
     Json(payload): Json<PrioritiesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.update_priorities(payload.priorities);
+        s.config.update_priorities(payload.priorities);
         s.snapshot()
     })
     .await;
@@ -93,7 +93,7 @@ pub(crate) async fn set_model(
     Json(payload): Json<ModelConfig>,
 ) -> Json<crate::state::CoachSnapshot> {
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.update_model(payload);
+        s.config.update_model(payload);
         s.snapshot()
     })
     .await;
@@ -105,7 +105,7 @@ pub(crate) async fn set_api_token(
     Json(payload): Json<ApiTokenPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.update_api_token(&payload.provider, &payload.token);
+        s.config.update_api_token(&payload.provider, &payload.token);
         s.snapshot()
     })
     .await;
@@ -117,7 +117,7 @@ pub(crate) async fn set_coach_mode(
     Json(payload): Json<CoachModePayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.update_coach_mode(payload.coach_mode);
+        s.config.update_coach_mode(payload.coach_mode);
         s.snapshot()
     })
     .await;
@@ -129,7 +129,7 @@ pub(crate) async fn set_rules(
     Json(payload): Json<RulesPayload>,
 ) -> Json<crate::state::CoachSnapshot> {
     let snap = crate::state::mutate(&state.coach, &state.emitter, |s| {
-        s.update_rules(payload.rules);
+        s.config.update_rules(payload.rules);
         s.snapshot()
     })
     .await;

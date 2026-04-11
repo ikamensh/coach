@@ -9,7 +9,9 @@ use tokio::task::JoinHandle;
 use crate::llm_log::LlmLogger;
 #[cfg(feature = "pycoach")]
 use crate::pycoach::Pycoach;
-use crate::settings::{CoachRule, EngineMode, HookTarget, ModelConfig, Settings};
+use crate::settings::Settings;
+
+pub use crate::settings::Settings as AppConfig;
 
 mod snapshot;
 pub use snapshot::{
@@ -365,31 +367,69 @@ pub struct ObserverQueueItem {
     pub user_prompt: Option<String>,
 }
 
-pub struct CoachState {
+pub struct SessionRegistry {
     /// Keyed by session_id — one entry per live conversation. `/clear`
     /// mints a new conversation and therefore a new entry; the old one
     /// is evicted when the next hook arrives for the same PID under the
     /// new session_id, or when the scanner notices the owning PID died.
-    pub sessions: HashMap<SessionId, SessionState>,
-    pub priorities: Vec<String>,
-    pub port: u16,
-    pub theme: Theme,
+    pub inner: HashMap<SessionId, SessionState>,
     pub default_mode: CoachMode,
-    pub model: ModelConfig,
-    pub api_tokens: HashMap<String, String>,
-    pub env_tokens: HashMap<String, String>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+            default_mode: CoachMode::Present,
+        }
+    }
+
+    // ── HashMap passthroughs (keep call sites readable) ────────────────
+
+    pub fn get(&self, key: &str) -> Option<&SessionState> {
+        self.inner.get(key)
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut SessionState> {
+        self.inner.get_mut(key)
+    }
+
+    pub fn values(&self) -> std::collections::hash_map::Values<'_, SessionId, SessionState> {
+        self.inner.values()
+    }
+
+    pub fn values_mut(
+        &mut self,
+    ) -> std::collections::hash_map::ValuesMut<'_, SessionId, SessionState> {
+        self.inner.values_mut()
+    }
+
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, SessionId, SessionState> {
+        self.inner.iter()
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+pub struct RuntimeServices {
     pub http_client: reqwest::Client,
-    pub coach_mode: EngineMode,
-    pub rules: Vec<CoachRule>,
-    /// On clean exit, uninstall managed hooks. See `Settings`.
-    pub auto_uninstall_hooks_on_exit: bool,
-    /// Persistent record of "user opted in to Claude Code hooks". Survives
-    /// auto-cleanup on exit so the next startup re-installs.
-    pub hooks_user_enabled: bool,
-    /// Same, for Cursor Agent hooks.
-    pub cursor_hooks_user_enabled: bool,
-    /// Same, for Codex CLI hooks.
-    pub codex_hooks_user_enabled: bool,
+    pub env_tokens: HashMap<String, String>,
     /// When set, `llm::session_send` returns this function's result instead
     /// of calling a real provider. Used by scenario replay tests.
     pub mock_session_send: Option<MockSessionSend>,
@@ -406,13 +446,20 @@ pub struct CoachState {
     pub pycoach: Option<Arc<Pycoach>>,
 }
 
+pub struct CoachState {
+    pub sessions: SessionRegistry,
+    pub config: AppConfig,
+    pub services: RuntimeServices,
+}
+
 impl CoachState {
     /// Resolve the effective token for a provider: user override wins, then env.
     pub fn effective_token(&self, provider: &str) -> Option<&str> {
-        self.api_tokens
+        self.config
+            .api_tokens
             .get(provider)
             .filter(|v| !v.is_empty())
-            .or_else(|| self.env_tokens.get(provider))
+            .or_else(|| self.services.env_tokens.get(provider))
             .map(|s| s.as_str())
     }
 }
@@ -445,44 +492,37 @@ fn adopt_cwd_if_unset(sess: &mut SessionState, cwd: Option<&str>) {
 impl CoachState {
     pub fn from_settings(settings: Settings) -> Self {
         Self {
-            sessions: HashMap::new(),
-            priorities: settings.priorities,
-            port: settings.port,
-            theme: settings.theme,
-            default_mode: CoachMode::Present,
-            model: settings.model,
-            api_tokens: settings.api_tokens,
-            env_tokens: crate::settings::env_tokens(),
-            http_client: reqwest::Client::new(),
-            coach_mode: settings.coach_mode,
-            rules: settings.rules,
-            auto_uninstall_hooks_on_exit: settings.auto_uninstall_hooks_on_exit,
-            hooks_user_enabled: settings.hooks_user_enabled,
-            cursor_hooks_user_enabled: settings.cursor_hooks_user_enabled,
-            codex_hooks_user_enabled: settings.codex_hooks_user_enabled,
-            mock_session_send: None,
-            llm_logger: LlmLogger::from_env(),
-            #[cfg(feature = "pycoach")]
-            pycoach: None,
+            sessions: SessionRegistry::new(),
+            config: settings,
+            services: RuntimeServices {
+                http_client: reqwest::Client::new(),
+                env_tokens: crate::settings::env_tokens(),
+                mock_session_send: None,
+                llm_logger: LlmLogger::from_env(),
+                #[cfg(feature = "pycoach")]
+                pycoach: None,
+            },
         }
     }
+}
 
+impl SessionRegistry {
     /// Reverse lookup: find any session owned by `pid`. The map is
     /// small (single-digit sessions in practice), so a linear scan is
     /// fine.
     pub fn session_for_pid(&self, pid: u32) -> Option<&SessionState> {
-        self.sessions.values().find(|s| s.pid == pid)
+        self.inner.values().find(|s| s.pid == pid)
     }
 
     pub fn session_for_pid_mut(&mut self, pid: u32) -> Option<&mut SessionState> {
-        self.sessions.values_mut().find(|s| s.pid == pid)
+        self.inner.values_mut().find(|s| s.pid == pid)
     }
 
     /// Map key for the session owned by `pid`, if any. Scanner
     /// placeholders live under a sentinel key, so `session_id` alone
     /// can't find them.
     pub fn session_key_for_pid(&self, pid: u32) -> Option<SessionId> {
-        self.sessions
+        self.inner
             .iter()
             .find(|(_, s)| s.pid == pid)
             .map(|(k, _)| k.clone())
@@ -490,94 +530,21 @@ impl CoachState {
 
     pub fn set_all_modes(&mut self, mode: CoachMode) {
         self.default_mode = mode;
-        for session in self.sessions.values_mut() {
+        for session in self.inner.values_mut() {
             session.mode = mode;
         }
     }
 
-    // ── Config mutation methods ────────────────────────────────────────
-    //
-    // Centralise "mutate field + persist" so callers (Tauri commands,
-    // HTTP API handlers) don't each reimplement the same logic.
-
-    pub fn update_priorities(&mut self, priorities: Vec<String>) {
-        self.priorities = priorities;
-        self.save();
-    }
-
-    pub fn update_model(&mut self, model: ModelConfig) {
-        self.model = model;
-        self.save();
-    }
-
-    pub fn update_api_token(&mut self, provider: &str, token: &str) {
-        if token.is_empty() {
-            self.api_tokens.remove(provider);
-        } else {
-            self.api_tokens.insert(provider.to_string(), token.to_string());
-        }
-        self.save();
-    }
-
-    pub fn update_theme(&mut self, theme: Theme) {
-        self.theme = theme;
-        self.save();
-    }
-
-    pub fn update_coach_mode(&mut self, mode: EngineMode) {
-        self.coach_mode = mode;
-        self.save();
-    }
-
-    pub fn update_rules(&mut self, rules: Vec<CoachRule>) {
-        self.rules = rules;
-        self.save();
-    }
-
-    pub fn update_auto_uninstall(&mut self, enabled: bool) {
-        self.auto_uninstall_hooks_on_exit = enabled;
-        self.save();
-    }
-
     pub fn set_session_mode(&mut self, session_id: &str, mode: CoachMode) {
-        if let Some(session) = self.sessions.get_mut(session_id) {
+        if let Some(session) = self.inner.get_mut(session_id) {
             session.mode = mode;
         }
     }
 
     pub fn set_intervention_muted(&mut self, session_id: &str, muted: bool) {
-        if let Some(session) = self.sessions.get_mut(session_id) {
+        if let Some(session) = self.inner.get_mut(session_id) {
             session.coach.intervention_muted = muted;
         }
-    }
-
-    pub fn set_hook_enabled(&mut self, target: HookTarget, enabled: bool) {
-        match target {
-            HookTarget::Claude => self.hooks_user_enabled = enabled,
-            HookTarget::Cursor => self.cursor_hooks_user_enabled = enabled,
-            HookTarget::Codex => self.codex_hooks_user_enabled = enabled,
-        }
-        self.save();
-    }
-
-    pub fn to_settings(&self) -> Settings {
-        Settings {
-            api_tokens: self.api_tokens.clone(),
-            model: self.model.clone(),
-            priorities: self.priorities.clone(),
-            theme: self.theme.clone(),
-            port: self.port,
-            coach_mode: self.coach_mode.clone(),
-            rules: self.rules.clone(),
-            auto_uninstall_hooks_on_exit: self.auto_uninstall_hooks_on_exit,
-            hooks_user_enabled: self.hooks_user_enabled,
-            cursor_hooks_user_enabled: self.cursor_hooks_user_enabled,
-            codex_hooks_user_enabled: self.codex_hooks_user_enabled,
-        }
-    }
-
-    pub fn save(&self) {
-        self.to_settings().save();
     }
 
     /// Session lifecycle: create, adopt scanner placeholder, or `/clear`.
@@ -601,12 +568,12 @@ impl CoachState {
     ) -> &mut SessionState {
         let now = Utc::now();
 
-        if let Some(sess) = self.sessions.get_mut(session_id) {
+        if let Some(sess) = self.inner.get_mut(session_id) {
             sess.pid = pid;
             sess.last_event = Instant::now();
             sess.last_event_time = now;
             adopt_cwd_if_unset(sess, cwd);
-            return self.sessions.get_mut(session_id).expect("just touched");
+            return self.inner.get_mut(session_id).expect("just touched");
         }
 
         // Any prior entry for this PID belongs to either a scanner
@@ -621,7 +588,7 @@ impl CoachState {
 
         if let Some(old_key) = old_key {
             if is_placeholder_key(&old_key) {
-                let mut sess = self.sessions.remove(&old_key).expect("just found");
+                let mut sess = self.inner.remove(&old_key).expect("just found");
                 sess.session_id = session_id.to_string();
                 sess.last_event = Instant::now();
                 sess.last_event_time = now;
@@ -629,12 +596,12 @@ impl CoachState {
                     sess.discard_bootstrap();
                 }
                 adopt_cwd_if_unset(&mut sess, cwd);
-                self.sessions.insert(session_id.to_string(), sess);
-                return self.sessions.get_mut(session_id).expect("just inserted");
+                self.inner.insert(session_id.to_string(), sess);
+                return self.inner.get_mut(session_id).expect("just inserted");
             }
 
             // `/clear`: evict the old conversation entry.
-            let old = self.sessions.remove(&old_key).expect("just found");
+            let old = self.inner.remove(&old_key).expect("just found");
             if old.coach.memory.chain.kind() != "empty" || old.event_count > 0 {
                 eprintln!(
                     "[coach] apply_hook_event: evicting pid {pid} \
@@ -648,7 +615,7 @@ impl CoachState {
         }
 
         let display_name = derive_display_name(cwd, pid);
-        self.sessions.insert(
+        self.inner.insert(
             session_id.to_string(),
             SessionState {
                 session_id: session_id.to_string(),
@@ -673,7 +640,7 @@ impl CoachState {
                 bootstrapped_session_id: None,
             },
         );
-        self.sessions.get_mut(session_id).expect("just inserted")
+        self.inner.get_mut(session_id).expect("just inserted")
     }
 
     /// Append an activity entry to the session for `session_id`. Silent
@@ -686,7 +653,7 @@ impl CoachState {
         action: &str,
         detail: Option<String>,
     ) {
-        let Some(session) = self.sessions.get_mut(session_id) else {
+        let Some(session) = self.inner.get_mut(session_id) else {
             return;
         };
         session.activity.push_back(ActivityEntry {
@@ -713,11 +680,11 @@ impl CoachState {
         cwd: Option<&str>,
         started_at: DateTime<Utc>,
     ) -> bool {
-        if self.sessions.values().any(|s| s.pid == pid) {
+        if self.inner.values().any(|s| s.pid == pid) {
             return false;
         }
         let display_name = derive_display_name(cwd, pid);
-        self.sessions.insert(
+        self.inner.insert(
             placeholder_key(pid),
             SessionState {
                 session_id: String::new(),
@@ -752,7 +719,7 @@ impl CoachState {
     /// creates the session, since those functions don't know which
     /// agent the hook came from.
     pub fn mark_client(&mut self, session_id: &str, client: SessionClient) {
-        if let Some(s) = self.sessions.get_mut(session_id) {
+        if let Some(s) = self.inner.get_mut(session_id) {
             s.client = client;
         }
     }
@@ -761,13 +728,13 @@ impl CoachState {
     /// the removed session_ids.
     pub fn remove_dead_pids(&mut self, live_pids: &HashSet<u32>) -> Vec<SessionId> {
         let dead: Vec<SessionId> = self
-            .sessions
+            .inner
             .iter()
             .filter(|(_, s)| !live_pids.contains(&s.pid))
             .map(|(k, _)| k.clone())
             .collect();
         for key in &dead {
-            self.sessions.remove(key);
+            self.inner.remove(key);
         }
         dead
     }
@@ -797,28 +764,31 @@ where
 #[cfg(test)]
 pub(crate) fn test_state() -> CoachState {
     CoachState {
-        sessions: HashMap::new(),
-        priorities: vec!["Simplicity".into()],
-        port: 7700,
-        theme: Theme::System,
-        default_mode: CoachMode::Present,
-        model: crate::settings::ModelConfig {
-            provider: "google".into(),
-            model: "gemini-2.5-flash".into(),
+        sessions: SessionRegistry::new(),
+        config: AppConfig {
+            api_tokens: HashMap::new(),
+            model: crate::settings::ModelConfig {
+                provider: "google".into(),
+                model: "gemini-2.5-flash".into(),
+            },
+            priorities: vec!["Simplicity".into()],
+            theme: Theme::System,
+            port: 7700,
+            coach_mode: crate::settings::EngineMode::Rules,
+            rules: vec![],
+            auto_uninstall_hooks_on_exit: true,
+            hooks_user_enabled: false,
+            cursor_hooks_user_enabled: false,
+            codex_hooks_user_enabled: false,
         },
-        api_tokens: HashMap::new(),
-        env_tokens: HashMap::new(),
-        http_client: reqwest::Client::new(),
-        coach_mode: crate::settings::EngineMode::Rules,
-        rules: vec![],
-        auto_uninstall_hooks_on_exit: true,
-        hooks_user_enabled: false,
-        cursor_hooks_user_enabled: false,
-        codex_hooks_user_enabled: false,
-        mock_session_send: None,
-        llm_logger: None,
-        #[cfg(feature = "pycoach")]
-        pycoach: None,
+        services: RuntimeServices {
+            http_client: reqwest::Client::new(),
+            env_tokens: HashMap::new(),
+            mock_session_send: None,
+            llm_logger: None,
+            #[cfg(feature = "pycoach")]
+            pycoach: None,
+        },
     }
 }
 
@@ -833,16 +803,16 @@ mod tests {
     #[test]
     fn effective_token_user_overrides_env() {
         let mut state = test_state();
-        state.api_tokens.insert("google".into(), "user-key".into());
-        state.env_tokens.insert("google".into(), "env-key".into());
+        state.config.api_tokens.insert("google".into(), "user-key".into());
+        state.services.env_tokens.insert("google".into(), "env-key".into());
         assert_eq!(state.effective_token("google"), Some("user-key"));
     }
 
     #[test]
     fn effective_token_empty_user_falls_back_to_env() {
         let mut state = test_state();
-        state.api_tokens.insert("google".into(), "".into());
-        state.env_tokens.insert("google".into(), "env-key".into());
+        state.config.api_tokens.insert("google".into(), "".into());
+        state.services.env_tokens.insert("google".into(), "env-key".into());
         assert_eq!(state.effective_token("google"), Some("env-key"));
     }
 
@@ -855,7 +825,7 @@ mod tests {
     #[test]
     fn effective_token_providers_are_independent() {
         let mut state = test_state();
-        state.api_tokens.insert("google".into(), "gk".into());
+        state.config.api_tokens.insert("google".into(), "gk".into());
         assert_eq!(state.effective_token("google"), Some("gk"));
         assert_eq!(state.effective_token("anthropic"), None);
     }
@@ -868,9 +838,9 @@ mod tests {
     #[test]
     fn apply_hook_event_creates_session_for_new_sid() {
         let mut state = test_state();
-        state.default_mode = CoachMode::Away;
+        state.sessions.default_mode = CoachMode::Away;
 
-        state.apply_hook_event(42, "conv-1", Some("/tmp"));
+        state.sessions.apply_hook_event(42, "conv-1", Some("/tmp"));
 
         let sess = state.sessions.get("conv-1").unwrap();
         assert_eq!(sess.pid, 42);
@@ -891,10 +861,10 @@ mod tests {
     #[test]
     fn apply_hook_event_touches_existing_session() {
         let mut state = test_state();
-        state.apply_hook_event(42, "conv-1", Some("/a"));
+        state.sessions.apply_hook_event(42, "conv-1", Some("/a"));
         state.sessions.get_mut("conv-1").unwrap().mode = CoachMode::Away;
 
-        state.apply_hook_event(42, "conv-1", Some("/b"));
+        state.sessions.apply_hook_event(42, "conv-1", Some("/b"));
 
         let sess = state.sessions.get("conv-1").unwrap();
         assert_eq!(sess.event_count, 0, "apply_hook_event doesn't touch event_count");
@@ -907,7 +877,7 @@ mod tests {
     #[test]
     fn apply_hook_event_evicts_old_entry_on_clear() {
         let mut state = test_state();
-        state.apply_hook_event(42, "old", Some("/projects/coach"));
+        state.sessions.apply_hook_event(42, "old", Some("/projects/coach"));
         {
             let s = state.sessions.get_mut("old").unwrap();
             s.mode = CoachMode::Away;
@@ -924,7 +894,7 @@ mod tests {
             });
         }
 
-        state.apply_hook_event(42, "new", Some("/projects/coach"));
+        state.sessions.apply_hook_event(42, "new", Some("/projects/coach"));
 
         assert!(!state.sessions.contains_key("old"), "old entry evicted");
         let sess = state.sessions.get("new").unwrap();
@@ -948,10 +918,10 @@ mod tests {
         use chrono::Duration;
         let mut state = test_state();
         let scanner_started = Utc::now() - Duration::hours(2);
-        state.register_discovered_pid(42, Some("/p"), scanner_started);
+        state.sessions.register_discovered_pid(42, Some("/p"), scanner_started);
         assert!(state.sessions.contains_key(&placeholder_key(42)));
 
-        state.apply_hook_event(42, "conv-X", Some("/p"));
+        state.sessions.apply_hook_event(42, "conv-X", Some("/p"));
 
         assert!(
             !state.sessions.contains_key(&placeholder_key(42)),
@@ -972,8 +942,8 @@ mod tests {
     #[test]
     fn distinct_pids_in_same_cwd_are_separate_sessions() {
         let mut state = test_state();
-        state.apply_hook_event(100, "conv-a", Some("/projects/coach"));
-        state.apply_hook_event(200, "conv-b", Some("/projects/coach"));
+        state.sessions.apply_hook_event(100, "conv-a", Some("/projects/coach"));
+        state.sessions.apply_hook_event(200, "conv-b", Some("/projects/coach"));
 
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(state.sessions.get("conv-a").unwrap().pid, 100);
@@ -985,9 +955,9 @@ mod tests {
     #[test]
     fn log_adds_entries_to_session() {
         let mut state = test_state();
-        state.apply_hook_event(1, "s", None);
-        state.log("s", "PostToolUse", "observed", None);
-        state.log("s", "Stop", "blocked", Some("priorities".into()));
+        state.sessions.apply_hook_event(1, "s", None);
+        state.sessions.log("s", "PostToolUse", "observed", None);
+        state.sessions.log("s", "Stop", "blocked", Some("priorities".into()));
 
         let activity = &state.sessions.get("s").unwrap().activity;
         assert_eq!(activity.len(), 2);
@@ -998,16 +968,16 @@ mod tests {
     #[test]
     fn log_for_unknown_session_id_is_silent_noop() {
         let mut state = test_state();
-        state.log("ghost", "PostToolUse", "observed", None);
+        state.sessions.log("ghost", "PostToolUse", "observed", None);
         assert!(state.sessions.is_empty());
     }
 
     #[test]
     fn log_is_capped_per_session() {
         let mut state = test_state();
-        state.apply_hook_event(1, "s", None);
+        state.sessions.apply_hook_event(1, "s", None);
         for i in 0..SESSION_ACTIVITY_CAP + 10 {
-            state.log("s", "PostToolUse", &format!("entry-{i}"), None);
+            state.sessions.log("s", "PostToolUse", &format!("entry-{i}"), None);
         }
         let activity = &state.sessions.get("s").unwrap().activity;
         assert_eq!(activity.len(), SESSION_ACTIVITY_CAP);
@@ -1022,12 +992,12 @@ mod tests {
     #[test]
     fn busy_session_does_not_evict_quiet_session() {
         let mut state = test_state();
-        state.apply_hook_event(1, "quiet", None);
-        state.apply_hook_event(2, "busy", None);
-        state.log("quiet", "PostToolUse", "first", Some("Read".into()));
+        state.sessions.apply_hook_event(1, "quiet", None);
+        state.sessions.apply_hook_event(2, "busy", None);
+        state.sessions.log("quiet", "PostToolUse", "first", Some("Read".into()));
 
         for i in 0..SESSION_ACTIVITY_CAP * 3 {
-            state.log("busy", "PostToolUse", &format!("noise-{i}"), None);
+            state.sessions.log("busy", "PostToolUse", &format!("noise-{i}"), None);
         }
 
         let quiet = &state.sessions.get("quiet").unwrap().activity;
@@ -1045,9 +1015,9 @@ mod tests {
         use chrono::Duration;
 
         let mut state = test_state();
-        state.apply_hook_event(1, "s1", None);
-        state.apply_hook_event(2, "s2", None);
-        state.apply_hook_event(3, "s3", None);
+        state.sessions.apply_hook_event(1, "s1", None);
+        state.sessions.apply_hook_event(2, "s2", None);
+        state.sessions.apply_hook_event(3, "s3", None);
 
         let now = Utc::now();
         // All three are active. started_at: s1 oldest, s2 middle, s3 newest.
@@ -1072,8 +1042,8 @@ mod tests {
         use chrono::Duration;
 
         let mut state = test_state();
-        state.apply_hook_event(10, "active_old", None);
-        state.apply_hook_event(20, "idle_new", None);
+        state.sessions.apply_hook_event(10, "active_old", None);
+        state.sessions.apply_hook_event(20, "idle_new", None);
 
         let now = Utc::now();
         // idle started recently but hasn't seen events for an hour.
@@ -1104,7 +1074,7 @@ mod tests {
     #[test]
     fn snapshot_token_status_reflects_user_token() {
         let mut state = test_state();
-        state.api_tokens.insert("google".into(), "gk-user".into());
+        state.config.api_tokens.insert("google".into(), "gk-user".into());
         let snap = state.snapshot();
         let google_status = snap.token_status.get("google").unwrap();
         assert_eq!(google_status.source, TokenSource::User);
@@ -1114,7 +1084,7 @@ mod tests {
     #[test]
     fn snapshot_contains_model_config() {
         let mut state = test_state();
-        state.model = ModelConfig {
+        state.config.model = ModelConfig {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-20250514".into(),
         };
@@ -1126,7 +1096,7 @@ mod tests {
     #[test]
     fn snapshot_exposes_pid_and_session_id() {
         let mut state = test_state();
-        state.apply_hook_event(77, "conv-X", Some("/Users/foo/projects/coach"));
+        state.sessions.apply_hook_event(77, "conv-X", Some("/Users/foo/projects/coach"));
         {
             let s = state.sessions.get_mut("conv-X").unwrap();
             s.tool_counts.insert("Read".into(), 3);
@@ -1145,7 +1115,7 @@ mod tests {
     #[test]
     fn snapshot_mirrors_coach_telemetry_fields() {
         let mut state = test_state();
-        state.apply_hook_event(7, "s", Some("/p"));
+        state.sessions.apply_hook_event(7, "s", Some("/p"));
         let usage = CoachUsage { input_tokens: 100, output_tokens: 20, cached_input_tokens: 10 };
         let now = Utc::now();
         {
@@ -1196,7 +1166,7 @@ mod tests {
     #[test]
     fn snapshot_server_id_chain_messages_derived_from_calls() {
         let mut state = test_state();
-        state.apply_hook_event(8, "s", Some("/p"));
+        state.sessions.apply_hook_event(8, "s", Some("/p"));
         {
             let s = state.sessions.get_mut("s").unwrap();
             s.coach.memory.chain = CoachChain::ServerId { id: "resp_xyz".into() };
@@ -1214,7 +1184,7 @@ mod tests {
     #[test]
     fn clear_starts_with_empty_coach_telemetry() {
         let mut state = test_state();
-        state.apply_hook_event(9, "old", Some("/p"));
+        state.sessions.apply_hook_event(9, "old", Some("/p"));
         {
             let s = state.sessions.get_mut("old").unwrap();
             s.coach.memory.chain = CoachChain::ServerId { id: "resp_old".into() };
@@ -1234,7 +1204,7 @@ mod tests {
                 cached_input_tokens: 0,
             };
         }
-        state.apply_hook_event(9, "new", Some("/p"));
+        state.sessions.apply_hook_event(9, "new", Some("/p"));
         assert!(!state.sessions.contains_key("old"), "old entry evicted");
         let s = state.sessions.get("new").unwrap();
         assert_eq!(s.coach.telemetry.calls, 0);
@@ -1246,10 +1216,10 @@ mod tests {
         assert!(s.coach.memory.session_title.is_none());
     }
 
-    // ── from_settings / to_settings roundtrip ───────────────────────────
+    // ── from_settings roundtrip ─────────────────────────────────────────
 
     #[test]
-    fn from_settings_to_settings_roundtrip() {
+    fn from_settings_preserves_all_fields() {
         let original = Settings {
             api_tokens: HashMap::from([("openai".into(), "sk-test".into())]),
             model: ModelConfig {
@@ -1267,10 +1237,10 @@ mod tests {
             codex_hooks_user_enabled: true,
         };
 
-        // Round-trip via from_settings/to_settings — exercises the full
-        // pair instead of constructing CoachState by hand and silently
-        // forgetting new fields.
-        let restored = CoachState::from_settings(original.clone()).to_settings();
+        // `AppConfig` is an alias for `Settings`, so the round-trip is
+        // just "copy it into CoachState and read it back" — no manual
+        // field copying, no risk of forgetting a new field.
+        let restored = CoachState::from_settings(original.clone()).config;
 
         assert_eq!(restored.api_tokens, original.api_tokens);
         assert_eq!(restored.model.provider, original.model.provider);
@@ -1296,13 +1266,12 @@ mod tests {
     }
 
     #[test]
-    fn to_settings_excludes_transient_state() {
+    fn config_serialization_excludes_transient_state() {
         let mut state = test_state();
-        state.apply_hook_event(1, "s", Some("/tmp"));
-        state.log("s", "PostToolUse", "observed", None);
+        state.sessions.apply_hook_event(1, "s", Some("/tmp"));
+        state.sessions.log("s", "PostToolUse", "observed", None);
 
-        let settings = state.to_settings();
-        let json = serde_json::to_value(&settings).unwrap();
+        let json = serde_json::to_value(&state.config).unwrap();
 
         assert!(json.get("sessions").is_none());
         assert!(json.get("activity").is_none());
@@ -1346,10 +1315,10 @@ mod tests {
     #[test]
     fn launch_cwd_is_frozen_after_first_observation() {
         let mut state = test_state();
-        state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
+        state.sessions.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
         // Subsequent hooks from a deeper cwd must NOT drift the title.
-        state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach/src-tauri"));
-        state.apply_hook_event(1, "s", Some("/tmp/elsewhere"));
+        state.sessions.apply_hook_event(1, "s", Some("/Users/foo/projects/coach/src-tauri"));
+        state.sessions.apply_hook_event(1, "s", Some("/tmp/elsewhere"));
 
         let sess = state.sessions.get("s").unwrap();
         assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
@@ -1361,8 +1330,8 @@ mod tests {
     #[test]
     fn launch_cwd_adopted_when_first_hook_had_none() {
         let mut state = test_state();
-        state.apply_hook_event(1, "s", None);
-        state.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
+        state.sessions.apply_hook_event(1, "s", None);
+        state.sessions.apply_hook_event(1, "s", Some("/Users/foo/projects/coach"));
 
         let sess = state.sessions.get("s").unwrap();
         assert_eq!(sess.cwd, Some("/Users/foo/projects/coach".into()));
@@ -1374,8 +1343,8 @@ mod tests {
     #[test]
     fn launch_cwd_captured_per_conversation() {
         let mut state = test_state();
-        state.apply_hook_event(1, "old", Some("/Users/foo/projects/coach"));
-        state.apply_hook_event(1, "new", Some("/Users/foo/projects/coach/src"));
+        state.sessions.apply_hook_event(1, "old", Some("/Users/foo/projects/coach"));
+        state.sessions.apply_hook_event(1, "new", Some("/Users/foo/projects/coach/src"));
         let sess = state.sessions.get("new").unwrap();
         assert_eq!(sess.cwd, Some("/Users/foo/projects/coach/src".into()));
     }
@@ -1387,10 +1356,12 @@ mod tests {
         use chrono::Duration;
         let mut state = test_state();
         let started = Utc::now() - Duration::hours(1);
-        let created = state.register_discovered_pid(12345, Some("/projects/foo"), started);
+        let created = state
+            .sessions
+            .register_discovered_pid(12345, Some("/projects/foo"), started);
 
         assert!(created);
-        let sess = state.session_for_pid(12345).unwrap();
+        let sess = state.sessions.session_for_pid(12345).unwrap();
         assert_eq!(sess.event_count, 0);
         assert_eq!(sess.pid, 12345);
         assert_eq!(sess.started_at, started);
@@ -1404,14 +1375,16 @@ mod tests {
     #[test]
     fn register_discovered_pid_is_noop_when_pid_known() {
         let mut state = test_state();
-        state.apply_hook_event(42, "from-hook", None);
-        let event_count_before = state.session_for_pid(42).unwrap().event_count;
+        state.sessions.apply_hook_event(42, "from-hook", None);
+        let event_count_before = state.sessions.session_for_pid(42).unwrap().event_count;
 
-        let created = state.register_discovered_pid(42, Some("/anywhere"), Utc::now());
+        let created = state
+            .sessions
+            .register_discovered_pid(42, Some("/anywhere"), Utc::now());
 
         assert!(!created);
         assert_eq!(
-            state.session_for_pid(42).unwrap().event_count,
+            state.sessions.session_for_pid(42).unwrap().event_count,
             event_count_before,
             "discovered should not stomp on hook-populated state"
         );
@@ -1422,12 +1395,12 @@ mod tests {
     #[test]
     fn remove_dead_pids_removes_only_unknown_pids() {
         let mut state = test_state();
-        state.apply_hook_event(1, "alive-1", None);
-        state.apply_hook_event(2, "dead-2", None);
-        state.apply_hook_event(3, "dead-3", None);
+        state.sessions.apply_hook_event(1, "alive-1", None);
+        state.sessions.apply_hook_event(2, "dead-2", None);
+        state.sessions.apply_hook_event(3, "dead-3", None);
 
         let live: HashSet<u32> = [1].into_iter().collect();
-        let mut dead = state.remove_dead_pids(&live);
+        let mut dead = state.sessions.remove_dead_pids(&live);
         dead.sort();
 
         assert_eq!(dead, vec!["dead-2".to_string(), "dead-3".to_string()]);
@@ -1439,11 +1412,11 @@ mod tests {
     #[test]
     fn remove_dead_pids_keeps_all_when_all_alive() {
         let mut state = test_state();
-        state.apply_hook_event(1, "a", None);
-        state.apply_hook_event(2, "b", None);
+        state.sessions.apply_hook_event(1, "a", None);
+        state.sessions.apply_hook_event(2, "b", None);
 
         let live: HashSet<u32> = [1, 2].into_iter().collect();
-        let dead = state.remove_dead_pids(&live);
+        let dead = state.sessions.remove_dead_pids(&live);
 
         assert!(dead.is_empty());
         assert_eq!(state.sessions.len(), 2);

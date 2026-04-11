@@ -50,9 +50,15 @@ pub(crate) async fn observer_consumer(
                             sess.coach.telemetry.intervention_count += 1;
                         }
                     }
-                    s.log(&session_id, "Observer", "noted", Some(assessment));
+                    s.sessions
+                        .log(&session_id, "Observer", "noted", Some(assessment));
                     if let Some(ref msg) = intervention {
-                        s.log(&session_id, "Observer", "intervention pending", Some(msg.clone()));
+                        s.sessions.log(
+                            &session_id,
+                            "Observer",
+                            "intervention pending",
+                            Some(msg.clone()),
+                        );
                     }
                 })
                 .await;
@@ -63,7 +69,7 @@ pub(crate) async fn observer_consumer(
                     if let Some(sess) = s.sessions.get_mut(&session_id) {
                         sess.coach.record_error(&e);
                     }
-                    s.log(&session_id, "Observer", "error", Some(e));
+                    s.sessions.log(&session_id, "Observer", "error", Some(e));
                 })
                 .await;
             }
@@ -101,7 +107,8 @@ pub(crate) async fn run_session_namer(
                     sess.coach.record_success(0, result.usage, None);
                     sess.coach.memory.session_title = Some(result.title.clone());
                 }
-                s.log(&session_id, "Namer", "renamed", Some(result.title));
+                s.sessions
+                    .log(&session_id, "Namer", "renamed", Some(result.title));
             })
             .await;
         }
@@ -111,7 +118,7 @@ pub(crate) async fn run_session_namer(
                 if let Some(sess) = s.sessions.get_mut(&session_id) {
                     sess.coach.record_error(&e);
                 }
-                s.log(&session_id, "Namer", "error", Some(e));
+                s.sessions.log(&session_id, "Namer", "error", Some(e));
             })
             .await;
         }

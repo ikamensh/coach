@@ -29,31 +29,31 @@ struct Harness {
 impl Harness {
     async fn real_llm(priorities: Vec<&str>) -> Self {
         let mut coach = CoachState::from_settings(Settings::default());
-        coach.coach_mode = EngineMode::Llm;
-        coach.priorities = priorities.into_iter().map(String::from).collect();
+        coach.config.coach_mode = EngineMode::Llm;
+        coach.config.priorities = priorities.into_iter().map(String::from).collect();
 
         if let Some(key) = env("ANTHROPIC_API_KEY") {
-            coach.model = ModelConfig { provider: "anthropic".into(), model: "claude-haiku-4-5-20251001".into() };
-            coach.api_tokens.insert("anthropic".into(), key);
+            coach.config.model = ModelConfig { provider: "anthropic".into(), model: "claude-haiku-4-5-20251001".into() };
+            coach.config.api_tokens.insert("anthropic".into(), key);
         } else if let Some(key) = env("OPENAI_API_KEY") {
-            coach.model = ModelConfig { provider: "openai".into(), model: "gpt-4.1-mini".into() };
-            coach.api_tokens.insert("openai".into(), key);
+            coach.config.model = ModelConfig { provider: "openai".into(), model: "gpt-4.1-mini".into() };
+            coach.config.api_tokens.insert("openai".into(), key);
         } else if let Some(key) = env("GOOGLE_API_KEY").or_else(|| env("GEMINI_API_KEY")) {
-            coach.model = ModelConfig { provider: "google".into(), model: "gemini-2.5-flash".into() };
-            coach.api_tokens.insert("google".into(), key);
+            coach.config.model = ModelConfig { provider: "google".into(), model: "gemini-2.5-flash".into() };
+            coach.config.api_tokens.insert("google".into(), key);
         } else {
             panic!("Need ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY");
         }
-        eprintln!("[harness] provider={} model={}", coach.model.provider, coach.model.model);
+        eprintln!("[harness] provider={} model={}", coach.config.model.provider, coach.config.model.model);
         Self::boot(Arc::new(RwLock::new(coach))).await
     }
 
     async fn mock(mock: MockSessionSend) -> Self {
         let mut coach = CoachState::from_settings(Settings::default());
-        coach.coach_mode = EngineMode::Llm;
-        coach.model = ModelConfig { provider: "anthropic".into(), model: "mock".into() };
-        coach.api_tokens.insert("anthropic".into(), "mock".into());
-        coach.mock_session_send = Some(mock);
+        coach.config.coach_mode = EngineMode::Llm;
+        coach.config.model = ModelConfig { provider: "anthropic".into(), model: "mock".into() };
+        coach.config.api_tokens.insert("anthropic".into(), "mock".into());
+        coach.services.mock_session_send = Some(mock);
         Self::boot(Arc::new(RwLock::new(coach))).await
     }
 

@@ -123,7 +123,7 @@ fn spawn_pycoach_if_configured(state: SharedState) {
         match pycoach::Pycoach::launch(launcher).await {
             Ok(py) => {
                 eprintln!("[coach] pycoach sidecar ready at {}", py.base_url);
-                state.write().await.pycoach = Some(Arc::new(py));
+                state.write().await.services.pycoach = Some(Arc::new(py));
             }
             Err(e) => {
                 eprintln!("[coach] pycoach sidecar failed to start: {e}");

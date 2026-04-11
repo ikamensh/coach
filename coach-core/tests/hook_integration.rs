@@ -289,7 +289,7 @@ async fn permission_request_auto_approves_in_away_mode() {
 
     {
         let mut s = state.write().await;
-        s.default_mode = coach_core::state::CoachMode::Away;
+        s.sessions.default_mode = coach_core::state::CoachMode::Away;
         if let Some(sess) = s.sessions.get_mut("away-sess") {
             sess.mode = coach_core::state::CoachMode::Away;
         }
@@ -334,7 +334,7 @@ async fn stop_blocks_then_allows_on_cooldown() {
     {
         let mut s = state.write().await;
         // This test exercises the rules/cooldown stop path, so force Rules mode.
-        s.coach_mode = coach_core::settings::EngineMode::Rules;
+        s.config.coach_mode = coach_core::settings::EngineMode::Rules;
         if let Some(sess) = s.sessions.get_mut("stop-sess") {
             sess.mode = coach_core::state::CoachMode::Away;
         }
@@ -390,12 +390,12 @@ async fn stop_blocks_then_allows_on_cooldown() {
 async fn clear_replaces_session_in_same_window() {
     let mut coach = CoachState::from_settings(Settings::default());
     let pid = 4242;
-    coach.apply_hook_event(pid, "before-clear", Some("/projects/coach"));
+    coach.sessions.apply_hook_event(pid, "before-clear", Some("/projects/coach"));
     coach.sessions.get_mut("before-clear").unwrap().record_tool("Read");
     coach.sessions.get_mut("before-clear").unwrap().record_tool("Bash");
 
     // /clear: new session_id for the same PID.
-    coach.apply_hook_event(pid, "after-clear", Some("/projects/coach"));
+    coach.sessions.apply_hook_event(pid, "after-clear", Some("/projects/coach"));
 
     assert!(!coach.sessions.contains_key("before-clear"), "old entry evicted");
     let sess = coach.sessions.get("after-clear").unwrap();
@@ -421,6 +421,7 @@ async fn scanner_discovers_real_sessions() {
 
     for file in &live_files {
         let sess = coach
+            .sessions
             .session_for_pid(file.pid)
             .unwrap_or_else(|| panic!("PID {} from session file should be in state", file.pid));
         assert_eq!(sess.pid, file.pid);
@@ -438,11 +439,15 @@ async fn hook_adopts_scanner_discovered_pid() {
     let mut coach = CoachState::from_settings(Settings::default());
     let pid = 7777;
     let scanner_started = chrono::Utc::now() - chrono::Duration::hours(1);
-    coach.register_discovered_pid(pid, Some("/tmp/project"), scanner_started);
-    assert!(coach.session_for_pid(pid).is_some());
+    coach
+        .sessions
+        .register_discovered_pid(pid, Some("/tmp/project"), scanner_started);
+    assert!(coach.sessions.session_for_pid(pid).is_some());
     assert!(!coach.sessions.contains_key("adopt-me"));
 
-    coach.apply_hook_event(pid, "adopt-me", Some("/tmp/project"));
+    coach
+        .sessions
+        .apply_hook_event(pid, "adopt-me", Some("/tmp/project"));
 
     let sess = coach.sessions.get("adopt-me").unwrap();
     assert_eq!(sess.pid, pid);
@@ -632,7 +637,7 @@ async fn all_hook_responses_conform_to_claude_code_schema() {
 
     {
         let mut s = state.write().await;
-        s.default_mode = coach_core::state::CoachMode::Away;
+        s.sessions.default_mode = coach_core::state::CoachMode::Away;
         if let Some(sess) = s.sessions.get_mut("schema-present") {
             sess.mode = coach_core::state::CoachMode::Away;
         }
@@ -727,13 +732,13 @@ async fn post_tool_use_rule_response_schema() {
 
 async fn put_in_llm_mode_no_key(state: &Arc<RwLock<CoachState>>) {
     let mut s = state.write().await;
-    s.coach_mode = coach_core::settings::EngineMode::Llm;
-    s.model = coach_core::settings::ModelConfig {
+    s.config.coach_mode = coach_core::settings::EngineMode::Llm;
+    s.config.model = coach_core::settings::ModelConfig {
         provider: "openai".into(),
         model: "gpt-5.4-mini".into(),
     };
-    s.api_tokens.clear();
-    s.env_tokens.clear();
+    s.config.api_tokens.clear();
+    s.services.env_tokens.clear();
 }
 
 #[tokio::test]
@@ -841,7 +846,7 @@ async fn observer_does_not_fire_in_rules_mode() {
     let (base, state) = start_test_server().await;
     {
         let mut s = state.write().await;
-        s.coach_mode = coach_core::settings::EngineMode::Rules;
+        s.config.coach_mode = coach_core::settings::EngineMode::Rules;
     }
     let client = reqwest::Client::new();
 
@@ -883,13 +888,13 @@ async fn observer_does_not_fire_for_non_capable_provider() {
     // so we pick openrouter to keep this gate test meaningful.
     {
         let mut s = state.write().await;
-        s.coach_mode = coach_core::settings::EngineMode::Llm;
-        s.model = coach_core::settings::ModelConfig {
+        s.config.coach_mode = coach_core::settings::EngineMode::Llm;
+        s.config.model = coach_core::settings::ModelConfig {
             provider: "openrouter".into(),
             model: "openrouter/auto".into(),
         };
-        s.api_tokens.clear();
-        s.env_tokens.clear();
+        s.config.api_tokens.clear();
+        s.services.env_tokens.clear();
     }
 
     client
@@ -1259,7 +1264,7 @@ async fn api_set_priorities_updates_state_and_snapshot() {
 
     // And the underlying CoachState (the same one a save() would persist).
     let s = state.read().await;
-    assert_eq!(s.priorities, vec!["X", "Y", "Z"]);
+    assert_eq!(s.config.priorities, vec!["X", "Y", "Z"]);
 }
 
 #[tokio::test]
@@ -1294,7 +1299,7 @@ async fn api_set_all_sessions_mode_flips_every_session() {
         s.sessions.values().all(|sess| sess.mode == coach_core::state::CoachMode::Away),
         "every session must be in away mode after the bulk POST"
     );
-    assert_eq!(s.default_mode, coach_core::state::CoachMode::Away);
+    assert_eq!(s.sessions.default_mode, coach_core::state::CoachMode::Away);
 }
 
 #[tokio::test]
@@ -1362,8 +1367,8 @@ async fn api_set_model_updates_state() {
         .unwrap();
 
     let s = state.read().await;
-    assert_eq!(s.model.provider, "anthropic");
-    assert_eq!(s.model.model, "claude-sonnet-4-6");
+    assert_eq!(s.config.model.provider, "anthropic");
+    assert_eq!(s.config.model.model, "claude-sonnet-4-6");
 }
 
 #[tokio::test]
@@ -1379,7 +1384,10 @@ async fn api_set_api_token_inserts_and_clears() {
         .unwrap();
     {
         let s = state.read().await;
-        assert_eq!(s.api_tokens.get("openai").map(String::as_str), Some("sk-test"));
+        assert_eq!(
+            s.config.api_tokens.get("openai").map(String::as_str),
+            Some("sk-test")
+        );
     }
 
     // Empty token deletes the entry — matches the Tauri command behavior.
@@ -1390,7 +1398,7 @@ async fn api_set_api_token_inserts_and_clears() {
         .await
         .unwrap();
     let s = state.read().await;
-    assert!(!s.api_tokens.contains_key("openai"));
+    assert!(!s.config.api_tokens.contains_key("openai"));
 }
 
 #[tokio::test]
@@ -1406,7 +1414,7 @@ async fn api_set_coach_mode_round_trip() {
         .unwrap();
     {
         let s = state.read().await;
-        assert_eq!(s.coach_mode, coach_core::settings::EngineMode::Llm);
+        assert_eq!(s.config.coach_mode, coach_core::settings::EngineMode::Llm);
     }
 
     client
@@ -1416,7 +1424,7 @@ async fn api_set_coach_mode_round_trip() {
         .await
         .unwrap();
     let s = state.read().await;
-    assert_eq!(s.coach_mode, coach_core::settings::EngineMode::Rules);
+    assert_eq!(s.config.coach_mode, coach_core::settings::EngineMode::Rules);
 }
 
 #[tokio::test]
@@ -1437,9 +1445,9 @@ async fn api_set_rules_replaces_rule_list() {
         .unwrap();
 
     let s = state.read().await;
-    assert_eq!(s.rules.len(), 2);
-    assert!(s.rules.iter().any(|r| r.id == "outdated_models" && !r.enabled));
-    assert!(s.rules.iter().any(|r| r.id == "custom_one" && r.enabled));
+    assert_eq!(s.config.rules.len(), 2);
+    assert!(s.config.rules.iter().any(|r| r.id == "outdated_models" && !r.enabled));
+    assert!(s.config.rules.iter().any(|r| r.id == "custom_one" && r.enabled));
 }
 
 #[tokio::test]
@@ -1502,13 +1510,13 @@ async fn nested_claude_sessions_do_not_collide() {
     let parent_pid = 1000;
     let nested_pid = 2000;
 
-    coach.apply_hook_event(parent_pid, "parent-sid", Some("/home/me/work"));
+    coach.sessions.apply_hook_event(parent_pid, "parent-sid", Some("/home/me/work"));
     coach.sessions.get_mut("parent-sid").unwrap().record_tool("Bash");
     coach.sessions.get_mut("parent-sid").unwrap().coach.memory.chain =
         coach_core::state::CoachChain::ServerId { id: "resp_established".into() };
 
     // Nested Claude fires a hook — different session_id, different pid.
-    coach.apply_hook_event(nested_pid, "nested-sid", Some("/tmp/sandbox"));
+    coach.sessions.apply_hook_event(nested_pid, "nested-sid", Some("/tmp/sandbox"));
     coach.sessions.get_mut("nested-sid").unwrap().record_tool("Read");
 
     let parent = coach.sessions.get("parent-sid").expect("parent persists");
