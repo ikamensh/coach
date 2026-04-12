@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCoachStore } from "../store/useCoachStore";
+import type { ModelConfig, CoachUsage, SessionSnapshot } from "../types";
 import { formatDuration, formatTime, timeAgo } from "../utils/time";
 import { abbreviateCwd, jsonlPath } from "../utils/path";
 import { TopBar } from "./TopBar";
@@ -19,6 +20,58 @@ function formatLatency(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+// ── Model metadata ───────────────────────────────────────────────────────
+// Context window sizes (input tokens). Used to show a usage bar.
+// Pricing per 1M tokens: [input_$/M, output_$/M, cached_input_$/M].
+
+interface ModelMeta {
+  context: number;
+  price: [number, number, number];
+}
+
+const MODEL_META: Record<string, ModelMeta> = {
+  // Google
+  "gemini-2.5-flash":         { context: 1_048_576, price: [0.15,  0.60,  0.0375] },
+  "gemini-2.5-pro":           { context: 1_048_576, price: [1.25,  10.0,  0.3125] },
+  "gemini-3-flash-preview":   { context: 1_048_576, price: [0.15,  0.60,  0.0375] },
+  // Anthropic
+  "claude-haiku-4-5":         { context: 200_000, price: [0.80,  4.0,   0.08] },
+  "claude-sonnet-4-6":        { context: 200_000, price: [3.0,   15.0,  0.30] },
+  "claude-opus-4-6":          { context: 200_000, price: [15.0,  75.0,  1.50] },
+  // OpenAI
+  "gpt-5.4":                  { context: 200_000, price: [2.50,  10.0,  1.25] },
+  "gpt-5.4-mini":             { context: 200_000, price: [0.40,  1.60,  0.10] },
+  "gpt-5.4-nano":             { context: 200_000, price: [0.10,  0.40,  0.025] },
+  // OpenRouter (rough)
+  "qwen/qwen3.5-397b-a17b":  { context: 131_072, price: [0.30,  1.20,  0.15] },
+  "moonshotai/kimi-k2.5":     { context: 131_072, price: [0.40,  1.60,  0.20] },
+  "xiaomi/mimo-v2-pro":       { context: 131_072, price: [0.20,  0.80,  0.10] },
+};
+
+function modelMeta(model: string): ModelMeta | null {
+  return MODEL_META[model] ?? null;
+}
+
+/// Estimate session cost in USD from cumulative usage + model pricing.
+function estimateCost(usage: CoachUsage, model: string): number | null {
+  const meta = modelMeta(model);
+  if (!meta) return null;
+  const [inp, out, cached] = meta.price;
+  // cached_input_tokens is a subset of input_tokens for Anthropic;
+  // for others it may be 0. Charge the cached portion at cached rate,
+  // the rest at full input rate.
+  const freshInput = usage.input_tokens - usage.cached_input_tokens;
+  return (
+    (freshInput * inp + usage.cached_input_tokens * cached + usage.output_tokens * out) / 1_000_000
+  );
+}
+
+function formatCost(usd: number): string {
+  if (usd < 0.01) return `<$0.01`;
+  if (usd < 1) return `$${usd.toFixed(2)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
 
 export function SessionDetail() {
   const sessions = useCoachStore((s) => s.sessions);
@@ -27,6 +80,8 @@ export function SessionDetail() {
   const setInterventionMuted = useCoachStore((s) => s.setInterventionMuted);
   const setView = useCoachStore((s) => s.setView);
   const engineMode = useCoachStore((s) => s.engineMode);
+  const globalModel = useCoachStore((s) => s.model);
+  const llmLogDir = useCoachStore((s) => s.llmLogDir);
 
   const session = sessions.find((s) => s.session_id === selectedSessionId);
 
@@ -97,6 +152,9 @@ export function SessionDetail() {
           />
         </div>
       </section>
+
+      {/* Model & Cost */}
+      <ModelCostSection session={session} globalModel={globalModel} llmLogDir={llmLogDir} />
 
       {/* Coach panel — always rendered so the user knows the section exists.
           Three states:
@@ -189,6 +247,18 @@ export function SessionDetail() {
                 </div>
                 <div className="text-xs text-red-600 dark:text-red-400 font-mono whitespace-pre-wrap break-all">
                   {session.coach_last_error}
+                </div>
+              </div>
+            )}
+
+            {/* Observer drops — signals the observer can't keep up. */}
+            {session.observer_dropped > 0 && (
+              <div className="border-t border-amber-200/40 dark:border-amber-500/10 pt-2">
+                <div className="text-[10px] uppercase tracking-wide text-amber-600 dark:text-amber-400 mb-1">
+                  Observer drops
+                </div>
+                <div className="text-xs text-amber-700 dark:text-amber-300 font-mono">
+                  {session.observer_dropped} observation{session.observer_dropped !== 1 ? "s" : ""} dropped (queue full)
                 </div>
               </div>
             )}
@@ -427,6 +497,102 @@ function JsonlLink({
     >
       {label}
     </button>
+  );
+}
+
+function ModelCostSection({
+  session,
+  globalModel,
+  llmLogDir,
+}: {
+  session: SessionSnapshot;
+  globalModel: ModelConfig;
+  llmLogDir: string | null;
+}) {
+  const lastModel = session.coach_last_model;
+  const activeModel = lastModel ?? globalModel;
+  const meta = modelMeta(activeModel.model);
+  const totalUsage = session.coach_total_usage;
+  const totalTokens = totalUsage.input_tokens + totalUsage.output_tokens;
+  const cost = estimateCost(totalUsage, activeModel.model);
+
+  // Context window bar: total input tokens consumed (cumulative) vs model limit.
+  // This shows how much of the model's context the session has used in total,
+  // which is most meaningful for history-based chains (Anthropic, Google)
+  // where the full history is resent each call.
+  const contextLimit = meta?.context ?? 0;
+  const lastCallInput = session.coach_last_usage?.input_tokens ?? 0;
+  const contextPct = contextLimit > 0 ? Math.min((lastCallInput / contextLimit) * 100, 100) : 0;
+
+  // Model changed since last call?
+  const modelChanged = lastModel &&
+    (lastModel.provider !== globalModel.provider || lastModel.model !== globalModel.model);
+
+  return (
+    <section>
+      <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
+        Model
+      </h2>
+      <div className="bg-zinc-50 dark:bg-zinc-800/30 border border-zinc-200/60 dark:border-zinc-700/40 rounded px-3 py-2 space-y-2">
+        {/* Active model */}
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-zinc-400 dark:text-zinc-500">{activeModel.provider}</span>
+          <span className="font-mono text-zinc-700 dark:text-zinc-200 font-medium">
+            {activeModel.model}
+          </span>
+          {modelChanged && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400">
+              changed → {globalModel.model}
+            </span>
+          )}
+        </div>
+
+        {/* Context window bar */}
+        {contextLimit > 0 && lastCallInput > 0 && (
+          <div>
+            <div className="flex justify-between text-[10px] text-zinc-400 dark:text-zinc-500 mb-0.5">
+              <span>Last call context</span>
+              <span className="tabular-nums">
+                {formatTokens(lastCallInput)} / {formatTokens(contextLimit)} ({contextPct.toFixed(1)}%)
+              </span>
+            </div>
+            <div className="h-1.5 bg-zinc-200 dark:bg-zinc-700 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all ${
+                  contextPct > 80
+                    ? "bg-red-500"
+                    : contextPct > 50
+                      ? "bg-amber-500"
+                      : "bg-emerald-500"
+                }`}
+                style={{ width: `${contextPct}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Cost + totals row */}
+        {totalTokens > 0 && (
+          <div className="flex items-center gap-3 text-xs text-zinc-500 dark:text-zinc-400">
+            <span className="tabular-nums">
+              {formatTokens(totalUsage.input_tokens)} in / {formatTokens(totalUsage.output_tokens)} out
+            </span>
+            {cost !== null && (
+              <span className="tabular-nums font-medium text-zinc-600 dark:text-zinc-300">
+                {formatCost(cost)}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* LLM log dir */}
+        {llmLogDir && (
+          <div className="text-[10px] text-zinc-400 dark:text-zinc-600 font-mono truncate">
+            {llmLogDir}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 

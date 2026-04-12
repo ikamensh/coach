@@ -523,9 +523,10 @@ async fn on_stop_requested(
             Ok((decision, new_chain, usage)) if decision.allow => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 crate::state::mutate(&state.app, &state.emitter, |coach| {
+                    let model = coach.config.model.clone();
                     if let Some(s) = coach.sessions.get_mut(&session_id) {
                         let u = usage.unwrap_or_default();
-                        s.coach.record_success(latency_ms, u, new_chain);
+                        s.coach.record_success(latency_ms, u, new_chain, model);
                     }
                     coach
                         .sessions
@@ -537,6 +538,7 @@ async fn on_stop_requested(
             Ok((decision, new_chain, usage)) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let message = crate::state::mutate(&state.app, &state.emitter, |coach| {
+                    let model = coach.config.model.clone();
                     let message = decision
                         .message
                         .filter(|m| !m.trim().is_empty())
@@ -547,7 +549,7 @@ async fn on_stop_requested(
                         s.last_stop_blocked = Some(std::time::Instant::now());
                         s.stop_blocked_count += 1;
                         let u = usage.unwrap_or_default();
-                        s.coach.record_success(latency_ms, u, new_chain);
+                        s.coach.record_success(latency_ms, u, new_chain, model);
                     }
                     coach.sessions.log(
                         &session_id,

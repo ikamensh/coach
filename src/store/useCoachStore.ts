@@ -31,6 +31,7 @@ interface CoachState {
   pathStatus: PathStatus | null;
   observerCapableProviders: string[];
   autoUninstallHooksOnExit: boolean;
+  llmLogDir: string | null;
   modelError: string | null;
   modelValidating: boolean;
   initialized: boolean;
@@ -104,6 +105,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
   pathStatus: null,
   observerCapableProviders: [],
   autoUninstallHooksOnExit: true,
+  llmLogDir: null,
   modelError: null,
   modelValidating: false,
   initialized: false,
@@ -129,6 +131,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         rules: snapshot.rules,
         observerCapableProviders: snapshot.observer_capable_providers,
         autoUninstallHooksOnExit: snapshot.auto_uninstall_hooks_on_exit,
+        llmLogDir: snapshot.llm_log_dir ?? null,
         initialized: true,
       });
     } catch (e) {
@@ -152,6 +155,7 @@ export const useCoachStore = create<CoachStore>((set, get) => ({
         rules: s.rules,
         observerCapableProviders: s.observer_capable_providers,
         autoUninstallHooksOnExit: s.auto_uninstall_hooks_on_exit,
+        llmLogDir: s.llm_log_dir ?? null,
       });
     });
 

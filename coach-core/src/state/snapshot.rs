@@ -136,6 +136,9 @@ pub struct SessionSnapshot {
     /// The user message sent to the LLM on the last observer call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coach_last_user_message: Option<String>,
+    /// Provider + model used on the most recent successful coach call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coach_last_model: Option<ModelConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -169,6 +172,9 @@ pub struct CoachSnapshot {
     /// User toggle: when Coach exits cleanly, remove its hooks so other
     /// live Claude/Cursor sessions don't fail with "HTTP undefined".
     pub auto_uninstall_hooks_on_exit: bool,
+    /// Directory holding per-session JSONL LLM call logs (when `COACH_LLM_LOG_DIR` is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_log_dir: Option<String>,
 }
 
 /// Build the "away mode" intervention message from the current priorities.
@@ -250,6 +256,11 @@ impl super::AppState {
                 .map(|s| s.to_string())
                 .collect(),
             auto_uninstall_hooks_on_exit: self.config.auto_uninstall_hooks_on_exit,
+            llm_log_dir: self
+                .services
+                .llm_logger
+                .as_ref()
+                .map(|l| l.run_dir().display().to_string()),
         }
     }
 }
@@ -294,5 +305,6 @@ fn snapshot_session(s: &SessionState, now: DateTime<Utc>) -> SessionSnapshot {
         observer_dropped: s.coach.observer_dropped,
         coach_last_system_prompt: s.coach.memory.last_system_prompt.clone(),
         coach_last_user_message: s.coach.memory.last_user_message.clone(),
+        coach_last_model: s.coach.telemetry.last_model.clone(),
     }
 }

@@ -154,6 +154,8 @@ pub struct CoachTelemetry {
     pub last_usage: Option<CoachUsage>,
     pub total_usage: CoachUsage,
     pub intervention_count: usize,
+    /// Provider + model used on the most recent successful LLM call.
+    pub last_model: Option<crate::settings::ModelConfig>,
 }
 
 impl CoachTelemetry {
@@ -166,16 +168,18 @@ impl CoachTelemetry {
             last_usage: None,
             total_usage: CoachUsage::default(),
             intervention_count: 0,
+            last_model: None,
         }
     }
 
-    /// Record a successful LLM call: bump counter, update latency and usage.
-    pub fn record_success(&mut self, latency_ms: u64, usage: CoachUsage) {
+    /// Record a successful LLM call: bump counter, update latency, usage, and model.
+    pub fn record_success(&mut self, latency_ms: u64, usage: CoachUsage, model: crate::settings::ModelConfig) {
         self.calls += 1;
         self.last_called_at = Some(Utc::now());
         self.last_latency_ms = Some(latency_ms);
         self.last_usage = Some(usage);
         self.total_usage += usage;
+        self.last_model = Some(model);
     }
 
     /// Record a failed LLM call.
@@ -225,8 +229,9 @@ impl SessionCoachState {
         latency_ms: u64,
         usage: CoachUsage,
         new_chain: Option<CoachChain>,
+        model: crate::settings::ModelConfig,
     ) {
-        self.telemetry.record_success(latency_ms, usage);
+        self.telemetry.record_success(latency_ms, usage, model);
         if let Some(chain) = new_chain {
             self.memory.chain = chain;
         }

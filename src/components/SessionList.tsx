@@ -128,6 +128,9 @@ export function SessionList() {
                 </div>
                 <div className="text-xs text-zinc-400 dark:text-zinc-500">
                   {formatDuration(session.duration_secs)} · {session.event_count} events
+                  {session.coach_last_model && (
+                    <span className="text-zinc-400 dark:text-zinc-500"> · <span className="font-mono">{session.coach_last_model.model}</span></span>
+                  )}
                   {Object.keys(session.tool_counts).length > 0 && (
                     <span> · {topTools(session.tool_counts)}</span>
                   )}

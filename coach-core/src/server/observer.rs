@@ -40,8 +40,9 @@ pub(crate) async fn observer_consumer(
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let (assessment, intervention) = parse_intervention(&result.assessment);
                 crate::state::mutate(&coach, &emitter, |s| {
+                    let model = s.config.model.clone();
                     if let Some(sess) = s.sessions.get_mut(&session_id) {
-                        sess.coach.record_success(latency_ms, result.usage, Some(result.chain));
+                        sess.coach.record_success(latency_ms, result.usage, Some(result.chain), model);
                         sess.coach.memory.last_assessment = Some(assessment.clone());
                         sess.coach.memory.last_system_prompt = Some(result.system_prompt);
                         sess.coach.memory.last_user_message = Some(result.user_message);
@@ -101,10 +102,11 @@ pub(crate) async fn run_session_namer(
     match llm_coach.name_session(input).await {
         Ok(result) => {
             crate::state::mutate(&coach, &emitter, |s| {
+                let model = s.config.model.clone();
                 if let Some(sess) = s.sessions.get_mut(&session_id) {
                     // Namer doesn't update the chain — pass 0 latency since
                     // it's a stateless call and latency isn't worth tracking.
-                    sess.coach.record_success(0, result.usage, None);
+                    sess.coach.record_success(0, result.usage, None, model);
                     sess.coach.memory.session_title = Some(result.title.clone());
                 }
                 s.sessions

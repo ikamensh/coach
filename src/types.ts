@@ -118,6 +118,8 @@ export interface SessionSnapshot {
   observer_dropped: number;
   coach_last_system_prompt: string | null;
   coach_last_user_message: string | null;
+  /** Provider + model used on the most recent successful coach call. */
+  coach_last_model?: ModelConfig | null;
 }
 
 export interface CoachSnapshot {
@@ -131,4 +133,6 @@ export interface CoachSnapshot {
   rules: CoachRule[];
   observer_capable_providers: string[];
   auto_uninstall_hooks_on_exit: boolean;
+  /** Directory holding per-session JSONL LLM call logs (when COACH_LLM_LOG_DIR is set). */
+  llm_log_dir?: string | null;
 }
