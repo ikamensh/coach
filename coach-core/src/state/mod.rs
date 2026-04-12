@@ -200,6 +200,9 @@ pub struct SessionCoachState {
     /// When true, observer interventions are shown in the UI only —
     /// not sent to the coding agent via hook responses.
     pub intervention_muted: bool,
+    /// Model locked when the first coach call is made for this session.
+    /// All subsequent calls use this model, not the global config.
+    pub model: Option<crate::settings::ModelConfig>,
 }
 
 impl SessionCoachState {
@@ -211,6 +214,7 @@ impl SessionCoachState {
             observer_task: None,
             observer_dropped: 0,
             intervention_muted: true,
+            model: None,
         }
     }
 
@@ -222,6 +226,7 @@ impl SessionCoachState {
             handle.abort();
         }
         self.observer_dropped = 0;
+        self.model = None;
     }
 
     pub fn record_success(

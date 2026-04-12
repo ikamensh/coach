@@ -1,3 +1,4 @@
+use crate::settings::ModelConfig;
 use crate::state::{CoachChain, CoachUsage, SharedState};
 
 pub use crate::llm::{NameSessionInput, StopContext, StopDecision};
@@ -48,14 +49,22 @@ pub struct NameSessionOutput {
 ///
 /// The low-level provider and prompt plumbing stays in `llm.rs`; callers
 /// should depend on this type so the app has one clear coach boundary.
+///
+/// When `model` is set, all calls use that model instead of the global
+/// config — this is how per-session model locking works.
 #[derive(Clone)]
 pub struct LlmCoach {
     state: SharedState,
+    model: Option<ModelConfig>,
 }
 
 impl LlmCoach {
     pub fn new(state: SharedState) -> Self {
-        Self { state }
+        Self { state, model: None }
+    }
+
+    pub fn with_model(state: SharedState, model: ModelConfig) -> Self {
+        Self { state, model: Some(model) }
     }
 
     pub async fn observe_tool_use(
@@ -74,6 +83,7 @@ impl LlmCoach {
             &input.chain,
             &event,
             input.session_id.as_deref(),
+            self.model.clone(),
         )
         .await?;
         Ok(ObserveToolUseOutput {
@@ -86,7 +96,7 @@ impl LlmCoach {
     }
 
     pub async fn evaluate_stop(&self, context: StopContext) -> Result<StopDecision, String> {
-        crate::llm::evaluate_stop(&self.state, &context).await
+        crate::llm::evaluate_stop(&self.state, &context, self.model.clone()).await
     }
 
     pub async fn evaluate_stop_chained(
@@ -99,6 +109,7 @@ impl LlmCoach {
             &input.chain,
             input.stop_reason.as_deref(),
             input.session_id.as_deref(),
+            self.model.clone(),
         )
         .await?;
         Ok(ChainedStopOutput {
@@ -112,7 +123,7 @@ impl LlmCoach {
         &self,
         input: NameSessionInput,
     ) -> Result<NameSessionOutput, String> {
-        let (title, usage) = crate::llm::name_session(&self.state, &input).await?;
+        let (title, usage) = crate::llm::name_session(&self.state, &input, self.model.clone()).await?;
         Ok(NameSessionOutput { title, usage })
     }
 }

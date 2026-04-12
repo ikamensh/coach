@@ -342,9 +342,20 @@ async fn on_tool_completed(
                 None => None,
             };
 
-            let llm_active = coach.config.coach_mode == EngineMode::Llm
+            // Lock model on first coach call for this session.
+            let global_model = coach.config.model.clone();
+            let coach_mode_is_llm = coach.config.coach_mode == EngineMode::Llm;
+            let sess = coach
+                .sessions
+                .get_mut(&session_id)
+                .expect("apply_hook_event populated");
+            if sess.coach.model.is_none() {
+                sess.coach.model = Some(global_model);
+            }
+            let session_model = sess.coach.model.as_ref().unwrap();
+            let llm_active = coach_mode_is_llm
                 && crate::settings::OBSERVER_CAPABLE_PROVIDERS
-                    .contains(&coach.config.model.provider.as_str());
+                    .contains(&session_model.provider.as_str());
 
             if llm_active {
                 let priorities = coach.config.priorities.clone();
@@ -448,13 +459,13 @@ async fn on_stop_requested(
             provider_capable: bool,
             prev_chain: crate::state::CoachChain,
             ctx: StopContext,
+            session_model: crate::settings::ModelConfig,
         },
     }
     let phase1 = crate::state::mutate(&state.app, &state.emitter, |coach| {
         let priorities = coach.config.priorities.clone();
-        let provider_capable = crate::settings::OBSERVER_CAPABLE_PROVIDERS
-            .contains(&coach.config.model.provider.as_str());
         let coach_mode = coach.config.coach_mode.clone();
+        let global_model = coach.config.model.clone();
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         sess.stop_count += 1;
 
@@ -464,6 +475,14 @@ async fn on_stop_requested(
                 .log(&session_id, "Stop", "passed through", None);
             return Phase1::PassThrough;
         }
+
+        // Lock model on first coach call for this session.
+        if sess.coach.model.is_none() {
+            sess.coach.model = Some(global_model);
+        }
+        let session_model = sess.coach.model.clone().unwrap();
+        let provider_capable = crate::settings::OBSERVER_CAPABLE_PROVIDERS
+            .contains(&session_model.provider.as_str());
 
         let prev_chain = sess.coach.memory.chain.clone();
         let ctx = StopContext {
@@ -480,22 +499,24 @@ async fn on_stop_requested(
             provider_capable,
             prev_chain,
             ctx,
+            session_model,
         }
     })
     .await;
 
-    let (coach_mode, provider_capable, prev_chain, ctx) = match phase1 {
+    let (coach_mode, provider_capable, prev_chain, ctx, session_model) = match phase1 {
         Phase1::PassThrough => return passthrough(),
         Phase1::Evaluate {
             coach_mode,
             provider_capable,
             prev_chain,
             ctx,
-        } => (coach_mode, provider_capable, prev_chain, ctx),
+            session_model,
+        } => (coach_mode, provider_capable, prev_chain, ctx, session_model),
     };
 
     if coach_mode == EngineMode::Llm {
-        let llm_coach = LlmCoach::new(state.app.clone());
+        let llm_coach = LlmCoach::with_model(state.app.clone(), session_model.clone());
         let started = std::time::Instant::now();
         let chained = if provider_capable {
             match llm_coach
@@ -523,10 +544,9 @@ async fn on_stop_requested(
             Ok((decision, new_chain, usage)) if decision.allow => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 crate::state::mutate(&state.app, &state.emitter, |coach| {
-                    let model = coach.config.model.clone();
                     if let Some(s) = coach.sessions.get_mut(&session_id) {
                         let u = usage.unwrap_or_default();
-                        s.coach.record_success(latency_ms, u, new_chain, model);
+                        s.coach.record_success(latency_ms, u, new_chain, session_model.clone());
                     }
                     coach
                         .sessions
@@ -538,7 +558,6 @@ async fn on_stop_requested(
             Ok((decision, new_chain, usage)) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let message = crate::state::mutate(&state.app, &state.emitter, |coach| {
-                    let model = coach.config.model.clone();
                     let message = decision
                         .message
                         .filter(|m| !m.trim().is_empty())
@@ -549,7 +568,7 @@ async fn on_stop_requested(
                         s.last_stop_blocked = Some(std::time::Instant::now());
                         s.stop_blocked_count += 1;
                         let u = usage.unwrap_or_default();
-                        s.coach.record_success(latency_ms, u, new_chain, model);
+                        s.coach.record_success(latency_ms, u, new_chain, session_model.clone());
                     }
                     coach.sessions.log(
                         &session_id,

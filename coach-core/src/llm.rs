@@ -45,7 +45,7 @@ pub struct StopContext {
 
 /// Per-call constraints for `session_send`. Everything is optional /
 /// defaulted so callers who don't care can pass `CallConstraints::default()`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CallConstraints {
     /// Hard cap on the model's output length. OpenAI maps this to
     /// `max_output_tokens`; Anthropic maps it to `max_tokens`.
@@ -55,6 +55,10 @@ pub struct CallConstraints {
     /// equivalent flag, the caller is expected to prompt for JSON in
     /// the message itself.
     pub require_json: bool,
+    /// When set, use this model instead of the global `config.model`.
+    /// Used to lock a session to the model that was active when the
+    /// session's coach first started observing.
+    pub model: Option<crate::settings::ModelConfig>,
 }
 
 // ── Provider helpers ───────────────────────────────────────────────────
@@ -69,9 +73,12 @@ struct ProviderConfig {
     primary_token: String,
 }
 
-async fn snapshot_config(state: &SharedState) -> Result<ProviderConfig, String> {
+async fn snapshot_config(
+    state: &SharedState,
+    model_override: Option<&ModelConfig>,
+) -> Result<ProviderConfig, String> {
     let s = state.read().await;
-    let primary = s.config.model.clone();
+    let primary = model_override.cloned().unwrap_or_else(|| s.config.model.clone());
     let primary_token = s
         .effective_token(&primary.provider)
         .ok_or("No API token for primary model")?
@@ -129,6 +136,7 @@ fn build_stop_prompt(ctx: &StopContext) -> Result<String, String> {
 pub async fn evaluate_stop(
     state: &SharedState,
     ctx: &StopContext,
+    model: Option<ModelConfig>,
 ) -> Result<StopDecision, String> {
     let prompt = build_stop_prompt(ctx)?;
     let (text, _chain, _usage) = session_send(
@@ -136,7 +144,7 @@ pub async fn evaluate_stop(
         &crate::state::CoachChain::Empty,
         "You evaluate whether an AI agent should stop. Respond with JSON only.",
         &prompt,
-        CallConstraints { max_output_tokens: Some(200), require_json: true },
+        CallConstraints { max_output_tokens: Some(200), require_json: true, model },
         LogContext::new("stop_oneshot", ctx.session_id.as_deref()),
     )
     .await?;
@@ -277,10 +285,11 @@ pub async fn session_send(
     // request and outcome without re-acquiring the lock around the await.
     let (logger, provider_name, model_name, mock) = {
         let s = state.read().await;
+        let model = constraints.model.as_ref().unwrap_or(&s.config.model);
         (
             s.services.llm_logger.clone(),
-            s.config.model.provider.clone(),
-            s.config.model.model.clone(),
+            model.provider.clone(),
+            model.model.clone(),
             s.services.mock_session_send.clone(),
         )
     };
@@ -296,7 +305,7 @@ pub async fn session_send(
                 (text, new_chain, usage)
             })
         } else {
-            dispatch_real(state, chain, system_prompt, message, constraints).await
+            dispatch_real(state, chain, system_prompt, message, constraints.clone()).await
         };
 
     if let Some(logger) = logger {
@@ -338,7 +347,7 @@ async fn dispatch_real(
     use crate::state::CoachChain;
     use rig::completion::Completion;
 
-    let cfg = snapshot_config(state).await?;
+    let cfg = snapshot_config(state, constraints.model.as_ref()).await?;
     let provider = cfg.primary.provider.as_str();
 
     match provider {
@@ -482,6 +491,7 @@ pub async fn observe_event(
     chain: &crate::state::CoachChain,
     event: &str,
     session_id: Option<&str>,
+    model: Option<ModelConfig>,
 ) -> Result<(String, crate::state::CoachChain, crate::state::CoachUsage), String> {
     let system = coach_system_prompt(priorities)?;
     session_send(
@@ -492,6 +502,7 @@ pub async fn observe_event(
         CallConstraints {
             max_output_tokens: Some(80),
             require_json: false,
+            model,
         },
         LogContext::new("observer", session_id),
     )
@@ -506,6 +517,7 @@ pub async fn evaluate_stop_chained(
     chain: &crate::state::CoachChain,
     stop_reason: Option<&str>,
     session_id: Option<&str>,
+    model: Option<ModelConfig>,
 ) -> Result<(StopDecision, crate::state::CoachChain, crate::state::CoachUsage), String> {
     let reason = stop_reason.unwrap_or("not specified");
     let stop_chained_template = crate::prompts::load("stop_chained")?;
@@ -519,6 +531,7 @@ pub async fn evaluate_stop_chained(
         CallConstraints {
             max_output_tokens: Some(200),
             require_json: true,
+            model,
         },
         LogContext::new("stop_chained", session_id),
     )
@@ -625,6 +638,7 @@ pub fn clean_session_title(raw: &str) -> Option<String> {
 pub async fn name_session(
     state: &SharedState,
     input: &NameSessionInput,
+    model: Option<ModelConfig>,
 ) -> Result<(String, crate::state::CoachUsage), String> {
     let prompt = build_name_session_prompt(input)?;
     // Tiny system prompt — the namer doesn't need the full coach preamble.
@@ -637,6 +651,7 @@ pub async fn name_session(
         CallConstraints {
             max_output_tokens: Some(20),
             require_json: false,
+            model,
         },
         LogContext::new("namer", input.session_id.as_deref()),
     )
@@ -1001,6 +1016,7 @@ mod tests {
             CallConstraints {
                 max_output_tokens: Some(40),
                 require_json: false,
+                ..Default::default()
             },
             crate::llm_log::LogContext::new("observer", Some("sess-xyz")),
         )
@@ -1099,10 +1115,10 @@ mod tests {
         let priorities = vec!["Simplicity".into()];
         let chain = crate::state::CoachChain::Empty;
 
-        observe_event(&state, &priorities, &chain, "event", Some("sess-q"))
+        observe_event(&state, &priorities, &chain, "event", Some("sess-q"), None)
             .await
             .unwrap();
-        evaluate_stop_chained(&state, &priorities, &chain, Some("end_turn"), Some("sess-q"))
+        evaluate_stop_chained(&state, &priorities, &chain, Some("end_turn"), Some("sess-q"), None)
             .await
             .unwrap();
 
@@ -1159,7 +1175,7 @@ mod live_tests {
             &crate::state::CoachChain::Empty,
             "You are a test bot.",
             "Reply with the single word: hello",
-            CallConstraints { max_output_tokens: Some(20), require_json: false },
+            CallConstraints { max_output_tokens: Some(20), require_json: false, ..Default::default() },
             LogContext::new("test", None),
         )
         .await
@@ -1176,14 +1192,14 @@ mod live_tests {
     async fn live_session_send_openai_continues_context() {
         let Some(state) = live_state() else { return };
         let system = "You are a test bot. Reply tersely.";
-        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false };
+        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false, ..Default::default() };
 
         let (_t1, chain1, _u1) = session_send(
             &state,
             &crate::state::CoachChain::Empty,
             system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
-            constraints,
+            constraints.clone(),
             LogContext::new("test", None),
         )
         .await
@@ -1216,7 +1232,7 @@ mod live_tests {
             &crate::state::CoachChain::Empty,
             "You return JSON only.",
             "Return JSON of the form {\"answer\": <number>}. The number is 7.",
-            CallConstraints { max_output_tokens: Some(60), require_json: true },
+            CallConstraints { max_output_tokens: Some(60), require_json: true, ..Default::default() },
             LogContext::new("test", None),
         )
         .await
@@ -1246,7 +1262,7 @@ mod live_tests {
         )
         .unwrap();
         let (_text1, chain1, _u1) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None, None)
                 .await
                 .expect("first observe_event failed");
         let id1 = match &chain1 {
@@ -1261,7 +1277,7 @@ mod live_tests {
             None,
         )
         .unwrap();
-        let (_text2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None)
+        let (_text2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None, None)
             .await
             .expect("second observe_event failed");
         let id2 = match &chain2 {
@@ -1289,7 +1305,7 @@ mod live_tests {
         )
         .unwrap();
         let (_text, observed_chain, _u) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None, None)
                 .await
                 .expect("observe failed");
 
@@ -1298,6 +1314,7 @@ mod live_tests {
             &priorities,
             &observed_chain,
             Some("end_turn"),
+            None,
             None,
         )
         .await
@@ -1326,6 +1343,7 @@ mod live_tests {
             &priorities,
             &crate::state::CoachChain::Empty,
             Some("end_turn"),
+            None,
             None,
         )
         .await
@@ -1364,7 +1382,7 @@ mod live_tests {
             &crate::state::CoachChain::Empty,
             "You are a test bot. Respond with one word.",
             "Reply with the single word: hello",
-            CallConstraints { max_output_tokens: Some(20), require_json: false },
+            CallConstraints { max_output_tokens: Some(20), require_json: false, ..Default::default() },
             LogContext::new("test", None),
         )
         .await
@@ -1386,14 +1404,14 @@ mod live_tests {
     async fn live_session_send_anthropic_continues_context() {
         let Some(state) = live_state_anthropic() else { return };
         let system = "You are a test bot. Reply tersely.";
-        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false };
+        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false, ..Default::default() };
 
         let (_t1, chain1, _u1) = session_send(
             &state,
             &crate::state::CoachChain::Empty,
             system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
-            constraints,
+            constraints.clone(),
             LogContext::new("test", None),
         )
         .await
@@ -1435,7 +1453,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t1, chain1, _u1) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None, None)
                 .await
                 .expect("first observe_event failed");
         let h1 = match &chain1 {
@@ -1450,7 +1468,7 @@ mod live_tests {
             None,
         )
         .unwrap();
-        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None)
+        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None, None)
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
@@ -1476,7 +1494,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t, observed_chain, _u_obs) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None, None)
                 .await
                 .expect("observe failed");
 
@@ -1485,6 +1503,7 @@ mod live_tests {
             &priorities,
             &observed_chain,
             Some("end_turn"),
+            None,
             None,
         )
         .await
@@ -1534,7 +1553,7 @@ mod live_tests {
             &crate::state::CoachChain::Empty,
             "You are a test bot. Respond with one word.",
             "Reply with the single word: hello",
-            CallConstraints { max_output_tokens: Some(20), require_json: false },
+            CallConstraints { max_output_tokens: Some(20), require_json: false, ..Default::default() },
             LogContext::new("test", None),
         )
         .await
@@ -1553,14 +1572,14 @@ mod live_tests {
     async fn live_session_send_gemini_continues_context() {
         let Some(state) = live_state_google() else { return };
         let system = "You are a test bot. Reply tersely.";
-        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false };
+        let constraints = CallConstraints { max_output_tokens: Some(30), require_json: false, ..Default::default() };
 
         let (_t1, chain1, _u1) = session_send(
             &state,
             &crate::state::CoachChain::Empty,
             system,
             "Remember this token: PURPLE-OWL-42. Reply 'noted'.",
-            constraints,
+            constraints.clone(),
             LogContext::new("test", None),
         )
         .await
@@ -1602,7 +1621,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t1, chain1, _u1) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event1, None, None)
                 .await
                 .expect("first observe_event failed");
         let h1 = match &chain1 {
@@ -1617,7 +1636,7 @@ mod live_tests {
             None,
         )
         .unwrap();
-        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None)
+        let (_t2, chain2, _u2) = observe_event(&state, &priorities, &chain1, &event2, None, None)
             .await
             .expect("second observe_event failed");
         let h2 = match &chain2 {
@@ -1643,7 +1662,7 @@ mod live_tests {
         )
         .unwrap();
         let (_t, observed_chain, _u_obs) =
-            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None)
+            observe_event(&state, &priorities, &crate::state::CoachChain::Empty, &event, None, None)
                 .await
                 .expect("observe failed");
 
@@ -1652,6 +1671,7 @@ mod live_tests {
             &priorities,
             &observed_chain,
             Some("end_turn"),
+            None,
             None,
         )
         .await
