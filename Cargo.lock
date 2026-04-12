@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "coach"
-version = "0.1.106"
+version = "0.1.107"
 dependencies = [
  "coach-core",
  "reqwest 0.12.28",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "coach-core"
-version = "0.1.106"
+version = "0.1.107"
 dependencies = [
  "axum",
  "chrono",
