@@ -1,0 +1,29 @@
+{
+  "name": "rule_current_model_no_flag",
+  "source": "hook_integration::post_tool_use_passes_through_current_models",
+  "description": "Write tool with gemini-2.5-flash (current) must NOT trigger the outdated_models rule — passthrough.",
+
+  "mode": "away",
+  "session_id": "bench-rule-current",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": { "prompt": "Set up the GenAI client" }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "/tmp/app.py",
+          "content": "import google.generativeai as genai\nmodel = genai.GenerativeModel('gemini-2.5-flash')\nresult = model.generate(prompt)"
+        },
+        "cwd": "/tmp"
+      },
+      "expect": {
+        "passthrough": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "name": "rule_outdated_model_in_write",
+  "source": "hook_integration::post_tool_use_triggers_outdated_models_rule",
+  "description": "Write tool with gemini-2.0-flash in content triggers the outdated_models rule advisory.",
+
+  "mode": "away",
+  "session_id": "bench-rule-write",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": { "prompt": "Set up the GenAI client" }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "/tmp/app.py",
+          "content": "import google.generativeai as genai\nmodel = genai.GenerativeModel('gemini-2.0-flash')\nresult = model.generate(prompt)"
+        },
+        "cwd": "/tmp"
+      },
+      "expect": {
+        "context_contains": "gemini-2.0-flash"
+      }
+    }
+  ]
+}

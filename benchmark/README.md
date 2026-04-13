@@ -45,6 +45,9 @@ scenario's one-line summary.
 | [away_stop_blocks_with_priorities](away_stop_blocks_with_priorities.md) | USER_STORIES G6 | In Away mode the first Stop must be blocked with the priority list injected as the block reason. |
 | [away_stop_cooldown_passes_second](away_stop_cooldown_passes_second.md) | USER_STORIES G7 | After a Stop is blocked, a second Stop within the cooldown window must pass through — no stacked blocks. |
 | [away_permission_auto_approved](away_permission_auto_approved.md) | USER_STORIES G5 | In Away mode a PermissionRequest must be auto-approved so the user can walk away without a modal. |
+| [rule_outdated_model_in_write](rule_outdated_model_in_write.md) | `rules::tests` | Write tool with `gemini-2.0-flash` in content fires the outdated_models rule advisory. |
+| [rule_outdated_model_in_edit](rule_outdated_model_in_edit.md) | `rules::tests` | Edit tool with `gpt-4o` in `new_string` fires the outdated_models rule advisory. |
+| [rule_current_model_no_flag](rule_current_model_no_flag.md) | `hook_integration` | Write tool with `gemini-2.5-flash` (current) must NOT trigger the rule — passthrough. |
 
 ### LLM-mode (real API calls, `#[ignore]` by default)
 

@@ -497,6 +497,18 @@ scenario!(
     away_stop_cooldown_passes_second,
     "away_stop_cooldown_passes_second"
 );
+scenario!(
+    rule_outdated_model_in_write,
+    "rule_outdated_model_in_write"
+);
+scenario!(
+    rule_outdated_model_in_edit,
+    "rule_outdated_model_in_edit"
+);
+scenario!(
+    rule_current_model_no_flag,
+    "rule_current_model_no_flag"
+);
 
 // LLM-mode scenarios — ignored unless opted in via `-- --ignored`.
 llm_scenario!(

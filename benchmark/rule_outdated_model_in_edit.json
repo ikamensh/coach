@@ -1,0 +1,30 @@
+{
+  "name": "rule_outdated_model_in_edit",
+  "source": "rules::tests::detects_outdated_gpt_model",
+  "description": "Edit tool with gpt-4o in new_string triggers the outdated_models rule advisory.",
+
+  "mode": "away",
+  "session_id": "bench-rule-edit",
+
+  "events": [
+    {
+      "hook": "user-prompt-submit",
+      "body": { "prompt": "Update the model config" }
+    },
+    {
+      "hook": "post-tool-use",
+      "body": {
+        "tool_name": "Edit",
+        "tool_input": {
+          "file_path": "/tmp/config.yaml",
+          "old_string": "model: gpt-3.5-turbo",
+          "new_string": "model: gpt-4o"
+        },
+        "cwd": "/tmp"
+      },
+      "expect": {
+        "context_contains": "gpt-4o"
+      }
+    }
+  ]
+}
