@@ -7,7 +7,7 @@ import { useState } from "react";
 import { ActivityBar, ActivityLegend, activityCategory } from "./ActivityBar";
 import type { ActivityEntry } from "../types";
 
-const COACH_CATEGORIES = new Set(["blocked", "approved", "observer"]);
+const COACH_CATEGORIES = new Set(["blocked", "observer"]);
 function isCoachActivity(entry: ActivityEntry): boolean {
   return COACH_CATEGORIES.has(activityCategory(entry));
 }

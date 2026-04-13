@@ -30,7 +30,6 @@ export function activityOpacity(
 export function activityColor(entry: ActivityEntry): string {
   if (entry.hook_event === "UserPromptSubmit") return "rgb(250 204 21)"; // yellow-400
   if (entry.action.includes("blocked")) return "rgb(239 68 68)"; // red-500
-  if (entry.action.includes("auto-approved")) return "rgb(245 158 11)"; // amber-500
 
   const tool = entry.detail ?? "";
   switch (tool) {
@@ -77,7 +76,6 @@ export const LEGEND_GROUPS: { label: string; entries: { key: string; color: stri
     label: "Coach",
     entries: [
       { key: "blocked", color: "rgb(239 68 68)", label: "Blocked" },
-      { key: "approved", color: "rgb(245 158 11)", label: "Approved" },
       { key: "observer", color: "rgb(139 92 246)", label: "Observer" },
     ],
   },
@@ -92,7 +90,6 @@ export const LEGEND_GROUPS: { label: string; entries: { key: string; color: stri
 export function activityCategory(entry: ActivityEntry): string {
   if (entry.hook_event === "UserPromptSubmit") return "prompt";
   if (entry.action.includes("blocked")) return "blocked";
-  if (entry.action.includes("auto-approved")) return "approved";
   const tool = entry.detail ?? "";
   switch (tool) {
     case "Bash": return "bash";

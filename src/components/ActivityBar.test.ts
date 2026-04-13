@@ -70,17 +70,6 @@ describe("activityColor", () => {
     ).toBe("rgb(239 68 68)");
   });
 
-  it("uses amber for auto-approved permissions", () => {
-    expect(
-      activityColor({
-        timestamp: "",
-        hook_event: "PermissionRequest",
-        action: "auto-approved",
-        detail: "Bash",
-      }),
-    ).toBe("rgb(245 158 11)");
-  });
-
   /** Tool family colors are stable so the visual stays readable. */
   it("colors Bash distinctly from Read", () => {
     const bash = activityColor({
