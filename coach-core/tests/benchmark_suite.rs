@@ -126,16 +126,41 @@ fn build_state(scenario: &Scenario) -> AppState {
     app
 }
 
-/// Pick the first observer-capable provider with a key on the
-/// environment, install it onto `app`, and set a small default
-/// model. Priority order mirrors `scenario_replay.rs::real_llm`:
-/// Anthropic → OpenAI → Google. Panics if none are set — LLM
-/// scenarios are `#[ignore]`d so reaching this without a key means
-/// the user explicitly opted in with `-- --ignored` and forgot the
-/// key.
+/// Configure the LLM provider and model on `app`.
+///
+/// If `COACH_BENCHMARK_MODEL` is set (format: `provider/model`, e.g.
+/// `openai/gpt-5.4-nano`), use that exact model. Otherwise fall back
+/// to auto-detection from API key env vars.
+///
+/// Either way, the matching API key must be set in the environment.
 fn install_env_llm_key(app: &mut AppState) {
     fn env(name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.is_empty())
+    }
+
+    // Explicit model override — used by the multi-model eval script.
+    if let Some(spec) = env("COACH_BENCHMARK_MODEL") {
+        let (provider, model) = spec
+            .split_once('/')
+            .unwrap_or_else(|| panic!(
+                "COACH_BENCHMARK_MODEL must be provider/model, got {spec:?}"
+            ));
+        let key_var = match provider {
+            "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "google" => "GOOGLE_API_KEY",
+            other => panic!("unknown provider {other:?} in COACH_BENCHMARK_MODEL"),
+        };
+        let key = env(key_var).unwrap_or_else(|| {
+            panic!("COACH_BENCHMARK_MODEL={spec} but {key_var} is not set")
+        });
+        app.config.model = ModelConfig {
+            provider: provider.into(),
+            model: model.into(),
+        };
+        app.config.api_tokens.insert(provider.into(), key);
+        eprintln!("[benchmark] model override: {provider}/{model}");
+        return;
     }
 
     if let Some(key) = env("ANTHROPIC_API_KEY") {
