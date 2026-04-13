@@ -1489,46 +1489,15 @@ mod tests {
     }
 
     // ── session identity: pid=0 edge cases ──────────────────────────────
-    //
-    // PID resolution (lsof against the TCP peer) is best-effort. When it
-    // fails the hook arrives with pid=0. These tests verify that sessions
-    // are stable regardless of PID resolution success.
 
-    /// Scanner registers session_id from the session file. A subsequent
-    /// hook with pid=0 (resolution failure) must find the same entry by
-    /// session_id — no duplicate, no orphan placeholder.
-    #[test]
-    fn scanner_registered_session_found_despite_pid_zero() {
-        let mut state = test_state();
-        let started = Utc::now() - chrono::Duration::minutes(1);
-        state
-            .sessions
-            .register_discovered_pid(42, Some("conv-1"), Some("/p"), started);
-        assert_eq!(state.sessions.len(), 1, "precondition: one session");
-
-        // Hook arrives but lsof couldn't resolve the TCP peer → pid=0.
-        state.sessions.apply_hook_event(0, "conv-1", Some("/p"));
-
-        assert_eq!(
-            state.sessions.len(),
-            1,
-            "scanner entry + hook must yield one session, not a duplicate"
-        );
-        let sess = state.sessions.get("conv-1").unwrap();
-        assert_eq!(sess.pid, 42, "pid=0 must not overwrite the known PID");
-        assert_eq!(sess.started_at, started, "scanner started_at preserved");
-    }
-
-    /// Bug reproduction: a session whose PID couldn't be resolved (pid=0)
-    /// gets reaped by dead-PID cleanup because 0 is never in the live
-    /// process set. An unresolved PID is not the same as a dead process.
+    /// A session whose PID couldn't be resolved (pid=0) must not be
+    /// reaped by dead-PID cleanup. Unresolvable ≠ dead.
     #[test]
     fn pid_zero_session_not_reaped_by_dead_pid_cleanup() {
         let mut state = test_state();
         state.sessions.apply_hook_event(0, "conv-1", Some("/p"));
         assert_eq!(state.sessions.len(), 1, "precondition: session exists");
 
-        // Scanner reports actually-live PIDs; 0 is never among them.
         let live: HashSet<u32> = [100, 200].into_iter().collect();
         state.sessions.remove_dead_pids(&live);
 

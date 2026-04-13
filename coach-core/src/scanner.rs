@@ -1222,6 +1222,54 @@ mod tests {
         }
     }
 
+    // ── pid=0 regression ─────────────────────────────────────────────
+
+    /// End-to-end: scanner discovers a session, then hook arrives with
+    /// pid=0 (PID resolution failure). Must produce exactly one session
+    /// and not overwrite the real PID with 0.
+    ///
+    /// This test goes through sync_sessions_with (the production path)
+    /// so it survives internal refactoring of how sessions are registered.
+    #[tokio::test]
+    async fn hook_with_pid_zero_finds_scanner_session_no_duplicate() {
+        let sessions_dir = TempDir::new().unwrap();
+        let projects_dir = TempDir::new().unwrap();
+        let my_pid = std::process::id();
+        let sid = "pid-zero-regression";
+        let cwd = "/tmp/pid-zero-test";
+
+        write_session_file_full(sessions_dir.path(), my_pid, sid, cwd);
+
+        let state: SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::state::AppState::from_settings(crate::settings::Settings::default()),
+        ));
+        let emitter = crate::NoopEmitter;
+
+        // Scanner discovers the process.
+        let live = scan_live_sessions_in(sessions_dir.path());
+        sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
+
+        {
+            let coach = state.read().await;
+            assert_eq!(coach.sessions.len(), 1, "scanner created one entry");
+        }
+
+        // Hook arrives with pid=0 (lsof failed).
+        {
+            let mut coach = state.write().await;
+            coach.sessions.apply_hook_event(0, sid, Some(cwd));
+        }
+
+        let coach = state.read().await;
+        assert_eq!(
+            coach.sessions.len(),
+            1,
+            "scanner + pid=0 hook must not create a duplicate"
+        );
+        let sess = coach.sessions.get(sid).unwrap();
+        assert_eq!(sess.pid, my_pid, "pid=0 must not overwrite the real PID");
+    }
+
     // ── Codex scanner tests ─────────────────────────────────────────
 
     #[test]
