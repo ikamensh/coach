@@ -603,11 +603,20 @@ impl SessionRegistry {
         // placeholder (rekey into the real session_id) or a previous
         // conversation in the same window (`/clear` → evict).
         //
-        // PID 0 means the kernel resolver failed; treating it as a
-        // match would let unrelated sessions stomp each other.
-        let old_key: Option<SessionId> = (pid != 0)
-            .then(|| self.session_key_for_pid(pid))
-            .flatten();
+        // PID 0 means the resolver failed. We can't match by PID, but
+        // we can still adopt a scanner placeholder whose cwd matches —
+        // without this, pid=0 hooks create a duplicate entry beside the
+        // placeholder and the user sees two sessions for one process.
+        let old_key: Option<SessionId> = if pid != 0 {
+            self.session_key_for_pid(pid)
+        } else {
+            cwd.and_then(|cwd| {
+                self.inner
+                    .iter()
+                    .find(|(k, s)| is_placeholder_key(k) && s.cwd.as_deref() == Some(cwd))
+                    .map(|(k, _)| k.clone())
+            })
+        };
 
         if let Some(old_key) = old_key {
             if is_placeholder_key(&old_key) {
@@ -745,12 +754,14 @@ impl SessionRegistry {
     }
 
     /// Remove sessions whose owning PID is not in the live set. Returns
-    /// the removed session_ids.
+    /// the removed session_ids. Sessions with pid=0 (unresolved) are
+    /// skipped — we can't confirm they're dead, and reaping them causes
+    /// active sessions to vanish from the UI.
     pub fn remove_dead_pids(&mut self, live_pids: &HashSet<u32>) -> Vec<SessionId> {
         let dead: Vec<SessionId> = self
             .inner
             .iter()
-            .filter(|(_, s)| !live_pids.contains(&s.pid))
+            .filter(|(_, s)| s.pid != 0 && !live_pids.contains(&s.pid))
             .map(|(k, _)| k.clone())
             .collect();
         for key in &dead {
@@ -1440,6 +1451,59 @@ mod tests {
 
         assert!(dead.is_empty());
         assert_eq!(state.sessions.len(), 2);
+    }
+
+    // ── session identity: pid=0 edge cases ──────────────────────────────
+    //
+    // PID resolution (lsof against the TCP peer) is best-effort. When it
+    // fails the hook arrives with pid=0. The two bugs below combine to
+    // produce the user-visible symptoms "messages create new sessions" and
+    // "sessions disappear".
+
+    /// Bug reproduction: scanner creates a placeholder for a discovered
+    /// PID, then the first hook arrives with pid=0 (resolution failure).
+    /// The hook should adopt the existing placeholder — not create a
+    /// second entry. One process must produce exactly one session.
+    #[test]
+    fn scanner_placeholder_adopted_even_when_hook_pid_is_zero() {
+        let mut state = test_state();
+        let started = Utc::now() - chrono::Duration::minutes(1);
+        state
+            .sessions
+            .register_discovered_pid(42, Some("/p"), started);
+        assert_eq!(state.sessions.len(), 1, "precondition: one placeholder");
+
+        // Hook arrives but lsof couldn't resolve the TCP peer → pid=0.
+        state.sessions.apply_hook_event(0, "conv-1", Some("/p"));
+
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "scanner placeholder + hook must yield one session, not a duplicate"
+        );
+        assert!(
+            state.sessions.get("conv-1").is_some(),
+            "session must be findable under its real session_id"
+        );
+    }
+
+    /// Bug reproduction: a session whose PID couldn't be resolved (pid=0)
+    /// gets reaped by dead-PID cleanup because 0 is never in the live
+    /// process set. An unresolved PID is not the same as a dead process.
+    #[test]
+    fn pid_zero_session_not_reaped_by_dead_pid_cleanup() {
+        let mut state = test_state();
+        state.sessions.apply_hook_event(0, "conv-1", Some("/p"));
+        assert_eq!(state.sessions.len(), 1, "precondition: session exists");
+
+        // Scanner reports actually-live PIDs; 0 is never among them.
+        let live: HashSet<u32> = [100, 200].into_iter().collect();
+        state.sessions.remove_dead_pids(&live);
+
+        assert!(
+            state.sessions.contains_key("conv-1"),
+            "session with unresolved PID must survive dead-PID cleanup"
+        );
     }
 
     // ── observer queue backpressure ─────────────────────────────────────
