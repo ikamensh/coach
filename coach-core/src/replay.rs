@@ -52,7 +52,7 @@ pub struct ReplayEvent {
     pub tool_name: String,
     pub timestamp: String,
     pub summary: String,
-    /// null = passthrough, "blocked", "auto-approved"
+    /// null = passthrough, "blocked", "intervention"
     pub action: Option<String>,
     pub message: Option<String>,
 }
@@ -385,11 +385,11 @@ async fn wait_for_observer_tick(
 }
 
 /// Convert a dispatch response into `(action, message)` for a
-/// `ReplayEvent`. Mirrors the three response shapes `dispatch` emits:
-///   • `{}`                                                   → passthrough
+/// `ReplayEvent`. Mirrors the response shapes `dispatch` emits:
+///   • `{}`                                                   → passthrough (no action)
 ///   • `{decision: "block", reason: "..."}`                   → blocked stop
 ///   • `{hookSpecificOutput: {additionalContext: "..."}}`     → rule / intervention
-///   • `{hookSpecificOutput: {decision: {behavior: "allow"}}}` → auto-approved (unused here)
+///   • `{hookSpecificOutput: {decision: ...}}`                → passthrough (permission wire format, not a coach action)
 fn interpret_response(resp: &serde_json::Value) -> (Option<String>, Option<String>) {
     if resp.get("decision").and_then(|d| d.as_str()) == Some("block") {
         let msg = resp
@@ -406,13 +406,6 @@ fn interpret_response(resp: &serde_json::Value) -> (Option<String>, Option<Strin
             Some("intervention".to_string()),
             Some(ctx.to_string()),
         );
-    }
-    if resp
-        .pointer("/hookSpecificOutput/decision/behavior")
-        .and_then(|v| v.as_str())
-        == Some("allow")
-    {
-        return (Some("auto-approved".to_string()), None);
     }
     (None, None)
 }

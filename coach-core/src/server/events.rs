@@ -225,11 +225,7 @@ async fn on_permission_requested(
     let mode = crate::state::mutate(&state.app, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
         let mode = sess.mode;
-        let action = if mode == CoachMode::Away {
-            "auto-approved"
-        } else {
-            "passed through"
-        };
+        let action = "passed through";
         coach
             .sessions
             .log(&session_id, "PermissionRequest", action, Some(tool_name));
