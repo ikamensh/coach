@@ -285,15 +285,17 @@ pub async fn sync_all_sessions_with(
     for session in claude_live {
         let created = coach.sessions.register_discovered_pid(
             session.pid,
+            Some(&session.session_id),
             session.cwd.as_deref(),
             session.started_at_utc(),
         );
         if created {
-            if let Some(key) = coach.sessions.session_key_for_pid(session.pid) {
-                coach
-                    .sessions
-                    .log(&key, "Scanner", "process discovered", session.cwd.clone());
-            }
+            coach.sessions.log(
+                &session.session_id,
+                "Scanner",
+                "process discovered",
+                session.cwd.clone(),
+            );
             changed = true;
         }
         bootstrap_claude_session(&mut coach, session, projects_dir, &mut changed);
@@ -304,6 +306,7 @@ pub async fn sync_all_sessions_with(
         let pid = fake_pid_for_sid(&session.thread_id);
         let created = coach.sessions.register_discovered_pid(
             pid,
+            None,
             session.cwd.as_deref(),
             session.started_at_utc(),
         );
@@ -896,8 +899,7 @@ mod tests {
     }
 
     /// Scanner discovers a session and bootstraps it from the JSONL.
-    /// The placeholder lives under an empty session_id until a hook
-    /// lands with the real one.
+    /// The entry is keyed by the session_id from the session file.
     #[tokio::test]
     async fn sync_bootstraps_scanner_discovered_session() {
         let sessions_dir = TempDir::new().unwrap();
@@ -932,8 +934,8 @@ mod tests {
         assert_eq!(sess.tool_counts.get("Agent"), Some(&1));
         assert_eq!(sess.active_agents, 1, "Agent t3 has no result yet");
         assert_eq!(sess.event_count, 3);
-        assert!(sess.session_id.is_empty(),
-            "bootstrap must not set session_id");
+        assert_eq!(sess.session_id, sid,
+            "scanner registers under the session_id from the session file");
         assert_eq!(sess.bootstrapped_session_id, Some(sid.to_string()));
     }
 
@@ -1069,8 +1071,8 @@ mod tests {
         ));
         let emitter = crate::NoopEmitter;
 
-        // Scanner runs first — bootstraps from stale JSONL into a
-        // placeholder keyed under the empty session_id.
+        // Scanner runs first — registers under the stale session_id
+        // from the session file and bootstraps from the stale JSONL.
         let live = scan_live_sessions_in(sessions_dir.path());
         sync_sessions_with(&state, &emitter, &live, projects_dir.path()).await;
 
@@ -1078,13 +1080,13 @@ mod tests {
             let coach = state.read().await;
             let sess = coach.sessions.session_for_pid(my_pid).unwrap();
             assert!(sess.bootstrapped);
-            assert!(sess.session_id.is_empty());
+            assert_eq!(sess.session_id, stale_sid);
             assert_eq!(sess.tool_counts.get("Bash"), Some(&1));
         }
 
-        // Hook arrives with the REAL session_id — placeholder is
-        // rekeyed under real_sid; stale bootstrap is discarded because
-        // its bootstrapped_session_id doesn't match.
+        // Hook arrives with the REAL session_id — stale entry is
+        // evicted (same PID, different session_id = /clear) and a
+        // fresh entry is created under real_sid.
         {
             let mut coach = state.write().await;
             let sess = coach.sessions.apply_hook_event(my_pid, real_sid, Some(cwd));

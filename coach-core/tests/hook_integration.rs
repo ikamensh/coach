@@ -441,7 +441,7 @@ async fn hook_adopts_scanner_discovered_pid() {
     let scanner_started = chrono::Utc::now() - chrono::Duration::hours(1);
     coach
         .sessions
-        .register_discovered_pid(pid, Some("/tmp/project"), scanner_started);
+        .register_discovered_pid(pid, None, Some("/tmp/project"), scanner_started);
     assert!(coach.sessions.session_for_pid(pid).is_some());
     assert!(!coach.sessions.contains_key("adopt-me"));
 

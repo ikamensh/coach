@@ -592,7 +592,10 @@ impl SessionRegistry {
         let now = Utc::now();
 
         if let Some(sess) = self.inner.get_mut(session_id) {
-            sess.pid = pid;
+            // Don't overwrite a known PID with 0 (unresolved).
+            if pid != 0 {
+                sess.pid = pid;
+            }
             sess.last_event = Instant::now();
             sess.last_event_time = now;
             adopt_cwd_if_unset(sess, cwd);
@@ -603,20 +606,11 @@ impl SessionRegistry {
         // placeholder (rekey into the real session_id) or a previous
         // conversation in the same window (`/clear` → evict).
         //
-        // PID 0 means the resolver failed. We can't match by PID, but
-        // we can still adopt a scanner placeholder whose cwd matches —
-        // without this, pid=0 hooks create a duplicate entry beside the
-        // placeholder and the user sees two sessions for one process.
-        let old_key: Option<SessionId> = if pid != 0 {
-            self.session_key_for_pid(pid)
-        } else {
-            cwd.and_then(|cwd| {
-                self.inner
-                    .iter()
-                    .find(|(k, s)| is_placeholder_key(k) && s.cwd.as_deref() == Some(cwd))
-                    .map(|(k, _)| k.clone())
-            })
-        };
+        // PID 0 means the resolver failed; treating it as a match
+        // would let unrelated sessions stomp each other.
+        let old_key: Option<SessionId> = (pid != 0)
+            .then(|| self.session_key_for_pid(pid))
+            .flatten();
 
         if let Some(old_key) = old_key {
             if is_placeholder_key(&old_key) {
@@ -696,27 +690,41 @@ impl SessionRegistry {
         });
     }
 
-    /// Register a PID discovered by the file scanner. Creates a
-    /// placeholder session entry (keyed under a `<pending:pid>`
-    /// sentinel) if no hook has populated one yet, so a freshly-
-    /// launched window appears in the UI before the user types
-    /// anything. The `session_id` field stays empty until the first
-    /// hook lands and rekeys the entry. Returns false if a
-    /// placeholder or real session already exists for this PID.
+    /// Register a PID discovered by the file scanner.
+    ///
+    /// When `session_id` is provided (Claude Code — the session file
+    /// contains it), the entry is keyed directly under that id so the
+    /// first hook finds it by session_id without needing PID resolution.
+    ///
+    /// When `session_id` is `None` (Codex, or any source that doesn't
+    /// advertise a session_id up front), a `<pending:pid>` placeholder
+    /// is created and later rekeyed by the first hook.
+    ///
+    /// Returns `false` (no-op) if the PID or session_id is already known.
     pub fn register_discovered_pid(
         &mut self,
         pid: u32,
+        session_id: Option<&str>,
         cwd: Option<&str>,
         started_at: DateTime<Utc>,
     ) -> bool {
         if self.inner.values().any(|s| s.pid == pid) {
             return false;
         }
+        if let Some(sid) = session_id {
+            if self.inner.contains_key(sid) {
+                return false;
+            }
+        }
+        let (key, sid_value) = match session_id {
+            Some(sid) => (sid.to_string(), sid.to_string()),
+            None => (placeholder_key(pid), String::new()),
+        };
         let display_name = derive_display_name(cwd, pid);
         self.inner.insert(
-            placeholder_key(pid),
+            key,
             SessionState {
-                session_id: String::new(),
+                session_id: sid_value,
                 pid,
                 mode: self.default_mode,
                 cwd: cwd.map(String::from),
@@ -941,15 +949,15 @@ mod tests {
         // Default mode is Present — `/clear` shouldn't preserve the old mode.
     }
 
-    /// First hook for a scanner-discovered placeholder rekeys it under
-    /// the real session_id. started_at is preserved (the scanner read
-    /// it from the session file).
+    /// First hook for a scanner-discovered placeholder (no session_id
+    /// known upfront — e.g. Codex) rekeys it under the real session_id.
+    /// started_at is preserved (the scanner read it from the session file).
     #[test]
     fn apply_hook_event_adopts_scanner_placeholder() {
         use chrono::Duration;
         let mut state = test_state();
         let scanner_started = Utc::now() - Duration::hours(2);
-        state.sessions.register_discovered_pid(42, Some("/p"), scanner_started);
+        state.sessions.register_discovered_pid(42, None, Some("/p"), scanner_started);
         assert!(state.sessions.contains_key(&placeholder_key(42)));
 
         state.sessions.apply_hook_event(42, "conv-X", Some("/p"));
@@ -1382,14 +1390,16 @@ mod tests {
 
     // ── register_discovered_pid ─────────────────────────────────────────
 
+    /// Without a session_id, register creates a placeholder keyed by
+    /// `<pending:pid>` (Codex path — session_id comes from the first hook).
     #[test]
-    fn register_discovered_pid_creates_placeholder() {
+    fn register_discovered_pid_creates_placeholder_without_session_id() {
         use chrono::Duration;
         let mut state = test_state();
         let started = Utc::now() - Duration::hours(1);
         let created = state
             .sessions
-            .register_discovered_pid(12345, Some("/projects/foo"), started);
+            .register_discovered_pid(12345, None, Some("/projects/foo"), started);
 
         assert!(created);
         let sess = state.sessions.session_for_pid(12345).unwrap();
@@ -1397,8 +1407,33 @@ mod tests {
         assert_eq!(sess.pid, 12345);
         assert_eq!(sess.started_at, started);
         assert_eq!(sess.cwd, Some("/projects/foo".into()));
-        // No conversation yet — first hook will set this.
         assert_eq!(sess.session_id, "");
+    }
+
+    /// With a session_id (Claude Code path — session file contains it),
+    /// register keys the entry directly so hooks find it by session_id
+    /// without needing PID resolution.
+    #[test]
+    fn register_discovered_pid_keys_by_session_id_when_known() {
+        let mut state = test_state();
+        let created = state.sessions.register_discovered_pid(
+            42,
+            Some("conv-1"),
+            Some("/projects/foo"),
+            Utc::now(),
+        );
+
+        assert!(created);
+        assert!(
+            state.sessions.get("conv-1").is_some(),
+            "entry keyed by session_id"
+        );
+        assert!(
+            !state.sessions.contains_key(&placeholder_key(42)),
+            "no placeholder created when session_id is known"
+        );
+        assert_eq!(state.sessions.get("conv-1").unwrap().pid, 42);
+        assert_eq!(state.sessions.get("conv-1").unwrap().session_id, "conv-1");
     }
 
     /// If a hook beat the scanner, the discovered PID is already in
@@ -1411,7 +1446,7 @@ mod tests {
 
         let created = state
             .sessions
-            .register_discovered_pid(42, Some("/anywhere"), Utc::now());
+            .register_discovered_pid(42, None, Some("/anywhere"), Utc::now());
 
         assert!(!created);
         assert_eq!(
@@ -1456,22 +1491,20 @@ mod tests {
     // ── session identity: pid=0 edge cases ──────────────────────────────
     //
     // PID resolution (lsof against the TCP peer) is best-effort. When it
-    // fails the hook arrives with pid=0. The two bugs below combine to
-    // produce the user-visible symptoms "messages create new sessions" and
-    // "sessions disappear".
+    // fails the hook arrives with pid=0. These tests verify that sessions
+    // are stable regardless of PID resolution success.
 
-    /// Bug reproduction: scanner creates a placeholder for a discovered
-    /// PID, then the first hook arrives with pid=0 (resolution failure).
-    /// The hook should adopt the existing placeholder — not create a
-    /// second entry. One process must produce exactly one session.
+    /// Scanner registers session_id from the session file. A subsequent
+    /// hook with pid=0 (resolution failure) must find the same entry by
+    /// session_id — no duplicate, no orphan placeholder.
     #[test]
-    fn scanner_placeholder_adopted_even_when_hook_pid_is_zero() {
+    fn scanner_registered_session_found_despite_pid_zero() {
         let mut state = test_state();
         let started = Utc::now() - chrono::Duration::minutes(1);
         state
             .sessions
-            .register_discovered_pid(42, Some("/p"), started);
-        assert_eq!(state.sessions.len(), 1, "precondition: one placeholder");
+            .register_discovered_pid(42, Some("conv-1"), Some("/p"), started);
+        assert_eq!(state.sessions.len(), 1, "precondition: one session");
 
         // Hook arrives but lsof couldn't resolve the TCP peer → pid=0.
         state.sessions.apply_hook_event(0, "conv-1", Some("/p"));
@@ -1479,12 +1512,11 @@ mod tests {
         assert_eq!(
             state.sessions.len(),
             1,
-            "scanner placeholder + hook must yield one session, not a duplicate"
+            "scanner entry + hook must yield one session, not a duplicate"
         );
-        assert!(
-            state.sessions.get("conv-1").is_some(),
-            "session must be findable under its real session_id"
-        );
+        let sess = state.sessions.get("conv-1").unwrap();
+        assert_eq!(sess.pid, 42, "pid=0 must not overwrite the known PID");
+        assert_eq!(sess.started_at, started, "scanner started_at preserved");
     }
 
     /// Bug reproduction: a session whose PID couldn't be resolved (pid=0)
