@@ -298,14 +298,42 @@ pub async fn session_send(
     // Mock interception: lets tests exercise the full pipeline without a
     // real LLM provider. Mock calls are logged too so tests can assert
     // on the logging path without needing real providers.
+    //
+    // Disk cache: when `COACH_LLM_CACHE_DIR` is set, successful real-
+    // provider responses are stored on disk keyed on (system_prompt,
+    // user_message, chain, model). A cache hit replays the stored
+    // response and grows the chain client-side (same as the mock path).
+    // ServerId chains are not cacheable — they reference provider-side
+    // state that won't exist across runs.
     let result: Result<(String, CoachChain, crate::state::CoachUsage), String> =
         if let Some(mock) = mock {
             mock(system_prompt, message).map(|(text, usage)| {
                 let new_chain = grow_mock_chain(chain, message, &text);
                 (text, new_chain, usage)
             })
+        } else if let Some(hit) = llm_cache::get(
+            system_prompt,
+            message,
+            chain,
+            &provider_name,
+            &model_name,
+        ) {
+            let new_chain = grow_mock_chain(chain, message, &hit.response);
+            Ok((hit.response, new_chain, hit.usage))
         } else {
-            dispatch_real(state, chain, system_prompt, message, constraints.clone()).await
+            let r = dispatch_real(state, chain, system_prompt, message, constraints.clone()).await;
+            if let Ok((ref text, _, ref usage)) = r {
+                llm_cache::put(
+                    system_prompt,
+                    message,
+                    chain,
+                    &provider_name,
+                    &model_name,
+                    text,
+                    *usage,
+                );
+            }
+            r
         };
 
     if let Some(logger) = logger {
@@ -679,6 +707,99 @@ fn strip_code_fence(text: &str) -> Option<&str> {
         None => s,
     };
     after_lang.strip_suffix("```").map(str::trim)
+}
+
+// ── Disk cache for LLM responses ──────────────────────────────────────
+//
+// When `COACH_LLM_CACHE_DIR` is set, successful real-provider responses
+// are stored on disk keyed on (system_prompt, user_message, chain,
+// provider, model). A cache hit replays the stored response — no API
+// call. Designed for benchmark runs: same prompts + same model =
+// identical LLM inputs, so re-running with no prompt changes is free.
+//
+// `ServerId` chains (OpenAI server-side state) are not cacheable: the
+// id references provider-side state that won't exist across runs.
+
+mod llm_cache {
+    use crate::state::{CoachChain, CoachUsage};
+    use serde::{Deserialize, Serialize};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::path::PathBuf;
+
+    #[derive(Serialize, Deserialize)]
+    pub struct CacheEntry {
+        pub response: String,
+        pub usage: CoachUsage,
+    }
+
+    fn cache_dir() -> Option<PathBuf> {
+        std::env::var("COACH_LLM_CACHE_DIR")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn cache_key(
+        system_prompt: &str,
+        message: &str,
+        chain: &CoachChain,
+        provider: &str,
+        model: &str,
+    ) -> Option<String> {
+        // ServerId chains reference ephemeral provider-side state.
+        if matches!(chain, CoachChain::ServerId { .. }) {
+            return None;
+        }
+        let chain_json = serde_json::to_string(chain).unwrap_or_default();
+        let mut h = DefaultHasher::new();
+        system_prompt.hash(&mut h);
+        message.hash(&mut h);
+        chain_json.hash(&mut h);
+        provider.hash(&mut h);
+        model.hash(&mut h);
+        Some(format!("{:016x}", h.finish()))
+    }
+
+    pub fn get(
+        system_prompt: &str,
+        message: &str,
+        chain: &CoachChain,
+        provider: &str,
+        model: &str,
+    ) -> Option<CacheEntry> {
+        let dir = cache_dir()?;
+        let key = cache_key(system_prompt, message, chain, provider, model)?;
+        let path = dir.join(format!("{key}.json"));
+        let content = std::fs::read_to_string(&path).ok()?;
+        let entry: CacheEntry = serde_json::from_str(&content).ok()?;
+        eprintln!("[coach] llm cache hit: {key}");
+        Some(entry)
+    }
+
+    pub fn put(
+        system_prompt: &str,
+        message: &str,
+        chain: &CoachChain,
+        provider: &str,
+        model: &str,
+        response: &str,
+        usage: CoachUsage,
+    ) {
+        let Some(dir) = cache_dir() else { return };
+        let Some(key) = cache_key(system_prompt, message, chain, provider, model) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let entry = CacheEntry {
+            response: response.to_string(),
+            usage,
+        };
+        let path = dir.join(format!("{key}.json"));
+        if let Ok(json) = serde_json::to_string_pretty(&entry) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
 }
 
 #[cfg(test)]

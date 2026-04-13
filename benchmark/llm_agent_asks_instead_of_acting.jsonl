@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2025-01-01T00:00:00Z","cwd":"/home/dev/myproject","message":{"content":"Build me a hello world web server"}}
+{"type":"assistant","timestamp":"2025-01-01T00:00:01Z","cwd":"/home/dev/myproject","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read","id":"t1","input":{"file_path":"/home/dev/myproject/package.json"}}]}}
+{"type":"assistant","timestamp":"2025-01-01T00:00:02Z","cwd":"/home/dev/myproject","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Glob","id":"t2","input":{"pattern":"src/**/*.ts"}}]}}
+{"type":"assistant","timestamp":"2025-01-01T00:00:03Z","cwd":"/home/dev/myproject","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Should I use Python or TypeScript for the server?"}]}}

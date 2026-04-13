@@ -15,3 +15,7 @@ src-tauri/target/
 # Tauri build artifacts: tauri-build regenerates these from
 # src-tauri/capabilities/ on every cargo build.
 src-tauri/gen/
+
+# Benchmark LLM response cache (per-machine, populated by
+# COACH_LLM_CACHE_DIR=benchmark/.cache cargo test ...)
+benchmark/.cache/
