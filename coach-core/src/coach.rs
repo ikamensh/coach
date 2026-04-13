@@ -9,6 +9,11 @@ pub struct ObserveToolUseInput {
     pub chain: CoachChain,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
+    /// Tool output/result. Present when replaying JSONL transcripts;
+    /// `None` for live hooks (Claude Code doesn't send tool results
+    /// in PostToolUse). When present, included in the observer prompt
+    /// so the coach sees the same content the coding agent saw.
+    pub tool_output: Option<String>,
     pub user_prompt: Option<String>,
     /// Coding-session id (e.g. Claude Code session UUID). Used as a
     /// routing key when JSONL logging is enabled.
@@ -74,6 +79,7 @@ impl LlmCoach {
         let event = crate::llm::build_observer_event(
             &input.tool_name,
             &input.tool_input,
+            input.tool_output.as_deref(),
             input.user_prompt.as_deref(),
         )?;
         let system = crate::llm::coach_system_prompt(&input.priorities)?;
@@ -163,6 +169,7 @@ mod tests {
                 chain: CoachChain::Empty,
                 tool_name: "Edit".into(),
                 tool_input: serde_json::json!({ "new_string": "hello" }),
+                tool_output: None,
                 user_prompt: Some("keep the session list stable".into()),
                 session_id: None,
             })

@@ -388,6 +388,10 @@ pub struct ObserverQueueItem {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub user_prompt: Option<String>,
+    /// Tool output/result. Present when replaying from a JSONL
+    /// transcript; `None` for live hooks (Claude Code doesn't send
+    /// tool results in PostToolUse).
+    pub tool_output: Option<String>,
 }
 
 pub struct SessionRegistry {
@@ -1523,6 +1527,7 @@ mod tests {
                 tool_name: "Bash".into(),
                 tool_input: serde_json::Value::Null,
                 user_prompt: None,
+                tool_output: None,
             };
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(item) {
                 dropped += 1;

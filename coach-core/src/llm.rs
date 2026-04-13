@@ -173,21 +173,26 @@ pub fn coach_system_prompt(priorities: &[String]) -> Result<String, String> {
 
 /// Build the per-event message we send to the observer.
 /// Tool input is included verbatim so the observer "sees what Claude saw."
-/// When available, the user's last prompt is prepended so the observer
-/// can compare user intent against agent behavior.
+/// When available, the tool's output/result is appended so the observer
+/// also knows what the tool returned (file contents, command output, etc.).
+/// The user's last prompt is prepended so the observer can compare user
+/// intent against agent behavior.
 pub fn build_observer_event(
     tool_name: &str,
     tool_input: &serde_json::Value,
+    tool_output: Option<&str>,
     user_prompt: Option<&str>,
 ) -> Result<String, String> {
     let input_pretty = serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".into());
     let user_prompt = user_prompt.unwrap_or("(not available)");
+    let output_section = tool_output.unwrap_or("(not available from hook)");
     let template = crate::prompts::load("observer_event")?;
     Ok(crate::prompts::render(
         &template,
         &[
             ("tool_name", tool_name),
             ("tool_input", &input_pretty),
+            ("tool_output", output_section),
             ("user_prompt", user_prompt),
         ],
     ))
@@ -902,7 +907,7 @@ mod tests {
     #[test]
     fn build_observer_event_includes_tool_and_input() {
         let input = serde_json::json!({"file_path": "/a.py", "content": "print(1)"});
-        let event = build_observer_event("Write", &input, Some("stabilize the UI")).unwrap();
+        let event = build_observer_event("Write", &input, None, Some("stabilize the UI")).unwrap();
         assert!(event.contains("Write"));
         assert!(event.contains("/a.py"));
         assert!(event.contains("print(1)"));
@@ -913,7 +918,7 @@ mod tests {
     /// (some tools have no input or send a literal null).
     #[test]
     fn build_observer_event_handles_null_input() {
-        let event = build_observer_event("NoInput", &serde_json::Value::Null, None).unwrap();
+        let event = build_observer_event("NoInput", &serde_json::Value::Null, None, None).unwrap();
         assert!(event.contains("NoInput"));
         assert!(event.contains("null"));
         assert!(event.contains("(not available)"));
@@ -1386,6 +1391,7 @@ mod live_tests {
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
             None,
+            None,
         )
         .unwrap();
         let (_text1, chain1, _u1) =
@@ -1401,6 +1407,7 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+            None,
             None,
         )
         .unwrap();
@@ -1428,6 +1435,7 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+            None,
             None,
         )
         .unwrap();
@@ -1577,6 +1585,7 @@ mod live_tests {
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
             None,
+            None,
         )
         .unwrap();
         let (_t1, chain1, _u1) =
@@ -1592,6 +1601,7 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+            None,
             None,
         )
         .unwrap();
@@ -1617,6 +1627,7 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+            None,
             None,
         )
         .unwrap();
@@ -1745,6 +1756,7 @@ mod live_tests {
                 "new_string": "def add(a, b):\n    return a + b\n"
             }),
             None,
+            None,
         )
         .unwrap();
         let (_t1, chain1, _u1) =
@@ -1760,6 +1772,7 @@ mod live_tests {
         let event2 = build_observer_event(
             "Bash",
             &serde_json::json!({"command": "python -c 'from x import add; print(add(2,3))'"}),
+            None,
             None,
         )
         .unwrap();
@@ -1785,6 +1798,7 @@ mod live_tests {
         let event = build_observer_event(
             "Edit",
             &serde_json::json!({"file_path": "/tmp/done.py", "new_string": "print('done')"}),
+            None,
             None,
         )
         .unwrap();

@@ -1,3 +1,4 @@
 User prompt: {user_prompt}
 Tool: {tool_name}
 Input: {tool_input}
+Output: {tool_output}

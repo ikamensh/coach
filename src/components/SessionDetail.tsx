@@ -20,6 +20,13 @@ function formatLatency(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+// ── Timeline lane classification ─────────────────────────────────────────
+// CC events = things the coding agent did. Coach events = Coach's reactions.
+const COACH_EVENTS = new Set(["Observer", "Intervention", "Namer", "Stop"]);
+function isCoachEvent(hookEvent: string): boolean {
+  return COACH_EVENTS.has(hookEvent);
+}
+
 // ── Model metadata ───────────────────────────────────────────────────────
 // Context window sizes (input tokens). Used to show a usage bar.
 // Pricing per 1M tokens: [input_$/M, output_$/M, cached_input_$/M].
@@ -209,48 +216,91 @@ export function SessionDetail() {
         </section>
       )}
 
-      {/* Timeline */}
+      {/* Timeline — two lanes */}
       <section className="flex-1 min-h-0 flex flex-col">
-        <h2 className="text-sm font-medium text-zinc-400 mb-2 uppercase tracking-wide">
-          Timeline
-        </h2>
+        <div className="flex items-center gap-4 mb-2">
+          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide flex-1">
+            Coding Agent
+          </h2>
+          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide flex-1 text-right">
+            Coach
+          </h2>
+        </div>
         {sessionEntries.length === 0 ? (
           <p className="text-xs text-zinc-400 dark:text-zinc-600 italic">
             No events recorded yet.
           </p>
         ) : (
           <div className="space-y-0.5 overflow-y-auto flex-1">
-            {sessionEntries.map((entry, i) => (
-              <div
-                key={i}
-                className="bg-zinc-50 dark:bg-zinc-800/30 rounded px-3 py-1 text-xs"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="text-zinc-400 dark:text-zinc-500 tabular-nums">
-                    {new Date(entry.timestamp).toLocaleTimeString()}
-                  </span>
-                  <span className="text-zinc-600 dark:text-zinc-400 font-medium">
-                    {entry.hook_event}
-                  </span>
-                  <span
-                    className={
-                      entry.action.includes("auto-approved")
-                        ? "text-amber-600 dark:text-amber-400"
-                        : entry.action.includes("blocked")
-                          ? "text-red-500 dark:text-red-400"
-                          : "text-zinc-400 dark:text-zinc-500"
-                    }
-                  >
-                    {entry.action}
-                  </span>
-                </div>
-                {entry.detail && (
-                  <div className="text-zinc-400 dark:text-zinc-600 mt-0.5 truncate">
-                    {entry.detail}
+            {sessionEntries.map((entry, i) => {
+              const isCoach = isCoachEvent(entry.hook_event);
+              return (
+                <div key={i} className="flex gap-1 text-xs">
+                  {/* Left lane — CC events */}
+                  <div className="flex-1 min-w-0">
+                    {!isCoach && (
+                      <div className="bg-blue-50 dark:bg-blue-950/30 border-l-2 border-blue-400 dark:border-blue-600 rounded-r px-2 py-0.5">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-zinc-400 dark:text-zinc-500 tabular-nums shrink-0">
+                            {new Date(entry.timestamp).toLocaleTimeString()}
+                          </span>
+                          <span className="text-blue-700 dark:text-blue-300 font-medium shrink-0">
+                            {entry.hook_event}
+                          </span>
+                          <span className="text-zinc-400 dark:text-zinc-500 truncate">
+                            {entry.action}
+                          </span>
+                        </div>
+                        {entry.detail && (
+                          <div className="text-zinc-400 dark:text-zinc-600 mt-0.5 truncate">
+                            {entry.detail}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            ))}
+                  {/* Right lane — Coach events */}
+                  <div className="flex-1 min-w-0">
+                    {isCoach && (
+                      <div
+                        className={`border-r-2 rounded-l px-2 py-0.5 ${
+                          entry.action.includes("blocked")
+                            ? "bg-red-50 dark:bg-red-950/30 border-red-400 dark:border-red-600"
+                            : entry.action.includes("intervention")
+                              ? "bg-amber-50 dark:bg-amber-950/30 border-amber-400 dark:border-amber-600"
+                              : "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-400 dark:border-emerald-600"
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-zinc-400 dark:text-zinc-500 tabular-nums shrink-0">
+                            {new Date(entry.timestamp).toLocaleTimeString()}
+                          </span>
+                          <span
+                            className={`font-medium shrink-0 ${
+                              entry.action.includes("blocked")
+                                ? "text-red-600 dark:text-red-400"
+                                : entry.action.includes("intervention")
+                                  ? "text-amber-600 dark:text-amber-400"
+                                  : "text-emerald-700 dark:text-emerald-300"
+                            }`}
+                          >
+                            {entry.hook_event}
+                          </span>
+                          <span className="text-zinc-400 dark:text-zinc-500 truncate">
+                            {entry.action}
+                          </span>
+                        </div>
+                        {entry.detail && (
+                          <div className="text-zinc-400 dark:text-zinc-600 mt-0.5 truncate">
+                            {entry.detail}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </section>

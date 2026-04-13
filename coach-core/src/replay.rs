@@ -416,12 +416,66 @@ fn extract_coach_message(resp: &serde_json::Value) -> Option<String> {
 /// `stop_reason == "end_turn"` become `StopRequested`. Only the
 /// tool/stop events get a user-visible `EmitInfo`; user prompts are
 /// dispatched silently so the observer sees them.
+/// Extract the text content from a `tool_result` content block. The
+/// `content` field can be a plain string or an array of typed blocks;
+/// we concatenate all text blocks.
+fn extract_tool_result_text(block: &serde_json::Value) -> Option<String> {
+    if let Some(text) = block.get("content").and_then(|c| c.as_str()) {
+        return Some(text.to_string());
+    }
+    if let Some(arr) = block.get("content").and_then(|c| c.as_array()) {
+        let parts: Vec<&str> = arr
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+    None
+}
+
+/// Build a map from `tool_use_id → result text` by scanning the
+/// transcript for `tool_result` content blocks in user messages.
+/// These appear right after the assistant's tool_use turn.
+fn build_tool_result_map(
+    messages: &[serde_json::Value],
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for msg in messages {
+        if msg.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(arr) = msg.pointer("/message/content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in arr {
+            if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let id = block
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(text) = extract_tool_result_text(block) {
+                map.insert(id.to_string(), text);
+            }
+        }
+    }
+    map
+}
+
 fn build_dispatch_stream(
     messages: &[serde_json::Value],
     session_id: &str,
     cwd: Option<String>,
 ) -> Vec<DispatchStep> {
     let mut steps: Vec<DispatchStep> = Vec::new();
+    let tool_results = build_tool_result_map(messages);
 
     for msg in messages {
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -468,6 +522,11 @@ fn build_dispatch_stream(
                     .get("input")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+                let tool_id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tool_output = tool_results.get(tool_id).cloned();
                 let summary = tool_summary(block);
                 steps.push(DispatchStep {
                     event: SessionEvent::ToolCompleted {
@@ -475,6 +534,7 @@ fn build_dispatch_stream(
                         cwd: cwd.clone(),
                         tool_name: tool.clone(),
                         tool_input,
+                        tool_output,
                     },
                     emit: Some(EmitInfo {
                         kind: "PostToolUse",

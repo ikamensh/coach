@@ -43,6 +43,7 @@ pub(crate) async fn observer_consumer(
                 chain,
                 tool_name: item.tool_name,
                 tool_input: item.tool_input,
+                tool_output: item.tool_output,
                 user_prompt: item.user_prompt,
                 session_id: Some(session_id.clone()),
             })

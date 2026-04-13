@@ -75,6 +75,11 @@ pub(crate) enum SessionEvent {
         cwd: Option<String>,
         tool_name: String,
         tool_input: Value,
+        /// Tool output/result. `None` for live hooks (Claude Code
+        /// doesn't send it in PostToolUse). Present when replaying
+        /// from a JSONL transcript, which contains the tool_result
+        /// user message right after each tool_use.
+        tool_output: Option<String>,
     },
     StopRequested {
         session_id: String,
@@ -120,7 +125,11 @@ pub(crate) async fn dispatch(
             cwd,
             tool_name,
             tool_input,
-        } => on_tool_completed(state, pid, source, session_id, cwd, tool_name, tool_input).await,
+            tool_output,
+        } => {
+            on_tool_completed(state, pid, source, session_id, cwd, tool_name, tool_input, tool_output)
+                .await
+        }
         SessionEvent::StopRequested {
             session_id,
             cwd,
@@ -278,6 +287,7 @@ async fn on_tool_completed(
     cwd: Option<String>,
     tool_name: String,
     tool_input: Value,
+    tool_output: Option<String>,
 ) -> Json<Value> {
     let (rule_message, intervention_to_deliver, namer_input) =
         crate::state::mutate(&state.app, &state.emitter, |coach| {
@@ -376,6 +386,7 @@ async fn on_tool_completed(
                     tool_name: tool_name.clone(),
                     tool_input: tool_input.clone(),
                     user_prompt: sess.coach.memory.last_user_prompt.clone(),
+                    tool_output: tool_output.clone(),
                 };
                 if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                     sess.coach.observer_tx.as_ref().unwrap().try_send(item)

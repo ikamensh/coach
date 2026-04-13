@@ -161,6 +161,7 @@ async fn handle_post_tool_use(
             cwd: payload.cwd,
             tool_name: payload.tool_name.unwrap_or_default(),
             tool_input: payload.tool_input.unwrap_or(Value::Null),
+            tool_output: None, // Claude Code PostToolUse doesn't include results
         },
     )
     .await

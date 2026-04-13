@@ -168,6 +168,7 @@ async fn after_shell(
             cwd: cwd(&v),
             tool_name: "Bash".into(),
             tool_input: json!({ "command": cmd }),
+            tool_output: None,
         },
     )
     .await
@@ -188,6 +189,7 @@ async fn after_mcp(
             cwd: cwd_val,
             tool_name: "mcp".into(),
             tool_input: v,
+            tool_output: None,
         },
     )
     .await
@@ -216,6 +218,7 @@ async fn after_file_edit(
             cwd: cwd(&v),
             tool_name: "Edit".into(),
             tool_input: json!({ "new_string": new_string }),
+            tool_output: None,
         },
     )
     .await
