@@ -8,7 +8,7 @@ export const PROVIDERS = [
     id: "google",
     label: "Google AI",
     envVar: "GEMINI_API_KEY",
-    models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-flash-preview"],
+    models: ["gemini-3.1-flash", "gemini-3.1-pro", "gemini-3.0-flash", "gemini-2.5-flash"],
   },
   {
     id: "anthropic",

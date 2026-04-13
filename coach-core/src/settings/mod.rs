@@ -129,7 +129,7 @@ pub struct Settings {
 fn default_model() -> ModelConfig {
     ModelConfig {
         provider: "openai".into(),
-        model: "gpt-4.1-nano".into(),
+        model: "gpt-5.4-nano".into(),
     }
 }
 
@@ -304,13 +304,13 @@ mod tests {
 
     // ── Default values ──────────────────────────────────────────────────
 
-    /// Default model should be OpenAI gpt-4.1-nano — cheap enough for
+    /// Default model should be OpenAI gpt-5.4-nano — cheap enough for
     /// always-on observation.
     #[test]
     fn default_model_is_openai_nano() {
         let s = Settings::default();
         assert_eq!(s.model.provider, "openai");
-        assert_eq!(s.model.model, "gpt-4.1-nano");
+        assert_eq!(s.model.model, "gpt-5.4-nano");
     }
 
     /// OpenAI must be in the observer-capable list (it's the one provider

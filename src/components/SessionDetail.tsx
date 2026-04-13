@@ -30,26 +30,28 @@ interface ModelMeta {
 }
 
 const MODEL_META: Record<string, ModelMeta> = {
-  // Google
-  "gemini-2.0-flash":         { context: 1_048_576, price: [0.10,  0.40,  0.025] },
+  // Google — current
+  "gemini-3.1-flash":         { context: 2_000_000, price: [0.10,  0.40,  0.025] },
+  "gemini-3.1-pro":           { context: 2_000_000, price: [1.25,  10.0,  0.3125] },
+  "gemini-3.0-flash":         { context: 1_048_576, price: [0.10,  0.40,  0.025] },
+  // Google — older
   "gemini-2.5-flash":         { context: 1_048_576, price: [0.15,  0.60,  0.0375] },
   "gemini-2.5-pro":           { context: 1_048_576, price: [1.25,  10.0,  0.3125] },
-  "gemini-3-flash-preview":   { context: 1_048_576, price: [0.15,  0.60,  0.0375] },
+  "gemini-2.0-flash":         { context: 1_048_576, price: [0.10,  0.40,  0.025] },
   // Anthropic
-  "claude-haiku-4-5":         { context: 200_000, price: [0.80,  4.0,   0.08] },
-  "claude-sonnet-4-5":        { context: 200_000, price: [3.0,   15.0,  0.30] },
-  "claude-sonnet-4-6":        { context: 200_000, price: [3.0,   15.0,  0.30] },
-  "claude-opus-4-6":          { context: 200_000, price: [15.0,  75.0,  1.50] },
-  // OpenAI
-  "gpt-4.1-nano":             { context: 1_047_576, price: [0.10,  0.40,  0.025] },
-  "gpt-4.1-mini":             { context: 1_047_576, price: [0.40,  1.60,  0.10] },
-  "gpt-4.1":                  { context: 1_047_576, price: [2.00,  8.00,  0.50] },
-  "gpt-4o":                   { context: 128_000,   price: [2.50,  10.0,  1.25] },
-  "gpt-4o-mini":              { context: 128_000,   price: [0.15,  0.60,  0.075] },
-  "o3-mini":                  { context: 200_000,   price: [1.10,  4.40,  0.55] },
+  "claude-haiku-4-5":         { context: 200_000,   price: [0.80,  4.0,   0.08] },
+  "claude-sonnet-4-5":        { context: 200_000,   price: [3.0,   15.0,  0.30] },
+  "claude-sonnet-4-6":        { context: 200_000,   price: [3.0,   15.0,  0.30] },
+  "claude-opus-4-6":          { context: 200_000,   price: [15.0,  75.0,  1.50] },
+  // OpenAI — current
   "gpt-5.4":                  { context: 200_000,   price: [2.50,  10.0,  1.25] },
   "gpt-5.4-mini":             { context: 200_000,   price: [0.40,  1.60,  0.10] },
   "gpt-5.4-nano":             { context: 200_000,   price: [0.10,  0.40,  0.025] },
+  // OpenAI — older
+  "gpt-4.1-nano":             { context: 1_047_576, price: [0.10,  0.40,  0.025] },
+  "gpt-4.1-mini":             { context: 1_047_576, price: [0.40,  1.60,  0.10] },
+  "gpt-4.1":                  { context: 1_047_576, price: [2.00,  8.00,  0.50] },
+  "gpt-4o-mini":              { context: 128_000,   price: [0.15,  0.60,  0.075] },
   // OpenRouter (rough)
   "qwen/qwen3.5-397b-a17b":  { context: 131_072,   price: [0.30,  1.20,  0.15] },
   "moonshotai/kimi-k2.5":     { context: 131_072,   price: [0.40,  1.60,  0.20] },
