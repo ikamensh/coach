@@ -4,7 +4,13 @@ import { abbreviateCwd } from "../utils/path";
 import { OwlIcon } from "./OwlIcon";
 import { CursorIcon } from "./CursorIcon";
 import { useState } from "react";
-import { ActivityBar, ActivityLegend } from "./ActivityBar";
+import { ActivityBar, ActivityLegend, activityCategory } from "./ActivityBar";
+import type { ActivityEntry } from "../types";
+
+const COACH_CATEGORIES = new Set(["blocked", "approved", "observer"]);
+function isCoachActivity(entry: ActivityEntry): boolean {
+  return COACH_CATEGORIES.has(activityCategory(entry));
+}
 
 /** Top N tools by count, formatted like "Write: 14, Bash: 8". */
 export function topTools(toolCounts: Record<string, number>, n = 3): string {
@@ -94,48 +100,63 @@ export function SessionList() {
                   </div>
                 )}
               </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">
-                      {session.coach_session_title ?? session.display_name}
+              <div className="flex-1 min-w-0 flex gap-3">
+                {/* Left: text info */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <div className="text-sm text-zinc-800 dark:text-zinc-200 font-medium truncate">
+                        {session.coach_session_title ?? session.display_name}
+                      </div>
+                      {session.is_worktree && (
+                        <span className="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-600 dark:text-orange-400">
+                          ⎇ worktree
+                        </span>
+                      )}
                     </div>
-                    {session.is_worktree && (
-                      <span className="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-600 dark:text-orange-400">
-                        ⎇ worktree
-                      </span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSessionMode(
+                          session.session_id,
+                          session.mode === "present" ? "away" : "present",
+                        );
+                      }}
+                      className={`text-xs px-2.5 py-0.5 rounded-md font-medium transition-colors flex-shrink-0 ${
+                        session.mode === "away"
+                          ? "bg-amber-500/20 text-amber-600 dark:text-amber-400 hover:bg-amber-500/30"
+                          : "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/30"
+                      }`}
+                    >
+                      {session.mode === "away" ? "Away" : "Present"}
+                    </button>
+                  </div>
+                  <div className="text-xs text-zinc-400 dark:text-zinc-500 font-mono truncate">
+                    {abbreviateCwd(session.cwd)}
+                  </div>
+                  <div className="text-xs text-zinc-400 dark:text-zinc-500">
+                    {formatDuration(session.duration_secs)} · {session.event_count} events
+                    {session.coach_last_model && (
+                      <span className="text-zinc-400 dark:text-zinc-500"> · <span className="font-mono">{session.coach_last_model.model}</span></span>
+                    )}
+                    {Object.keys(session.tool_counts).length > 0 && (
+                      <span> · {topTools(session.tool_counts)}</span>
                     )}
                   </div>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSessionMode(
-                        session.session_id,
-                        session.mode === "present" ? "away" : "present",
-                      );
-                    }}
-                    className={`text-xs px-2.5 py-0.5 rounded-md font-medium transition-colors flex-shrink-0 ${
-                      session.mode === "away"
-                        ? "bg-amber-500/20 text-amber-600 dark:text-amber-400 hover:bg-amber-500/30"
-                        : "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/30"
-                    }`}
-                  >
-                    {session.mode === "away" ? "Away" : "Present"}
-                  </button>
                 </div>
-                <div className="text-xs text-zinc-400 dark:text-zinc-500 font-mono truncate">
-                  {abbreviateCwd(session.cwd)}
+                {/* Right: two-lane activity bars */}
+                <div className="flex-shrink-0 flex flex-col justify-end" style={{ width: "40%" }}>
+                  <ActivityBar
+                    entries={session.activity.filter(e => !isCoachActivity(e))}
+                    hovered={hovered}
+                    setHovered={setHovered}
+                  />
+                  <ActivityBar
+                    entries={session.activity.filter(isCoachActivity)}
+                    hovered={hovered}
+                    setHovered={setHovered}
+                  />
                 </div>
-                <div className="text-xs text-zinc-400 dark:text-zinc-500">
-                  {formatDuration(session.duration_secs)} · {session.event_count} events
-                  {session.coach_last_model && (
-                    <span className="text-zinc-400 dark:text-zinc-500"> · <span className="font-mono">{session.coach_last_model.model}</span></span>
-                  )}
-                  {Object.keys(session.tool_counts).length > 0 && (
-                    <span> · {topTools(session.tool_counts)}</span>
-                  )}
-                </div>
-                <ActivityBar entries={session.activity} hovered={hovered} setHovered={setHovered} />
               </div>
             </li>
             );
