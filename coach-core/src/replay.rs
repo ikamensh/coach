@@ -48,13 +48,17 @@ pub struct SavedSession {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayEvent {
     pub index: usize,
+    /// "PostToolUse" or "Stop". On a Stop, a non-null `coach_message`
+    /// means the stop was blocked. On a PostToolUse, it's an advisory
+    /// note the agent sees. The distinction comes from the hook kind,
+    /// not from a separate type tag.
     pub kind: String,
     pub tool_name: String,
     pub timestamp: String,
     pub summary: String,
-    /// null = passthrough, "blocked", "intervention"
-    pub action: Option<String>,
-    pub message: Option<String>,
+    /// `null` = coach was silent. `Some(text)` = coach spoke — either
+    /// blocking a Stop or injecting an advisory note on a tool call.
+    pub coach_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,30 +388,26 @@ async fn wait_for_observer_tick(
     }
 }
 
-/// Convert a dispatch response into `(action, message)` for a
-/// `ReplayEvent`. Mirrors the response shapes `dispatch` emits:
-///   • `{}`                                                   → passthrough (no action)
-///   • `{decision: "block", reason: "..."}`                   → blocked stop
-///   • `{hookSpecificOutput: {additionalContext: "..."}}`     → rule / intervention
-///   • `{hookSpecificOutput: {decision: ...}}`                → passthrough (permission wire format, not a coach action)
-fn interpret_response(resp: &serde_json::Value) -> (Option<String>, Option<String>) {
+/// Extract the coach message (if any) from a dispatch response.
+/// Returns `None` when coach was silent, `Some(text)` when it spoke.
+///   • `{}`                                               → None
+///   • `{decision: "block", reason: "..."}`               → Some(reason)
+///   • `{hookSpecificOutput: {additionalContext: "..."}}`  → Some(context)
+///   • `{hookSpecificOutput: {decision: ...}}`            → None (wire format, not a coach message)
+fn extract_coach_message(resp: &serde_json::Value) -> Option<String> {
     if resp.get("decision").and_then(|d| d.as_str()) == Some("block") {
-        let msg = resp
+        return resp
             .get("reason")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        return (Some("blocked".to_string()), msg);
     }
     if let Some(ctx) = resp
         .pointer("/hookSpecificOutput/additionalContext")
         .and_then(|v| v.as_str())
     {
-        return (
-            Some("intervention".to_string()),
-            Some(ctx.to_string()),
-        );
+        return Some(ctx.to_string());
     }
-    (None, None)
+    None
 }
 
 /// Parse a Claude Code JSONL transcript into an ordered dispatch stream.
@@ -621,9 +621,9 @@ pub async fn replay_transcript_at(
             continue;
         };
 
-        let (action, message) = interpret_response(&response.0);
+        let coach_message = extract_coach_message(&response.0);
         let index = replay_events.len();
-        if action.is_some() && first_intervention.is_none() {
+        if coach_message.is_some() && first_intervention.is_none() {
             first_intervention = Some(index);
         }
         replay_events.push(ReplayEvent {
@@ -632,8 +632,7 @@ pub async fn replay_transcript_at(
             tool_name: emit.tool_name,
             timestamp: emit.timestamp,
             summary: emit.summary,
-            action,
-            message,
+            coach_message,
         });
     }
 
@@ -788,8 +787,8 @@ mod tests {
             .expect("present replay");
         assert_eq!(result.event_count, 2, "1 PostToolUse + 1 Stop expected");
         assert!(
-            result.events.iter().all(|e| e.action.is_none()),
-            "present mode should never intervene, got {:?}",
+            result.events.iter().all(|e| e.coach_message.is_none()),
+            "present mode: coach should be silent, got {:?}",
             result.events
         );
         assert!(result.first_intervention_index.is_none());
@@ -804,13 +803,11 @@ mod tests {
             .iter()
             .find(|e| e.kind == "Stop")
             .expect("Stop event missing");
-        assert_eq!(
-            stop.action.as_deref(),
-            Some("blocked"),
-            "away mode must block the first Stop: {:?}",
+        assert!(
+            stop.coach_message.is_some(),
+            "away mode: coach should speak on Stop: {:?}",
             stop
         );
-        assert!(stop.message.is_some());
         assert_eq!(result.first_intervention_index, Some(1));
 
         // ── llm (mocked observer + stop evaluator) ─────────────────
@@ -855,16 +852,10 @@ mod tests {
             .iter()
             .find(|e| e.kind == "Stop")
             .expect("Stop event missing");
-        assert_eq!(
-            stop.action.as_deref(),
-            Some("blocked"),
-            "llm mode should block via mocked decision: {:?}",
-            stop
-        );
-        let msg = stop.message.as_deref().unwrap_or("");
+        let msg = stop.coach_message.as_deref().unwrap_or("");
         assert!(
             msg.contains("keep going"),
-            "mocked block reason should propagate, got: {:?}",
+            "llm mode: mocked block reason should propagate, got: {:?}",
             msg
         );
     }
@@ -925,23 +916,15 @@ mod tests {
             session.id
         );
 
-        let errors: Vec<&&ReplayEvent> = stops
-            .iter()
-            .filter(|e| e.action.as_deref() == Some("error"))
-            .collect();
-        assert!(
-            errors.is_empty(),
-            "{}/{} Stop events errored from the LLM call. First error: {:?}",
-            errors.len(),
-            stops.len(),
-            errors.first().and_then(|e| e.message.as_ref())
-        );
-
-        eprintln!("[live] {} Stop events evaluated by Gemini:", stops.len());
+        eprintln!("[live] {} Stop events evaluated:", stops.len());
         for ev in &stops {
-            let verdict = ev.action.as_deref().unwrap_or("allowed");
+            let verdict = if ev.coach_message.is_some() {
+                "blocked"
+            } else {
+                "allowed"
+            };
             let preview = ev
-                .message
+                .coach_message
                 .as_ref()
                 .and_then(|m| m.lines().next())
                 .unwrap_or("");

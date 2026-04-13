@@ -20,8 +20,7 @@ interface ReplayEvent {
   tool_name: string;
   timestamp: string;
   summary: string;
-  action: string | null;
-  message: string | null;
+  coach_message: string | null;
 }
 
 interface ReplayResult {
@@ -287,7 +286,7 @@ function ReplayView({
         ) : (
           <div className="space-y-0.5 overflow-y-auto flex-1">
             {result.events.map((ev) => {
-              const isIntervention = ev.action !== null;
+              const coachSpoke = ev.coach_message !== null;
               const isFirst = ev.index === interventionIdx;
               const expanded = expandedEvent === ev.index;
 
@@ -300,7 +299,7 @@ function ReplayView({
                   className={`rounded px-3 py-1 text-xs cursor-pointer transition-colors ${
                     isFirst
                       ? "bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-300 dark:ring-amber-700"
-                      : isIntervention
+                      : coachSpoke
                         ? "bg-red-50 dark:bg-red-900/10"
                         : "bg-zinc-50 dark:bg-zinc-800/30 hover:bg-zinc-100 dark:hover:bg-zinc-800"
                   }`}
@@ -321,15 +320,9 @@ function ReplayView({
                     <span className="text-zinc-500 dark:text-zinc-500 truncate">
                       {ev.summary}
                     </span>
-                    {isIntervention && (
-                      <span
-                        className={`flex-shrink-0 font-medium ${
-                          ev.action === "blocked"
-                            ? "text-red-500 dark:text-red-400"
-                            : "text-amber-600 dark:text-amber-400"
-                        }`}
-                      >
-                        {ev.action}
+                    {coachSpoke && (
+                      <span className="flex-shrink-0 font-medium text-red-500 dark:text-red-400">
+                        {ev.kind === "Stop" ? "blocked" : "note"}
                       </span>
                     )}
                     {isFirst && (
@@ -339,18 +332,18 @@ function ReplayView({
                     )}
                   </div>
 
-                  {expanded && ev.message && (
+                  {expanded && ev.coach_message && (
                     <div className="mt-1.5 ml-10 p-2 bg-zinc-100 dark:bg-zinc-800 rounded text-zinc-600 dark:text-zinc-400 whitespace-pre-wrap break-words">
                       <div className="text-zinc-400 dark:text-zinc-500 text-[10px] uppercase tracking-wider mb-1">
                         Coach message
                       </div>
-                      {ev.message}
+                      {ev.coach_message}
                     </div>
                   )}
 
-                  {expanded && !ev.message && !isIntervention && (
+                  {expanded && !coachSpoke && (
                     <div className="mt-1 ml-10 text-zinc-400 dark:text-zinc-600 italic">
-                      Passthrough — no intervention
+                      Coach was silent
                     </div>
                   )}
                 </div>
