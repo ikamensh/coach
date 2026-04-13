@@ -758,6 +758,12 @@ mod llm_cache {
         chain_json.hash(&mut h);
         provider.hash(&mut h);
         model.hash(&mut h);
+        // COACH_BENCHMARK_SEED busts the cache so the same inputs
+        // produce a fresh LLM call, capturing the model's natural
+        // variance across runs.
+        if let Ok(seed) = std::env::var("COACH_BENCHMARK_SEED") {
+            seed.hash(&mut h);
+        }
         Some(format!("{:016x}", h.finish()))
     }
 
