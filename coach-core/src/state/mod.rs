@@ -383,15 +383,21 @@ impl Drop for SessionState {
 }
 
 /// Item enqueued for the per-session observer consumer.
-pub struct ObserverQueueItem {
-    pub priorities: Vec<String>,
-    pub tool_name: String,
-    pub tool_input: serde_json::Value,
-    pub user_prompt: Option<String>,
-    /// Tool output/result. Present when replaying from a JSONL
-    /// transcript; `None` for live hooks (Claude Code doesn't send
-    /// tool results in PostToolUse).
-    pub tool_output: Option<String>,
+pub enum ObserverQueueItem {
+    /// User typed a prompt — gets its own turn in the observer chain
+    /// so intent changes are visible immediately.
+    UserPrompt {
+        priorities: Vec<String>,
+        prompt: String,
+    },
+    /// A tool call completed — tool name, input, and (when available)
+    /// output are sent to the observer.
+    ToolCompleted {
+        priorities: Vec<String>,
+        tool_name: String,
+        tool_input: serde_json::Value,
+        tool_output: Option<String>,
+    },
 }
 
 pub struct SessionRegistry {
@@ -1522,11 +1528,10 @@ mod tests {
         );
         let mut dropped: u64 = 0;
         for _ in 0..100 {
-            let item = ObserverQueueItem {
+            let item = ObserverQueueItem::ToolCompleted {
                 priorities: vec![],
                 tool_name: "Bash".into(),
                 tool_input: serde_json::Value::Null,
-                user_prompt: None,
                 tool_output: None,
             };
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(item) {

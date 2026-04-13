@@ -17,38 +17,58 @@ pub(crate) async fn observer_consumer(
     session_id: SessionId,
     mut rx: tokio::sync::mpsc::Receiver<crate::state::ObserverQueueItem>,
 ) {
+    use crate::state::ObserverQueueItem;
+
     while let Some(item) = rx.recv().await {
-        let (chain, model) = {
+        let (chain, model, priorities) = {
             let mut s = coach.write().await;
             let global_model = s.config.model.clone();
             let sess = match s.sessions.get_mut(&session_id) {
                 Some(sess) => sess,
                 None => continue,
             };
-            // Lock model on first coach call for this session.
             if sess.coach.model.is_none() {
                 sess.coach.model = Some(global_model);
             }
+            let p = match &item {
+                ObserverQueueItem::UserPrompt { priorities, .. } => priorities.clone(),
+                ObserverQueueItem::ToolCompleted { priorities, .. } => priorities.clone(),
+            };
             (
                 sess.coach.memory.chain.clone(),
                 sess.coach.model.clone().unwrap(),
+                p,
             )
         };
 
         let llm_coach = LlmCoach::with_model(coach.clone(), model.clone());
         let started = std::time::Instant::now();
-        match llm_coach
-            .observe_tool_use(ObserveToolUseInput {
-                priorities: item.priorities,
+        let input = match item {
+            ObserverQueueItem::UserPrompt { prompt, .. } => ObserveToolUseInput {
+                priorities,
                 chain,
-                tool_name: item.tool_name,
-                tool_input: item.tool_input,
-                tool_output: item.tool_output,
-                user_prompt: item.user_prompt,
+                tool_name: String::new(),
+                tool_input: serde_json::Value::Null,
+                tool_output: None,
+                prompt_text: Some(prompt),
                 session_id: Some(session_id.clone()),
-            })
-            .await
-        {
+            },
+            ObserverQueueItem::ToolCompleted {
+                tool_name,
+                tool_input,
+                tool_output,
+                ..
+            } => ObserveToolUseInput {
+                priorities,
+                chain,
+                tool_name,
+                tool_input,
+                tool_output,
+                prompt_text: None,
+                session_id: Some(session_id.clone()),
+            },
+        };
+        match llm_coach.observe_tool_use(input).await {
             Ok(result) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let (assessment, intervention) = parse_intervention(&result.assessment);

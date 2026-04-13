@@ -211,10 +211,27 @@ async fn on_user_prompt_submitted(
     });
     crate::state::mutate(&state.app, &state.emitter, |coach| {
         let sess = adopt(coach, pid, &session_id, cwd.as_deref(), source);
-        sess.coach.memory.last_user_prompt = prompt;
+        sess.coach.memory.last_user_prompt = prompt.clone();
         coach
             .sessions
             .log(&session_id, "UserPromptSubmit", "user spoke", detail);
+
+        // Send the user prompt to the observer as its own chain turn
+        // so the coach sees intent changes immediately.
+        if let Some(ref prompt_text) = prompt {
+            let llm_active = coach.config.coach_mode == EngineMode::Llm;
+            if llm_active {
+                if let Some(sess) = coach.sessions.get_mut(&session_id) {
+                    if let Some(ref tx) = sess.coach.observer_tx {
+                        let item = crate::state::ObserverQueueItem::UserPrompt {
+                            priorities: coach.config.priorities.clone(),
+                            prompt: prompt_text.clone(),
+                        };
+                        let _ = tx.try_send(item);
+                    }
+                }
+            }
+        }
     })
     .await;
     passthrough()
@@ -381,11 +398,10 @@ async fn on_tool_completed(
                         observer::observer_consumer(coach_state, emitter, sid_for_task, rx).await;
                     }));
                 }
-                let item = crate::state::ObserverQueueItem {
+                let item = crate::state::ObserverQueueItem::ToolCompleted {
                     priorities,
                     tool_name: tool_name.clone(),
                     tool_input: tool_input.clone(),
-                    user_prompt: sess.coach.memory.last_user_prompt.clone(),
                     tool_output: tool_output.clone(),
                 };
                 if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
